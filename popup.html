@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GBP Maps Scraper</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1>GBP Maps Scraper</h1>
+
+      <section class="panel">
+        <label>
+          Max rows
+          <input id="maxRows" type="number" min="1" step="1" value="200" />
+        </label>
+        <label class="checkbox">
+          <input id="infiniteScroll" type="checkbox" />
+          Infinite scroll (ignore max rows)
+        </label>
+
+        <div class="row">
+          <label>
+            Min rating
+            <input id="minRating" type="number" min="0" max="5" step="0.1" placeholder="e.g. 4.2" />
+          </label>
+          <label>
+            Max rating
+            <input id="maxRating" type="number" min="0" max="5" step="0.1" placeholder="e.g. 4.8" />
+          </label>
+        </div>
+
+        <div class="row">
+          <label>
+            Min reviews
+            <input id="minReviews" type="number" min="0" step="1" placeholder="e.g. 50" />
+          </label>
+          <label>
+            Max reviews
+            <input id="maxReviews" type="number" min="0" step="1" placeholder="e.g. 500" />
+          </label>
+        </div>
+
+        <label>
+          Name keyword
+          <input id="nameKeyword" type="text" placeholder="e.g. dentist" />
+        </label>
+
+        <label>
+          Category include
+          <input id="categoryInclude" type="text" placeholder="e.g. restaurant" />
+        </label>
+
+        <label>
+          Category exclude
+          <input id="categoryExclude" type="text" placeholder="e.g. hotel" />
+        </label>
+
+        <div class="row toggles">
+          <label class="checkbox">
+            <input id="hasWebsite" type="checkbox" />
+            Has website
+          </label>
+          <label class="checkbox">
+            <input id="hasPhone" type="checkbox" />
+            Has phone
+          </label>
+        </div>
+
+        <label class="checkbox">
+          <input id="enableEnrichment" type="checkbox" />
+          Enrich websites (owner/email, best effort)
+        </label>
+
+        <section class="columns-block">
+          <div class="columns-head">
+            <strong id="columnsTitle">Export columns</strong>
+            <div class="columns-actions">
+              <button id="columnsAllBtn" type="button" class="chip-btn">All</button>
+              <button id="columnsNoneBtn" type="button" class="chip-btn">None</button>
+            </div>
+          </div>
+          <div id="columnList" class="column-list"></div>
+        </section>
+      </section>
+
+      <section class="actions">
+        <button id="startBtn" class="primary">Start Scrape</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <button id="exportBtn" disabled>Export CSV</button>
+      </section>
+
+      <section class="status panel">
+        <div class="status-grid">
+          <div><span>Processed</span><strong id="processed">0</strong></div>
+          <div><span>Matched</span><strong id="matched">0</strong></div>
+          <div><span>Duplicates</span><strong id="duplicates">0</strong></div>
+          <div><span>Errors</span><strong id="errors">0</strong></div>
+        </div>
+        <p id="stateText">Idle</p>
+        <p id="errorText" class="error"></p>
+      </section>
+    </main>
+
+    <script src="shared.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

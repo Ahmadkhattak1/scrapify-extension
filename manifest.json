@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "GBP Maps Scraper",
+  "version": "1.0.0",
+  "description": "Scrape Google Maps GBP listings with filters and export to CSV.",
+  "permissions": ["activeTab", "tabs", "storage", "downloads", "scripting"],
+  "host_permissions": ["https://www.google.com/maps/*", "https://*/*", "http://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "GBP Maps Scraper",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.google.com/maps/*"],
+      "js": ["shared.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

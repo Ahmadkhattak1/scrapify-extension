@@ -1,0 +1,189 @@
+:root {
+  --bg: #f5f7fa;
+  --panel: #ffffff;
+  --text: #142235;
+  --muted: #4a596d;
+  --border: #d7dde5;
+  --primary: #0d67ff;
+  --danger: #b42318;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  width: 360px;
+  background: linear-gradient(180deg, #eef3fb 0%, var(--bg) 100%);
+  color: var(--text);
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.app {
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+h1 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+input[type="text"],
+input[type="number"] {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text);
+  background: #fff;
+}
+
+input[disabled] {
+  background: #edf1f6;
+  color: #7c899b;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.toggles {
+  grid-template-columns: 1fr 1fr;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+}
+
+button {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  padding: 7px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button.chip-btn {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+button.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.status-grid div {
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  text-align: center;
+}
+
+.status-grid span {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.status-grid strong {
+  display: block;
+  font-size: 14px;
+}
+
+#stateText {
+  margin: 0;
+  font-size: 12px;
+}
+
+#errorText {
+  margin: 0;
+  min-height: 16px;
+  font-size: 12px;
+}
+
+.error {
+  color: var(--danger);
+}
+
+.columns-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  background: #f8fafc;
+  display: grid;
+  gap: 8px;
+}
+
+.columns-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.columns-head strong {
+  font-size: 12px;
+}
+
+.columns-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.column-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+}
+
+.column-checkbox {
+  font-size: 11px;
+  color: var(--text);
+}
