@@ -1,6 +1,8 @@
 (function () {
   const shared = window.GbpShared;
   const { MSG, DEFAULT_MAX_ROWS, CSV_COLUMNS, COLUMN_LABELS, readFilterConfig, normalizeText, sanitizeColumns } = shared;
+  const SCRAPE_SESSION_KEY = "scrapeSession";
+  const ENRICH_SESSION_KEY = "enrichSession";
 
   const el = {
     maxRows: document.getElementById("maxRows"),
@@ -37,6 +39,7 @@
     crawlDiscoveredStat: document.getElementById("crawlDiscoveredStat"),
     socialScannedStat: document.getElementById("socialScannedStat"),
     stateText: document.getElementById("stateText"),
+    leadSignalText: document.getElementById("leadSignalText"),
     errorText: document.getElementById("errorText")
   };
 
@@ -50,6 +53,7 @@
   let siteMaxPagesValue = 40;
   let showEnrichmentTabsEnabled = false;
   let scanSocialLinksEnabled = true;
+  let scrapeRunTabId = null;
 
   init();
 
@@ -70,6 +74,7 @@
     setRunningState(isBusy());
 
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
+    chrome.storage.onChanged.addListener(onStorageChanged);
   }
 
   function bindEvents() {
@@ -104,21 +109,29 @@
       return;
     }
 
+    const runId = createRunId();
+    scrapeRunTabId = tab.id;
     scrapeRunning = true;
     runInfiniteCurrent = config.infiniteScroll === true;
     lastRows = null;
     setRunningState(isBusy());
     setState(runInfiniteCurrent ? "Scraping (infinite scroll)..." : "Scraping...");
+    setLeadSignal("", "info");
     resetCounters();
 
     try {
       await ensureContentScriptReady(tab.id);
+      const payloadConfig = {
+        ...config,
+        runId,
+        runTabId: tab.id
+      };
 
       let response;
       try {
         response = await sendMessageToTab(tab.id, {
           type: MSG.START_SCRAPE,
-          config
+          config: payloadConfig
         });
       } catch (firstErr) {
         if (!isNoReceiverError(firstErr)) {
@@ -129,7 +142,7 @@
         await ensureContentScriptReady(tab.id);
         response = await sendMessageToTab(tab.id, {
           type: MSG.START_SCRAPE,
-          config
+          config: payloadConfig
         });
       }
 
@@ -155,12 +168,15 @@
 
   async function onStop() {
     clearError();
-    const tab = await getActiveTab();
-    if (!tab || !tab.id) return;
+    const targetTabId = await resolveScrapeRunTabId();
+    if (!Number.isFinite(targetTabId)) {
+      setError("No active scrape run found.");
+      return;
+    }
 
     try {
-      await ensureContentScriptReady(tab.id);
-      await sendMessageToTab(tab.id, { type: MSG.STOP_SCRAPE });
+      await ensureContentScriptReady(targetTabId);
+      await sendMessageToTab(targetTabId, { type: MSG.STOP_SCRAPE });
       setState("Stopping...");
     } catch (_error) {
       setError("Could not send stop request");
@@ -221,11 +237,11 @@
     }
 
     if (message.type === MSG.SCRAPE_PROGRESS) {
-      el.processed.textContent = String(message.processed || 0);
-      el.matched.textContent = String(message.matched || 0);
-      el.duplicates.textContent = String(message.duplicates || 0);
-      el.errors.textContent = String(message.errors || 0);
+      scrapeRunning = true;
+      applyScrapeCounters(message);
       updatePerformanceMetrics(message);
+      scrapeRunTabId = Number.isFinite(Number(message.tab_id)) ? Number(message.tab_id) : scrapeRunTabId;
+      setRunningState(isBusy());
       const quickSkips = Number(message.fast_skipped || 0);
       setState(runInfiniteCurrent ? `Scraping (infinite scroll)... fast-skipped ${quickSkips}` : `Scraping... fast-skipped ${quickSkips}`);
       return;
@@ -240,12 +256,15 @@
       scrapeRunning = false;
       runInfiniteCurrent = false;
       setRunningState(isBusy());
+      setLeadSignal("Scrape failed", "warn");
       setError(message.error || "Scrape failed");
       setState("Failed");
       return;
     }
 
     if (message.type === MSG.ENRICH_PROGRESS) {
+      enrichRunning = true;
+      setRunningState(isBusy());
       const processed = Number(message.processed || 0);
       const total = Number(message.total || 0);
       const current = normalizeText(message.current || "");
@@ -262,12 +281,14 @@
       el.crawlVisitedStat.textContent = String(Number.isFinite(siteVisited) ? siteVisited : 0);
       el.crawlDiscoveredStat.textContent = String(Number.isFinite(siteDiscovered) ? siteDiscovered : 0);
       el.socialScannedStat.textContent = String(Number.isFinite(socialScanned) ? socialScanned : 0);
+      setLeadSignal(normalizeText(message.lead_signal_text), normalizeText(message.lead_signal_tone || "info"));
       return;
     }
 
     if (message.type === MSG.ENRICH_ERROR) {
       enrichRunning = false;
       setRunningState(isBusy());
+      setLeadSignal("Enrichment failed", "warn");
       setError(message.error || "Website enrichment failed");
       setState("Enrichment failed");
     }
@@ -351,6 +372,8 @@
     try {
       const data = await storageGet([
         "lastRows",
+        SCRAPE_SESSION_KEY,
+        ENRICH_SESSION_KEY,
         "selectedColumns",
         "infiniteScrollEnabled",
         "enrichmentEnabled",
@@ -369,10 +392,112 @@
       siteMaxPagesValue = clampInt(data.siteMaxPagesValue, 1, 120, 40);
       showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
       scanSocialLinksEnabled = data.scanSocialLinksEnabled !== false;
+      applyScrapeSession(data[SCRAPE_SESSION_KEY]);
+      applyEnrichSession(data[ENRICH_SESSION_KEY]);
       el.exportBtn.disabled = isBusy() || !Array.isArray(lastRows) || selectedColumns.length === 0;
     } catch (_error) {
       el.exportBtn.disabled = true;
     }
+  }
+
+  function onStorageChanged(changes, areaName) {
+    if (areaName !== "local" || !changes) return;
+
+    if (changes.lastRows && Array.isArray(changes.lastRows.newValue)) {
+      lastRows = changes.lastRows.newValue;
+      setRunningState(isBusy());
+    }
+
+    if (changes[SCRAPE_SESSION_KEY]) {
+      applyScrapeSession(changes[SCRAPE_SESSION_KEY].newValue);
+    }
+
+    if (changes[ENRICH_SESSION_KEY]) {
+      applyEnrichSession(changes[ENRICH_SESSION_KEY].newValue);
+    }
+  }
+
+  function applyScrapeSession(session) {
+    if (!session || typeof session !== "object") return;
+
+    scrapeRunTabId = Number.isFinite(Number(session.tab_id)) ? Number(session.tab_id) : null;
+
+    const status = normalizeText(session.status).toLowerCase();
+    runInfiniteCurrent = session.infinite_scroll === true;
+    scrapeRunning = status === "running" || status === "stopping";
+
+    applyScrapeCounters(session, Array.isArray(lastRows) ? lastRows.length : 0);
+    updatePerformanceMetrics(session);
+
+    if (status === "running") {
+      const quickSkips = Number(session.fast_skipped || 0);
+      setState(runInfiniteCurrent ? `Scraping (infinite scroll)... fast-skipped ${quickSkips}` : `Scraping... fast-skipped ${quickSkips}`);
+    } else if (status === "stopping") {
+      setState("Stopping...");
+      setLeadSignal("Stop requested", "warn");
+    } else if (status === "done" || status === "stopped") {
+      const rowsCount = Number(session.rows_count || (Array.isArray(lastRows) ? lastRows.length : 0));
+      const duplicates = Number(session.duplicates || 0);
+      const fastSkipped = Number(session.fast_skipped || 0);
+      setState(`${status === "stopped" ? "Stopped" : "Completed"}: ${rowsCount} unique row(s), ${duplicates} duplicates, ${fastSkipped} fast-skipped`);
+      setLeadSignal(status === "stopped" ? "Scrape stopped by user" : "Scrape finished and saved", status === "stopped" ? "warn" : "success");
+    } else if (status === "error") {
+      setError(normalizeText(session.error) || "Scrape failed");
+      setState("Failed");
+      setLeadSignal("Scrape failed", "warn");
+    }
+
+    setRunningState(isBusy());
+  }
+
+  function applyEnrichSession(session) {
+    if (!session || typeof session !== "object") return;
+
+    const status = normalizeText(session.status).toLowerCase();
+    enrichRunning = status === "running";
+
+    const siteVisited = Number(session.site_pages_visited != null ? session.site_pages_visited : session.pages_visited || 0);
+    const siteDiscovered = Number(session.site_pages_discovered != null ? session.site_pages_discovered : session.pages_discovered || 0);
+    const socialScanned = Number(session.social_scanned || 0);
+    el.crawlVisitedStat.textContent = String(Number.isFinite(siteVisited) ? siteVisited : 0);
+    el.crawlDiscoveredStat.textContent = String(Number.isFinite(siteDiscovered) ? siteDiscovered : 0);
+    el.socialScannedStat.textContent = String(Number.isFinite(socialScanned) ? socialScanned : 0);
+
+    const signalText = normalizeText(session.lead_signal_text);
+    const signalTone = normalizeText(session.lead_signal_tone || "info");
+    if (signalText) {
+      setLeadSignal(signalText, signalTone);
+    }
+
+    if (status === "running") {
+      const processed = Number(session.processed || 0);
+      const total = Number(session.total || 0);
+      const phase = normalizeText(session.phase || "");
+      const host = shortHost(session.current_url || "");
+      const current = normalizeText(session.current || "");
+      const phaseSuffix = phase ? ` (${phase})` : "";
+      const hostSuffix = host ? ` @ ${host}` : "";
+      const currentSuffix = current ? ` ${current}` : "";
+      setState(`Enriching websites ${processed}/${total}${phaseSuffix}${hostSuffix} pages ${siteVisited}/${siteDiscovered}...${currentSuffix}`);
+    } else if (status === "done") {
+      const enriched = Number(session.enriched || 0);
+      const skipped = Number(session.skipped || 0);
+      const blocked = Number(session.blocked || 0);
+      setState(`Enrichment: ${enriched} enriched, ${skipped} skipped, ${blocked} blocked, pages ${siteVisited}/${siteDiscovered}`);
+      const personal = Number(session.personal_email_found || 0);
+      const company = Number(session.company_email_found || 0);
+      if (personal > 0 || company > 0) {
+        setLeadSignal(`Saved emails: personal ${personal}, company fallback ${company}`, "success");
+      } else {
+        setLeadSignal("No public emails found during enrichment", "warn");
+      }
+    } else if (status === "error") {
+      setError(normalizeText(session.error) || "Website enrichment failed");
+      setState("Enrichment failed");
+      setLeadSignal("Enrichment failed", "warn");
+    }
+
+    setRunningState(isBusy());
   }
 
   function persistRows(rows) {
@@ -383,6 +508,7 @@
   function finalizeScrapeResult(rowsInput, summaryInput) {
     scrapeRunning = false;
     runInfiniteCurrent = false;
+    scrapeRunTabId = null;
     setRunningState(isBusy());
 
     const rows = Array.isArray(rowsInput) ? rowsInput : [];
@@ -391,15 +517,13 @@
     lastRows = rows;
     persistRows(rows);
 
-    el.processed.textContent = String(summary.processed || 0);
-    el.matched.textContent = String(summary.matched || rows.length || 0);
-    el.duplicates.textContent = String(summary.duplicates || 0);
-    el.errors.textContent = String(summary.errors || 0);
+    applyScrapeCounters(summary, rows.length);
     updatePerformanceMetrics(summary);
 
     const status = summary.stopped ? "Stopped" : "Completed";
     const fastSkipped = Number(summary.fast_skipped || 0);
     setState(`${status}: ${rows.length} unique row(s), ${summary.duplicates || 0} duplicates, ${fastSkipped} fast-skipped`);
+    setLeadSignal(summary.stopped ? "Scrape stopped by user" : "Scrape finished and saved", summary.stopped ? "warn" : "success");
 
     if (rows.length === 0 && Number(summary.processed || 0) > 0) {
       setError("No rows extracted. Try disabling strict filters or run again with fewer active constraints.");
@@ -614,10 +738,14 @@
       column === "owner_title" ||
       column === "owner_email" ||
       column === "contact_email" ||
+      column === "primary_email" ||
+      column === "primary_email_type" ||
+      column === "primary_email_source" ||
       column === "website_scan_status" ||
       column === "site_pages_visited" ||
       column === "site_pages_discovered" ||
-      column === "social_pages_scanned";
+      column === "social_pages_scanned" ||
+      column === "social_links";
   }
 
   function rowsAlreadyEnriched(rows) {
@@ -663,10 +791,62 @@
       el.crawlDiscoveredStat.textContent = String(Number(enrichSummary.pages_discovered || 0));
       el.socialScannedStat.textContent = String(Number(enrichSummary.social_scanned || 0));
       setState(`Enrichment: ${enrichSummary.enriched || 0} enriched, ${enrichSummary.skipped || 0} skipped, ${enrichSummary.blocked || 0} blocked, pages ${enrichSummary.pages_visited || 0}/${enrichSummary.pages_discovered || 0}`);
+      const personalCount = Number(enrichSummary.personal_email_found || 0);
+      const companyCount = Number(enrichSummary.company_email_found || 0);
+      if (personalCount > 0 || companyCount > 0) {
+        setLeadSignal(`Saved emails: personal ${personalCount}, company fallback ${companyCount}`, "success");
+      } else {
+        setLeadSignal("No public emails found during enrichment", "warn");
+      }
       return rowsForExport;
     } finally {
       enrichRunning = false;
       setRunningState(isBusy());
+    }
+  }
+
+  function applyScrapeCounters(payload, rowsLengthFallback) {
+    const data = payload || {};
+    const fallback = Number(rowsLengthFallback || 0);
+    const processed = Number(data.processed || 0);
+    const matchedRaw = data.matched != null ? Number(data.matched) : fallback;
+    const duplicates = Number(data.duplicates || 0);
+    const errors = Number(data.errors || 0);
+
+    el.processed.textContent = String(Number.isFinite(processed) ? processed : 0);
+    el.matched.textContent = String(Number.isFinite(matchedRaw) ? matchedRaw : fallback);
+    el.duplicates.textContent = String(Number.isFinite(duplicates) ? duplicates : 0);
+    el.errors.textContent = String(Number.isFinite(errors) ? errors : 0);
+  }
+
+  function setLeadSignal(text, tone) {
+    const clean = normalizeText(text);
+    const level = normalizeText(tone).toLowerCase();
+    const supportedLevel = level === "success" || level === "warn" || level === "info" ? level : "info";
+    el.leadSignalText.textContent = clean;
+    el.leadSignalText.className = clean ? `lead-signal ${supportedLevel}` : "lead-signal";
+  }
+
+  function createRunId() {
+    return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  async function resolveScrapeRunTabId() {
+    if (Number.isFinite(Number(scrapeRunTabId))) {
+      return Number(scrapeRunTabId);
+    }
+
+    try {
+      const data = await storageGet([SCRAPE_SESSION_KEY]);
+      const session = data[SCRAPE_SESSION_KEY];
+      if (!session || typeof session !== "object") return null;
+      const status = normalizeText(session.status).toLowerCase();
+      if (status !== "running" && status !== "stopping") return null;
+      if (!Number.isFinite(Number(session.tab_id))) return null;
+      scrapeRunTabId = Number(session.tab_id);
+      return scrapeRunTabId;
+    } catch (_error) {
+      return null;
     }
   }
 

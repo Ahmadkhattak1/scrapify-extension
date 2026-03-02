@@ -1,6 +1,36 @@
 importScripts("shared.js");
 
 const { MSG, rowsToCsv, normalizeText, normalizeWebsiteUrl } = self.GbpShared;
+const ENRICH_SESSION_KEY = "enrichSession";
+let lastEnrichPersistAtMs = 0;
+
+function storageSet(items) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.set(items, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "Storage write failed"));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function saveEnrichSession(session, forceRows, rows) {
+  const snapshot = {
+    ...(session || {}),
+    updated_at: new Date().toISOString()
+  };
+  const payload = {
+    [ENRICH_SESSION_KEY]: snapshot
+  };
+
+  if (forceRows === true && Array.isArray(rows)) {
+    payload.lastRows = rows;
+  }
+
+  return storageSet(payload).catch(() => {});
+}
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || !message.type) {
@@ -57,10 +87,51 @@ function handleExportCsv(message, sendResponse) {
 }
 
 async function handleEnrichRows(message, sendResponse) {
+  const startedAt = new Date().toISOString();
+  const runId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const rows = Array.isArray(message.rows) ? message.rows : [];
+  lastEnrichPersistAtMs = 0;
+  await saveEnrichSession(
+    {
+      run_id: runId,
+      status: "running",
+      started_at: startedAt,
+      total: rows.length,
+      processed: 0,
+      enriched: 0,
+      skipped: 0,
+      blocked: 0,
+      errors: 0,
+      social_scanned: 0,
+      pages_visited: 0,
+      pages_discovered: 0,
+      personal_email_found: 0,
+      company_email_found: 0,
+      current: "",
+      current_url: "",
+      phase: "init",
+      lead_signal_text: "",
+      lead_signal_tone: "info"
+    },
+    false
+  );
+
   try {
-    const rows = Array.isArray(message.rows) ? message.rows : [];
     const options = message.options || {};
     const result = await enrichRows(rows, options);
+
+    await saveEnrichSession(
+      {
+        run_id: runId,
+        status: "done",
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+        ...result.summary,
+        phase: "done"
+      },
+      true,
+      result.rows
+    );
 
     sendResponse({
       type: MSG.ENRICH_DONE,
@@ -68,6 +139,17 @@ async function handleEnrichRows(message, sendResponse) {
       summary: result.summary
     });
   } catch (error) {
+    await saveEnrichSession(
+      {
+        run_id: runId,
+        status: "error",
+        started_at: startedAt,
+        completed_at: new Date().toISOString(),
+        error: error && error.message ? error.message : "Website enrichment failed",
+        phase: "error"
+      },
+      false
+    );
     sendResponse({
       type: MSG.ENRICH_ERROR,
       error: error && error.message ? error.message : "Website enrichment failed"
@@ -92,7 +174,9 @@ async function enrichRows(rows, options) {
     errors: 0,
     social_scanned: 0,
     pages_visited: 0,
-    pages_discovered: 0
+    pages_discovered: 0,
+    personal_email_found: 0,
+    company_email_found: 0
   };
 
   const outputRows = [];
@@ -105,19 +189,27 @@ async function enrichRows(rows, options) {
       owner_title: normalizeText(sourceRow.owner_title),
       owner_email: normalizeText(sourceRow.owner_email),
       contact_email: normalizeText(sourceRow.contact_email),
+      primary_email: normalizeText(sourceRow.primary_email),
+      primary_email_type: normalizeText(sourceRow.primary_email_type),
+      primary_email_source: normalizeText(sourceRow.primary_email_source),
       website_scan_status: normalizeText(sourceRow.website_scan_status),
       site_pages_visited: Number(sourceRow.site_pages_visited || 0),
       site_pages_discovered: Number(sourceRow.site_pages_discovered || 0),
-      social_pages_scanned: Number(sourceRow.social_pages_scanned || 0)
+      social_pages_scanned: Number(sourceRow.social_pages_scanned || 0),
+      social_links: normalizeText(sourceRow.social_links)
     };
 
     const website = normalizeWebsiteUrl(sourceRow.website);
 
     if (!website) {
       enrichedRow.website_scan_status = "no_website";
+      enrichedRow.primary_email = "";
+      enrichedRow.primary_email_type = "";
+      enrichedRow.primary_email_source = "";
       enrichedRow.site_pages_visited = 0;
       enrichedRow.site_pages_discovered = 0;
       enrichedRow.social_pages_scanned = 0;
+      enrichedRow.social_links = "";
       summary.skipped += 1;
       summary.processed += 1;
       outputRows.push(enrichedRow);
@@ -125,6 +217,8 @@ async function enrichRows(rows, options) {
         currentName: sourceRow.name,
         currentUrl: website,
         phase: "skip",
+        leadSignalText: "Skipped: no website",
+        leadSignalTone: "warn",
         sitePagesVisited: summary.pages_visited,
         sitePagesDiscovered: summary.pages_discovered
       });
@@ -164,13 +258,22 @@ async function enrichRows(rows, options) {
       if (scan.ownerTitle) enrichedRow.owner_title = scan.ownerTitle;
       if (scan.ownerEmail) enrichedRow.owner_email = scan.ownerEmail;
       if (scan.contactEmail) enrichedRow.contact_email = scan.contactEmail;
+      enrichedRow.primary_email = normalizeText(scan.primaryEmail);
+      enrichedRow.primary_email_type = normalizeText(scan.primaryEmailType);
+      enrichedRow.primary_email_source = normalizeText(scan.primaryEmailSource);
       enrichedRow.website_scan_status = scan.status;
       enrichedRow.site_pages_visited = Number(scan.pagesVisited || 0);
       enrichedRow.site_pages_discovered = Number(scan.pagesDiscovered || 0);
       enrichedRow.social_pages_scanned = Number(scan.socialScanned || 0);
+      enrichedRow.social_links = Array.isArray(scan.socialLinks) ? scan.socialLinks.join(" | ") : "";
 
       if (scan.blocked) {
         summary.blocked += 1;
+      }
+      if (scan.primaryEmailType === "personal") {
+        summary.personal_email_found += 1;
+      } else if (scan.primaryEmailType === "company") {
+        summary.company_email_found += 1;
       }
       summary.social_scanned += Number(scan.socialScanned || 0);
       summary.pages_visited += Number(scan.pagesVisited || 0);
@@ -183,19 +286,26 @@ async function enrichRows(rows, options) {
       }
     } catch (_rowError) {
       enrichedRow.website_scan_status = "scan_error";
+      enrichedRow.primary_email = "";
+      enrichedRow.primary_email_type = "";
+      enrichedRow.primary_email_source = "";
       enrichedRow.site_pages_visited = 0;
       enrichedRow.site_pages_discovered = 0;
       enrichedRow.social_pages_scanned = 0;
+      enrichedRow.social_links = "";
       summary.errors += 1;
       summary.skipped += 1;
     }
 
     summary.processed += 1;
     outputRows.push(enrichedRow);
+    const leadSignal = buildLeadSignal(enrichedRow);
     emitEnrichProgress(summary, {
       currentName: sourceRow.name,
       currentUrl: website,
       phase: "done",
+      leadSignalText: leadSignal.text,
+      leadSignalTone: leadSignal.tone,
       sitePagesVisited: summary.pages_visited,
       sitePagesDiscovered: summary.pages_discovered
     });
@@ -209,7 +319,7 @@ async function enrichRows(rows, options) {
 
 function emitEnrichProgress(summary, context) {
   const ctx = context || {};
-  chrome.runtime.sendMessage({
+  const payload = {
     type: MSG.ENRICH_PROGRESS,
     total: summary.total,
     processed: summary.processed,
@@ -220,17 +330,79 @@ function emitEnrichProgress(summary, context) {
     social_scanned: Number(ctx.socialScanned != null ? ctx.socialScanned : summary.social_scanned),
     site_pages_visited: Number(ctx.sitePagesVisited != null ? ctx.sitePagesVisited : summary.pages_visited),
     site_pages_discovered: Number(ctx.sitePagesDiscovered != null ? ctx.sitePagesDiscovered : summary.pages_discovered),
+    personal_email_found: Number(summary.personal_email_found || 0),
+    company_email_found: Number(summary.company_email_found || 0),
     current: normalizeText(ctx.currentName),
     current_url: normalizeText(ctx.currentUrl),
-    phase: normalizeText(ctx.phase)
-  });
+    phase: normalizeText(ctx.phase),
+    lead_signal_text: normalizeText(ctx.leadSignalText),
+    lead_signal_tone: normalizeText(ctx.leadSignalTone)
+  };
+
+  chrome.runtime.sendMessage(payload);
+  const now = Date.now();
+  const forcePersist = /^(done|skip|error)$/.test(normalizeText(ctx.phase).toLowerCase());
+  if (forcePersist || now - lastEnrichPersistAtMs >= 350) {
+    lastEnrichPersistAtMs = now;
+    saveEnrichSession(
+      {
+        status: "running",
+        ...payload
+      },
+      false
+    );
+  }
+}
+
+function buildLeadSignal(row) {
+  const primaryEmail = normalizeText(row && row.primary_email);
+  const emailType = normalizeText(row && row.primary_email_type).toLowerCase();
+  const emailSource = normalizeText(row && row.primary_email_source);
+  const scanStatus = normalizeText(row && row.website_scan_status).toLowerCase();
+  const ownerName = normalizeText(row && row.owner_name);
+
+  if (primaryEmail) {
+    if (emailType === "personal") {
+      return {
+        text: `Saved personal email (${sourceLabel(emailSource)})`,
+        tone: "success"
+      };
+    }
+    return {
+      text: `Saved company email fallback (${sourceLabel(emailSource)})`,
+      tone: "info"
+    };
+  }
+
+  if (scanStatus === "blocked") {
+    return { text: "Skipped: blocked by site protections", tone: "warn" };
+  }
+  if (scanStatus === "scan_error") {
+    return { text: "Skipped: scan error", tone: "warn" };
+  }
+  if (scanStatus === "no_website") {
+    return { text: "Skipped: no website", tone: "warn" };
+  }
+
+  if (scanStatus === "enriched" && ownerName) {
+    return { text: "Saved owner details (no public email)", tone: "info" };
+  }
+
+  return { text: "Skipped: no public email found", tone: "warn" };
+}
+
+function sourceLabel(source) {
+  const value = normalizeText(source);
+  return value || "website";
 }
 
 async function scanWebsite(startUrl, options) {
   let tab = null;
   const emails = new Set();
+  const emailSourceByAddress = new Map();
   const ownerCandidates = [];
   const socialCandidates = new Set();
+  const socialDiscovered = new Set();
   let blocked = false;
   let socialScanned = 0;
   let pagesVisited = 0;
@@ -252,6 +424,23 @@ async function scanWebsite(startUrl, options) {
       pagesDiscovered: discovered.size,
       socialScanned
     });
+  };
+
+  const registerEmail = (email, sourceUrl) => {
+    const normalized = normalizeEmail(email);
+    if (!normalized) return;
+    emails.add(normalized);
+
+    if (!emailSourceByAddress.has(normalized)) {
+      emailSourceByAddress.set(normalized, classifyEmailSource(sourceUrl));
+    }
+  };
+
+  const registerSocialCandidate = (socialUrl) => {
+    const normalizedSocial = normalizeWebsiteUrl(socialUrl);
+    if (!normalizedSocial) return;
+    socialCandidates.add(normalizedSocial);
+    socialDiscovered.add(normalizedSocial);
   };
 
   try {
@@ -287,8 +476,7 @@ async function scanWebsite(startUrl, options) {
       }
 
       for (const email of pageData.emails || []) {
-        const normalized = normalizeEmail(email);
-        if (normalized) emails.add(normalized);
+        registerEmail(email, nextUrl);
       }
 
       for (const candidate of pageData.ownerCandidates || []) {
@@ -320,15 +508,16 @@ async function scanWebsite(startUrl, options) {
       }
 
       for (const social of pageData.socialLinks || []) {
-        const normalizedSocial = normalizeWebsiteUrl(social);
-        if (!normalizedSocial) continue;
-        socialCandidates.add(normalizedSocial);
+        registerSocialCandidate(social);
       }
       reportProgress("site_page_done", nextUrl);
     }
 
     if (options.scanSocialLinks === true && emails.size === 0 && socialCandidates.size > 0) {
-      const socialQueue = Array.from(socialCandidates).slice(0, options.maxSocialPages || 0);
+      const socialQueue = prioritizeSocialLinks(Array.from(socialCandidates))
+        .filter(shouldScanSocialUrl)
+        .slice(0, options.maxSocialPages || 0);
+
       for (const socialUrl of socialQueue) {
         reportProgress("social_page", socialUrl);
         let socialData = null;
@@ -352,8 +541,7 @@ async function scanWebsite(startUrl, options) {
         }
 
         for (const email of socialData.emails || []) {
-          const normalized = normalizeEmail(email);
-          if (normalized) emails.add(normalized);
+          registerEmail(email, socialUrl);
         }
 
         for (const candidate of socialData.ownerCandidates || []) {
@@ -378,9 +566,12 @@ async function scanWebsite(startUrl, options) {
   const emailList = Array.from(emails);
   const ownerEmail = chooseOwnerEmail(emailList, bestOwner ? bestOwner.name : "");
   const contactEmail = chooseContactEmail(emailList, ownerEmail);
+  const primaryEmail = ownerEmail || contactEmail || "";
+  const primaryEmailType = ownerEmail ? "personal" : contactEmail ? "company" : "";
+  const primaryEmailSource = primaryEmail ? sourceForEmail(primaryEmail, emailSourceByAddress) : "";
 
   let status = "no_public_data";
-  if (bestOwner || ownerEmail || contactEmail) {
+  if (bestOwner || primaryEmail) {
     status = "enriched";
   } else if (blocked) {
     status = "blocked";
@@ -391,11 +582,15 @@ async function scanWebsite(startUrl, options) {
     ownerTitle: bestOwner ? bestOwner.title : "",
     ownerEmail,
     contactEmail,
+    primaryEmail,
+    primaryEmailType,
+    primaryEmailSource,
     status,
     blocked,
     socialScanned,
     pagesVisited,
-    pagesDiscovered: discovered.size
+    pagesDiscovered: discovered.size,
+    socialLinks: Array.from(socialDiscovered).slice(0, 20)
   };
 }
 
@@ -443,6 +638,13 @@ function chooseOwnerEmail(emails, ownerName) {
     }
   }
 
+  for (const email of list) {
+    const local = email.split("@")[0];
+    if (!isGenericMailboxLocalPart(local)) {
+      return email;
+    }
+  }
+
   return "";
 }
 
@@ -466,6 +668,71 @@ function chooseContactEmail(emails, ownerEmail) {
   }
 
   return list[0] || "";
+}
+
+function isGenericMailboxLocalPart(localPart) {
+  const local = normalizeText(localPart).toLowerCase();
+  if (!local) return false;
+  return /^(info|contact|hello|office|support|admin|sales|team|careers|jobs|hr|service|help|enquiries|inquiries)([._-]?[a-z0-9]*)?$/.test(local);
+}
+
+function sourceForEmail(email, sourceMap) {
+  if (!email || !(sourceMap instanceof Map)) return "";
+  const source = sourceMap.get(email);
+  return normalizeText(source);
+}
+
+function prioritizeSocialLinks(links) {
+  if (!Array.isArray(links) || links.length === 0) return [];
+  const unique = new Map();
+  for (const rawLink of links) {
+    const normalized = normalizeWebsiteUrl(rawLink);
+    if (!normalized || unique.has(normalized)) continue;
+    unique.set(normalized, socialPriorityScore(normalized));
+  }
+
+  return Array.from(unique.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([link]) => link);
+}
+
+function socialPriorityScore(url) {
+  const host = hostnameForUrl(url);
+  if (!host) return 0;
+  if (host.includes("facebook.com")) return 8;
+  if (host.includes("instagram.com")) return 3;
+  if (host.includes("linkedin.com")) return 2;
+  if (host.includes("x.com") || host.includes("twitter.com")) return -3;
+  if (host.includes("youtube.com")) return -4;
+  return 1;
+}
+
+function shouldScanSocialUrl(url) {
+  const host = hostnameForUrl(url);
+  if (!host) return false;
+  return host.includes("facebook.com");
+}
+
+function classifyEmailSource(url) {
+  const host = hostnameForUrl(url);
+  if (!host) return "website";
+  if (host.includes("facebook.com")) return "facebook";
+  if (host.includes("instagram.com")) return "instagram";
+  if (host.includes("linkedin.com")) return "linkedin";
+  if (host.includes("x.com") || host.includes("twitter.com")) return "x";
+  if (host.includes("youtube.com")) return "youtube";
+  return "website";
+}
+
+function hostnameForUrl(url) {
+  const normalized = normalizeWebsiteUrl(url);
+  if (!normalized) return "";
+  try {
+    const parsed = new URL(normalized);
+    return normalizeText(parsed.hostname).toLowerCase();
+  } catch (_e) {
+    return "";
+  }
 }
 
 function sanitizeEmailList(emails) {
@@ -787,11 +1054,46 @@ function extractPageDataScript() {
   const bodyText = normalize(document.body ? document.body.innerText || "" : "");
   const emails = new Set();
   const ownerCandidates = [];
+  const hostname = normalize(window.location.hostname || "").toLowerCase();
 
   const regexMatches = bodyText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
   for (const value of regexMatches) {
     const email = normalize(value).toLowerCase();
     if (isLikelyEmail(email)) emails.add(email);
+  }
+
+  if (hostname.includes("facebook.com")) {
+    const fbMain = document.querySelector("[role='main']");
+    const fbPrimaryText = normalize(
+      (fbMain && fbMain.innerText) || document.title || ""
+    );
+    const fbMatches = fbPrimaryText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+    for (const value of fbMatches) {
+      const email = normalize(value).toLowerCase();
+      if (isLikelyEmail(email)) emails.add(email);
+    }
+
+    const fbContactMeta = [
+      "meta[property='business:contact_data:email']",
+      "meta[property='og:email']",
+      "meta[name='email']"
+    ];
+    for (const selector of fbContactMeta) {
+      const node = document.querySelector(selector);
+      const email = normalize((node && node.getAttribute("content")) || "").toLowerCase();
+      if (isLikelyEmail(email)) emails.add(email);
+    }
+
+    const ariaNodes = Array.from(document.querySelectorAll("a[aria-label], span[aria-label], div[aria-label]")).slice(0, 1800);
+    for (const node of ariaNodes) {
+      const aria = normalize(node.getAttribute("aria-label") || "");
+      if (!aria) continue;
+      const hits = aria.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+      for (const hit of hits) {
+        const email = normalize(hit).toLowerCase();
+        if (isLikelyEmail(email)) emails.add(email);
+      }
+    }
   }
 
   const tryCollectStructuredData = (obj) => {

@@ -177,6 +177,28 @@ button:disabled {
   font-size: 12px;
 }
 
+#leadSignalText {
+  margin: 0;
+  min-height: 16px;
+  font-size: 11px;
+}
+
+.lead-signal {
+  color: var(--muted);
+}
+
+.lead-signal.success {
+  color: #127a3e;
+}
+
+.lead-signal.info {
+  color: #0d67ff;
+}
+
+.lead-signal.warn {
+  color: #b54708;
+}
+
 .error {
   color: var(--danger);
 }

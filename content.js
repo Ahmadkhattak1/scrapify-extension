@@ -6,10 +6,20 @@
 
   const shared = window.GbpShared;
   const { MSG, DEFAULT_MAX_ROWS, normalizeText, parseRating, parseReviewCount, normalizeMapsUrl, dedupeKey, applyFilters } = shared;
+  const SCRAPE_SESSION_KEY = "scrapeSession";
+  const ROW_SNAPSHOT_INTERVAL = 8;
 
   const state = {
     isRunning: false,
     stopRequested: false,
+    runId: "",
+    runTabId: null,
+    runStartedAtIso: "",
+    runInfiniteScroll: false,
+    sourceQuery: "",
+    sourceUrl: "",
+    lastProgressPersistAtMs: 0,
+    persistedRowsCount: 0,
     seenCardKeys: new Set(),
     seenKeys: new Set(),
     rows: [],
@@ -26,7 +36,7 @@
     errors: 0
   };
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || !message.type) {
       return false;
     }
@@ -37,7 +47,13 @@
         return false;
       }
 
-      runScrape(message.config || {})
+      const incomingConfig = message.config || {};
+      const senderTabId = sender && sender.tab && sender.tab.id != null ? sender.tab.id : null;
+      if (incomingConfig.runTabId == null && senderTabId != null) {
+        incomingConfig.runTabId = senderTabId;
+      }
+
+      runScrape(incomingConfig)
         .then((result) => {
           sendResponse({ ok: true, result });
         })
@@ -50,6 +66,7 @@
 
     if (message.type === MSG.STOP_SCRAPE) {
       state.stopRequested = true;
+      persistScrapeSession({ status: "stopping", force: true });
       sendResponse({ ok: true });
       return false;
     }
@@ -60,12 +77,24 @@
   async function runScrape(config) {
     resetState();
     state.isRunning = true;
+    state.runId = createRunId(config.runId);
+    state.runTabId = Number.isFinite(Number(config.runTabId)) ? Number(config.runTabId) : null;
+    state.runStartedAtIso = new Date().toISOString();
 
     const maxRows = Number(config.maxRows) > 0 ? Number(config.maxRows) : DEFAULT_MAX_ROWS;
     const infiniteScroll = Boolean(config.infiniteScroll);
+    state.runInfiniteScroll = infiniteScroll;
     const filters = config.filters || {};
     const sourceQuery = getCurrentQuery();
     const sourceUrl = window.location.href;
+    state.sourceQuery = normalizeText(sourceQuery);
+    state.sourceUrl = normalizeMapsUrl(sourceUrl);
+
+    persistScrapeSession({
+      status: "running",
+      infinite_scroll: infiniteScroll,
+      force: true
+    });
 
     try {
       const feed = findResultsFeed();
@@ -170,16 +199,33 @@
         stopped: state.stopRequested
       };
 
+      persistScrapeSession({
+        status: summary.stopped ? "stopped" : "done",
+        summary,
+        rows: state.rows,
+        force: true
+      });
+
       chrome.runtime.sendMessage({
         type: MSG.SCRAPE_DONE,
+        run_id: state.runId,
+        tab_id: state.runTabId,
         rows: state.rows,
         summary
       });
 
       return { rows: state.rows, summary };
     } catch (error) {
+      persistScrapeSession({
+        status: "error",
+        error: error && error.message ? error.message : "Unexpected scrape error",
+        rows: state.rows,
+        force: true
+      });
       chrome.runtime.sendMessage({
         type: MSG.SCRAPE_ERROR,
+        run_id: state.runId,
+        tab_id: state.runTabId,
         error: error && error.message ? error.message : "Unexpected scrape error"
       });
       throw error;
@@ -280,6 +326,7 @@
     if (!card) return null;
     const link = resolveCardLink(card);
     const cardText = normalizeText(card.textContent || "");
+    const quickData = buildQuickCardData(card);
     const lines = cardText.split(/\n+/).map((line) => normalizeText(line)).filter(Boolean);
 
     const name =
@@ -295,8 +342,8 @@
     return {
       place_id: normalizeText(placeId),
       name: normalizeText(name),
-      rating: parseRating(cardText),
-      review_count: parseReviewCount(cardText),
+      rating: quickData.rating !== "" ? quickData.rating : parseRating(cardText),
+      review_count: quickData.reviews !== "" ? quickData.reviews : parseReviewCount(cardText),
       category: lines[1] || "",
       address: "",
       phone: "",
@@ -405,47 +452,91 @@
     return {
       text,
       lower: text.toLowerCase(),
-      rating: parseCardRating(text),
-      reviews: parseCardReviewCount(text)
+      rating: parseCardRating(card, text),
+      reviews: parseCardReviewCount(card, text)
     };
   }
 
-  function parseCardRating(text) {
-    const clean = normalizeText(text).replace(",", ".");
-    if (!clean) return "";
+  function parseCardRating(card, text) {
+    const candidates = [
+      attrFromWithin(card, "span[role='img'][aria-label*='star']", "aria-label"),
+      attrFromWithin(card, "span[aria-label*='star']", "aria-label"),
+      attrFromWithin(card, "span[aria-hidden='true']", "textContent"),
+      normalizeText(text)
+    ];
 
-    const starPattern = clean.match(/(\d(?:\.\d)?)\s*[★⭐]/);
-    if (starPattern && starPattern[1]) {
-      const value = Number(starPattern[1]);
-      return Number.isFinite(value) ? value : "";
-    }
-
-    const directPattern = clean.match(/\b([0-5](?:\.\d)?)\b/);
-    if (directPattern && directPattern[1]) {
-      const value = Number(directPattern[1]);
-      return Number.isFinite(value) ? value : "";
+    for (const candidate of candidates) {
+      const value = parseRatingFromStarContext(candidate);
+      if (value !== "") return value;
     }
 
     return "";
   }
 
-  function parseCardReviewCount(text) {
-    const clean = normalizeText(text);
+  function parseCardReviewCount(card, text) {
+    const candidates = [
+      attrFromWithin(card, "button[aria-label*='review']", "aria-label"),
+      attrFromWithin(card, "span[aria-label*='review']", "aria-label"),
+      normalizeText(text)
+    ];
+
+    for (const candidate of candidates) {
+      const value = parseReviewCountFromReviewContext(candidate);
+      if (value !== "") return value;
+    }
+
+    return "";
+  }
+
+  function parseRatingFromStarContext(text) {
+    const clean = normalizeText(text).replace(/,/g, ".");
     if (!clean) return "";
 
-    const parenPattern = clean.match(/\(([\d,]+)\)/);
-    if (parenPattern && parenPattern[1]) {
-      const value = Number(parenPattern[1].replace(/,/g, ""));
-      return Number.isFinite(value) ? value : "";
+    const starPattern = clean.match(/([0-5](?:\.\d)?)\s*(?:stars?|★|⭐)/i);
+    if (starPattern && starPattern[1]) {
+      const value = Number(starPattern[1]);
+      if (Number.isFinite(value)) return value;
     }
+
+    const ratedPattern = clean.match(/rated\s*([0-5](?:\.\d)?)/i);
+    if (ratedPattern && ratedPattern[1]) {
+      const value = Number(ratedPattern[1]);
+      if (Number.isFinite(value)) return value;
+    }
+
+    const compactPattern = clean.match(/\b([0-5](?:\.\d)?)\s*\(([\d,]+)\)/);
+    if (compactPattern && compactPattern[1]) {
+      const value = Number(compactPattern[1]);
+      if (Number.isFinite(value)) return value;
+    }
+
+    return "";
+  }
+
+  function parseReviewCountFromReviewContext(text) {
+    const clean = normalizeText(text);
+    if (!clean) return "";
 
     const wordPattern = clean.match(/([\d,]+)\s+reviews?/i);
     if (wordPattern && wordPattern[1]) {
       const value = Number(wordPattern[1].replace(/,/g, ""));
-      return Number.isFinite(value) ? value : "";
+      if (Number.isFinite(value)) return value;
+    }
+
+    const parenPattern = clean.match(/\(([\d,]+)\)/);
+    if (parenPattern && parenPattern[1]) {
+      const value = Number(parenPattern[1].replace(/,/g, ""));
+      if (Number.isFinite(value)) return value;
     }
 
     return "";
+  }
+
+  function attrFromWithin(root, selector, attrName) {
+    if (!root || typeof root.querySelector !== "function") return "";
+    const node = root.querySelector(selector);
+    if (!node) return "";
+    return normalizeText(node[attrName] || node.getAttribute(attrName) || "");
   }
 
   function findResultsFeed() {
@@ -551,8 +642,84 @@
     return normalizeText(input.value || "");
   }
 
+  function createRunId(existing) {
+    const supplied = normalizeText(existing);
+    if (supplied) return supplied;
+    return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function persistScrapeSession(options) {
+    const opts = options || {};
+    const now = Date.now();
+    const force = opts.force === true;
+    if (!force && now - state.lastProgressPersistAtMs < 400) return;
+
+    state.lastProgressPersistAtMs = now;
+    const summary = opts.summary || {};
+    const progress = opts.progress || {};
+    const status = normalizeText(opts.status || "running") || "running";
+    const perf = getPerformanceStats();
+    const shouldPersistRows = force || state.rows.length - state.persistedRowsCount >= ROW_SNAPSHOT_INTERVAL;
+    const rows = Array.isArray(opts.rows) ? opts.rows : state.rows;
+
+    const snapshot = {
+      run_id: state.runId,
+      tab_id: Number.isFinite(Number(state.runTabId)) ? Number(state.runTabId) : null,
+      status,
+      processed: Number(progress.processed != null ? progress.processed : state.processed),
+      matched: Number(progress.matched != null ? progress.matched : state.matched),
+      duplicates: Number(progress.duplicates != null ? progress.duplicates : state.duplicates),
+      fast_skipped: Number(progress.fast_skipped != null ? progress.fast_skipped : state.fastSkipped),
+      errors: Number(progress.errors != null ? progress.errors : state.errors),
+      seen_listings: Number(progress.seen_listings != null ? progress.seen_listings : perf.seen_listings),
+      rate_per_sec: Number(progress.rate_per_sec != null ? progress.rate_per_sec : perf.rate_per_sec),
+      avg_rating_seen: progress.avg_rating_seen != null ? progress.avg_rating_seen : perf.avg_rating_seen,
+      avg_reviews_seen: progress.avg_reviews_seen != null ? progress.avg_reviews_seen : perf.avg_reviews_seen,
+      rows_count: rows.length,
+      source_query: state.sourceQuery,
+      source_url: state.sourceUrl,
+      infinite_scroll: state.runInfiniteScroll,
+      updated_at: new Date().toISOString()
+    };
+
+    if (opts.infinite_scroll != null) {
+      snapshot.infinite_scroll = opts.infinite_scroll === true;
+    }
+    if (summary && typeof summary === "object") {
+      snapshot.summary = summary;
+      if (summary.stopped === true) {
+        snapshot.status = "stopped";
+      }
+    }
+    if (opts.error) {
+      snapshot.error = normalizeText(opts.error);
+    }
+    snapshot.started_at = state.runStartedAtIso || new Date().toISOString();
+    if (status === "done" || status === "stopped" || status === "error") {
+      snapshot.completed_at = new Date().toISOString();
+    }
+
+    const payload = {
+      [SCRAPE_SESSION_KEY]: snapshot
+    };
+    if (shouldPersistRows) {
+      payload.lastRows = rows;
+      state.persistedRowsCount = rows.length;
+    }
+
+    chrome.storage.local.set(payload, () => {});
+  }
+
   function resetState() {
     state.stopRequested = false;
+    state.runId = "";
+    state.runTabId = null;
+    state.runStartedAtIso = "";
+    state.runInfiniteScroll = false;
+    state.sourceQuery = "";
+    state.sourceUrl = "";
+    state.lastProgressPersistAtMs = 0;
+    state.persistedRowsCount = 0;
     state.seenCardKeys = new Set();
     state.seenKeys = new Set();
     state.rows = [];
@@ -571,14 +738,21 @@
 
   function sendProgress() {
     const perf = getPerformanceStats();
-    chrome.runtime.sendMessage({
+    const payload = {
       type: MSG.SCRAPE_PROGRESS,
+      run_id: state.runId,
+      tab_id: state.runTabId,
       processed: state.processed,
       matched: state.matched,
       duplicates: state.duplicates,
       fast_skipped: state.fastSkipped,
       ...perf,
       errors: state.errors
+    };
+    chrome.runtime.sendMessage(payload);
+    persistScrapeSession({
+      status: state.stopRequested ? "stopping" : "running",
+      progress: payload
     });
   }
 

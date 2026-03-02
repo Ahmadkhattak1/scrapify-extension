@@ -17,9 +17,14 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 - Optional website enrichment mode (category-agnostic):
   - crawls internal website pages (configurable pages/site) instead of scanning only landing page
   - scans public pages for owner/founder/president/CEO-style names and emails
-  - can follow social links (Facebook/Instagram/LinkedIn/X/etc.) when website email is missing
+  - tracks discovered social links and can scan Facebook pages for fallback email when website email is missing
   - optional visible-tab mode to watch enrichment navigation live
   - skips blocked/unavailable websites and keeps core GBP data
+- Persistent run/session snapshots in `chrome.storage.local` so progress/results survive popup close/reopen
+- Email precedence output fields:
+  - `primary_email` (personal email first; falls back to company/contact)
+  - `primary_email_type` (`personal` or `company`)
+  - `primary_email_source` (`website`, `facebook`, etc.)
 - Fast pre-filtering from list cards for rating/review/name/category constraints to avoid opening every listing
 - Live run analytics in popup: processing speed (entries/sec), seen listings, avg rating, avg reviews
 - Live enrichment analytics: pages visited, pages discovered, social pages scanned
