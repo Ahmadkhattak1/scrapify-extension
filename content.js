@@ -1,4 +1,9 @@
 (function () {
+  if (window.__GBP_MAPS_SCRAPER_BOOTSTRAPPED__ === true) {
+    return;
+  }
+  window.__GBP_MAPS_SCRAPER_BOOTSTRAPPED__ = true;
+
   const shared = window.GbpShared;
   const { MSG, DEFAULT_MAX_ROWS, normalizeText, parseRating, parseReviewCount, normalizeMapsUrl, dedupeKey, applyFilters } = shared;
 

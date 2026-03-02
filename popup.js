@@ -93,10 +93,26 @@
     resetCounters();
 
     try {
-      const response = await sendMessageToTab(tab.id, {
-        type: MSG.START_SCRAPE,
-        config
-      });
+      await ensureContentScriptReady(tab.id);
+
+      let response;
+      try {
+        response = await sendMessageToTab(tab.id, {
+          type: MSG.START_SCRAPE,
+          config
+        });
+      } catch (firstErr) {
+        if (!isNoReceiverError(firstErr)) {
+          throw firstErr;
+        }
+
+        // Retry once after force-injecting scripts if receiver was not present yet.
+        await ensureContentScriptReady(tab.id);
+        response = await sendMessageToTab(tab.id, {
+          type: MSG.START_SCRAPE,
+          config
+        });
+      }
 
       if (!response || response.ok !== true) {
         throw new Error((response && response.error) || "Failed to start scrape");
@@ -110,7 +126,11 @@
       scrapeRunning = false;
       runInfiniteCurrent = false;
       setRunningState(isBusy());
-      setError(error && error.message ? error.message : "Could not start scrape");
+      if (isNoReceiverError(error)) {
+        setError("Could not attach scraper to this tab. Refresh Google Maps and try again.");
+      } else {
+        setError(error && error.message ? error.message : "Could not start scrape");
+      }
     }
   }
 
@@ -120,6 +140,7 @@
     if (!tab || !tab.id) return;
 
     try {
+      await ensureContentScriptReady(tab.id);
       await sendMessageToTab(tab.id, { type: MSG.STOP_SCRAPE });
       setState("Stopping...");
     } catch (_error) {
@@ -348,7 +369,7 @@
 
   function isMapsUrl(url) {
     if (!url) return false;
-    return /^https:\/\/www\.google\.com\/maps\//.test(url);
+    return /^https:\/\/([a-z0-9-]+\.)?google\.[a-z.]+\/maps\//i.test(url);
   }
 
   function defaultFilename() {
@@ -366,6 +387,24 @@
         }
         resolve(response);
       });
+    });
+  }
+
+  function ensureContentScriptReady(tabId) {
+    return new Promise((resolve, reject) => {
+      chrome.scripting.executeScript(
+        {
+          target: { tabId },
+          files: ["shared.js", "content.js"]
+        },
+        () => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message || "Failed to inject scraper scripts"));
+            return;
+          }
+          resolve();
+        }
+      );
     });
   }
 
@@ -507,5 +546,10 @@
 
   function isBusy() {
     return scrapeRunning || enrichRunning;
+  }
+
+  function isNoReceiverError(error) {
+    const msg = error && error.message ? String(error.message) : "";
+    return /receiving end does not exist/i.test(msg) || /could not establish connection/i.test(msg);
   }
 })();
