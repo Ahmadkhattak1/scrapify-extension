@@ -6,6 +6,9 @@
     maxRows: document.getElementById("maxRows"),
     infiniteScroll: document.getElementById("infiniteScroll"),
     enableEnrichment: document.getElementById("enableEnrichment"),
+    siteMaxPages: document.getElementById("siteMaxPages"),
+    showEnrichmentTabs: document.getElementById("showEnrichmentTabs"),
+    scanSocialLinks: document.getElementById("scanSocialLinks"),
     minRating: document.getElementById("minRating"),
     maxRating: document.getElementById("maxRating"),
     minReviews: document.getElementById("minReviews"),
@@ -26,6 +29,13 @@
     matched: document.getElementById("matched"),
     duplicates: document.getElementById("duplicates"),
     errors: document.getElementById("errors"),
+    speedStat: document.getElementById("speedStat"),
+    seenListingsStat: document.getElementById("seenListingsStat"),
+    avgRatingStat: document.getElementById("avgRatingStat"),
+    avgReviewsStat: document.getElementById("avgReviewsStat"),
+    crawlVisitedStat: document.getElementById("crawlVisitedStat"),
+    crawlDiscoveredStat: document.getElementById("crawlDiscoveredStat"),
+    socialScannedStat: document.getElementById("socialScannedStat"),
     stateText: document.getElementById("stateText"),
     errorText: document.getElementById("errorText")
   };
@@ -37,6 +47,9 @@
   let infiniteScrollEnabled = false;
   let runInfiniteCurrent = false;
   let enrichmentEnabled = false;
+  let siteMaxPagesValue = 40;
+  let showEnrichmentTabsEnabled = false;
+  let scanSocialLinksEnabled = true;
 
   init();
 
@@ -47,6 +60,9 @@
 
     el.infiniteScroll.checked = infiniteScrollEnabled;
     el.enableEnrichment.checked = enrichmentEnabled;
+    el.siteMaxPages.value = String(siteMaxPagesValue);
+    el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
+    el.scanSocialLinks.checked = scanSocialLinksEnabled;
 
     syncInfiniteScrollInput();
     renderColumnSelector();
@@ -62,6 +78,9 @@
     el.exportBtn.addEventListener("click", onExport);
     el.infiniteScroll.addEventListener("change", onInfiniteScrollToggle);
     el.enableEnrichment.addEventListener("change", onEnrichmentToggle);
+    el.siteMaxPages.addEventListener("change", onSiteMaxPagesChange);
+    el.showEnrichmentTabs.addEventListener("change", onShowEnrichmentTabsToggle);
+    el.scanSocialLinks.addEventListener("change", onScanSocialLinksToggle);
     el.columnsAllBtn.addEventListener("click", onSelectAllColumns);
     el.columnsNoneBtn.addEventListener("click", onClearColumns);
   }
@@ -161,33 +180,21 @@
       return;
     }
 
+    if (!el.enableEnrichment.checked && selectedColumns.some(isEnrichmentColumn) && !rowsAlreadyEnriched(lastRows)) {
+      setError("You selected enrichment columns. Enable 'Enrich websites' to populate them.");
+      return;
+    }
+
+    if (enrichRunning) {
+      setError("Website enrichment is still running. Wait for it to finish, then export.");
+      return;
+    }
+
     let rowsForExport = lastRows;
 
     try {
       if (el.enableEnrichment.checked) {
-        enrichRunning = true;
-        setRunningState(isBusy());
-        setState("Enriching websites...");
-
-        const enrichResponse = await sendRuntimeMessage({
-          type: MSG.ENRICH_ROWS,
-          rows: rowsForExport,
-          options: {
-            maxPagesPerSite: 3,
-            timeoutMs: 12000
-          }
-        });
-
-        if (!enrichResponse || enrichResponse.type !== MSG.ENRICH_DONE) {
-          throw new Error((enrichResponse && enrichResponse.error) || "Website enrichment failed");
-        }
-
-        rowsForExport = Array.isArray(enrichResponse.rows) ? enrichResponse.rows : rowsForExport;
-        lastRows = rowsForExport;
-        persistRows(rowsForExport);
-
-        const enrichSummary = enrichResponse.summary || {};
-        setState(`Enrichment: ${enrichSummary.enriched || 0} enriched, ${enrichSummary.skipped || 0} skipped, ${enrichSummary.blocked || 0} blocked`);
+        rowsForExport = await enrichRowsBestEffort(rowsForExport, { force: false });
       }
 
       const filename = defaultFilename();
@@ -205,9 +212,6 @@
       setState(`Exported ${rowsForExport.length} row(s)`);
     } catch (error) {
       setError(error && error.message ? error.message : "CSV export failed");
-    } finally {
-      enrichRunning = false;
-      setRunningState(isBusy());
     }
   }
 
@@ -221,7 +225,9 @@
       el.matched.textContent = String(message.matched || 0);
       el.duplicates.textContent = String(message.duplicates || 0);
       el.errors.textContent = String(message.errors || 0);
-      setState(runInfiniteCurrent ? "Scraping (infinite scroll)..." : "Scraping...");
+      updatePerformanceMetrics(message);
+      const quickSkips = Number(message.fast_skipped || 0);
+      setState(runInfiniteCurrent ? `Scraping (infinite scroll)... fast-skipped ${quickSkips}` : `Scraping... fast-skipped ${quickSkips}`);
       return;
     }
 
@@ -242,7 +248,20 @@
     if (message.type === MSG.ENRICH_PROGRESS) {
       const processed = Number(message.processed || 0);
       const total = Number(message.total || 0);
-      setState(`Enriching websites ${processed}/${total}...`);
+      const current = normalizeText(message.current || "");
+      const phase = normalizeText(message.phase || "");
+      const host = shortHost(message.current_url || "");
+      const siteVisited = Number(message.site_pages_visited || 0);
+      const siteDiscovered = Number(message.site_pages_discovered || 0);
+      const socialScanned = Number(message.social_scanned || 0);
+      const currentSuffix = current ? ` ${current}` : "";
+      const phaseSuffix = phase ? ` (${phase})` : "";
+      const hostSuffix = host ? ` @ ${host}` : "";
+      const crawlSuffix = ` pages ${siteVisited}/${siteDiscovered}`;
+      setState(`Enriching websites ${processed}/${total}${phaseSuffix}${hostSuffix}${crawlSuffix}...${currentSuffix}`);
+      el.crawlVisitedStat.textContent = String(Number.isFinite(siteVisited) ? siteVisited : 0);
+      el.crawlDiscoveredStat.textContent = String(Number.isFinite(siteDiscovered) ? siteDiscovered : 0);
+      el.socialScannedStat.textContent = String(Number.isFinite(socialScanned) ? socialScanned : 0);
       return;
     }
 
@@ -307,6 +326,13 @@
     el.matched.textContent = "0";
     el.duplicates.textContent = "0";
     el.errors.textContent = "0";
+    el.speedStat.textContent = "0.00/s";
+    el.seenListingsStat.textContent = "0";
+    el.avgRatingStat.textContent = "-";
+    el.avgReviewsStat.textContent = "-";
+    el.crawlVisitedStat.textContent = "0";
+    el.crawlDiscoveredStat.textContent = "0";
+    el.socialScannedStat.textContent = "0";
   }
 
   function setState(text) {
@@ -323,7 +349,15 @@
 
   async function restoreState() {
     try {
-      const data = await storageGet(["lastRows", "selectedColumns", "infiniteScrollEnabled", "enrichmentEnabled"]);
+      const data = await storageGet([
+        "lastRows",
+        "selectedColumns",
+        "infiniteScrollEnabled",
+        "enrichmentEnabled",
+        "siteMaxPagesValue",
+        "showEnrichmentTabsEnabled",
+        "scanSocialLinksEnabled"
+      ]);
       if (Array.isArray(data.lastRows)) {
         lastRows = data.lastRows;
       }
@@ -332,6 +366,9 @@
       }
       infiniteScrollEnabled = data.infiniteScrollEnabled === true;
       enrichmentEnabled = data.enrichmentEnabled === true;
+      siteMaxPagesValue = clampInt(data.siteMaxPagesValue, 1, 120, 40);
+      showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
+      scanSocialLinksEnabled = data.scanSocialLinksEnabled !== false;
       el.exportBtn.disabled = isBusy() || !Array.isArray(lastRows) || selectedColumns.length === 0;
     } catch (_error) {
       el.exportBtn.disabled = true;
@@ -358,12 +395,20 @@
     el.matched.textContent = String(summary.matched || rows.length || 0);
     el.duplicates.textContent = String(summary.duplicates || 0);
     el.errors.textContent = String(summary.errors || 0);
+    updatePerformanceMetrics(summary);
 
     const status = summary.stopped ? "Stopped" : "Completed";
-    setState(`${status}: ${rows.length} unique row(s), ${summary.duplicates || 0} duplicates`);
+    const fastSkipped = Number(summary.fast_skipped || 0);
+    setState(`${status}: ${rows.length} unique row(s), ${summary.duplicates || 0} duplicates, ${fastSkipped} fast-skipped`);
 
     if (rows.length === 0 && Number(summary.processed || 0) > 0) {
       setError("No rows extracted. Try disabling strict filters or run again with fewer active constraints.");
+    }
+
+    if (!summary.stopped && el.enableEnrichment.checked && rows.length > 0) {
+      void enrichRowsBestEffort(rows, { force: false }).catch((error) => {
+        setError(error && error.message ? error.message : "Website enrichment failed");
+      });
     }
   }
 
@@ -469,6 +514,22 @@
     storageSet({ enrichmentEnabled }).catch(() => {});
   }
 
+  function onSiteMaxPagesChange() {
+    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 40);
+    el.siteMaxPages.value = String(siteMaxPagesValue);
+    storageSet({ siteMaxPagesValue }).catch(() => {});
+  }
+
+  function onShowEnrichmentTabsToggle() {
+    showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked;
+    storageSet({ showEnrichmentTabsEnabled }).catch(() => {});
+  }
+
+  function onScanSocialLinksToggle() {
+    scanSocialLinksEnabled = el.scanSocialLinks.checked;
+    storageSet({ scanSocialLinksEnabled }).catch(() => {});
+  }
+
   function syncInfiniteScrollInput() {
     const enabled = el.infiniteScroll.checked;
     el.maxRows.disabled = enabled;
@@ -546,6 +607,109 @@
 
   function isBusy() {
     return scrapeRunning || enrichRunning;
+  }
+
+  function isEnrichmentColumn(column) {
+    return column === "owner_name" ||
+      column === "owner_title" ||
+      column === "owner_email" ||
+      column === "contact_email" ||
+      column === "website_scan_status" ||
+      column === "site_pages_visited" ||
+      column === "site_pages_discovered" ||
+      column === "social_pages_scanned";
+  }
+
+  function rowsAlreadyEnriched(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return false;
+    return rows.some((row) => normalizeText(row && row.website_scan_status) !== "");
+  }
+
+  async function enrichRowsBestEffort(rows, options) {
+    const opts = options || {};
+    const force = opts.force === true;
+
+    if (!Array.isArray(rows) || rows.length === 0) return rows;
+    if (enrichRunning) return Array.isArray(lastRows) ? lastRows : rows;
+    if (!force && rowsAlreadyEnriched(rows)) return rows;
+
+    enrichRunning = true;
+    setRunningState(isBusy());
+    setState("Enriching websites...");
+
+    try {
+      const enrichResponse = await sendRuntimeMessage({
+        type: MSG.ENRICH_ROWS,
+        rows,
+        options: {
+          maxPagesPerSite: clampInt(el.siteMaxPages.value, 1, 120, 40),
+          timeoutMs: 10000,
+          visibleTabs: Boolean(el.showEnrichmentTabs.checked),
+          scanSocialLinks: Boolean(el.scanSocialLinks.checked),
+          maxSocialPages: 4
+        }
+      });
+
+      if (!enrichResponse || enrichResponse.type !== MSG.ENRICH_DONE) {
+        throw new Error((enrichResponse && enrichResponse.error) || "Website enrichment failed");
+      }
+
+      const rowsForExport = Array.isArray(enrichResponse.rows) ? enrichResponse.rows : rows;
+      lastRows = rowsForExport;
+      persistRows(rowsForExport);
+
+      const enrichSummary = enrichResponse.summary || {};
+      el.crawlVisitedStat.textContent = String(Number(enrichSummary.pages_visited || 0));
+      el.crawlDiscoveredStat.textContent = String(Number(enrichSummary.pages_discovered || 0));
+      el.socialScannedStat.textContent = String(Number(enrichSummary.social_scanned || 0));
+      setState(`Enrichment: ${enrichSummary.enriched || 0} enriched, ${enrichSummary.skipped || 0} skipped, ${enrichSummary.blocked || 0} blocked, pages ${enrichSummary.pages_visited || 0}/${enrichSummary.pages_discovered || 0}`);
+      return rowsForExport;
+    } finally {
+      enrichRunning = false;
+      setRunningState(isBusy());
+    }
+  }
+
+  function updatePerformanceMetrics(payload) {
+    const data = payload || {};
+    const speed = Number(data.rate_per_sec || 0);
+    const seen = Number(data.seen_listings || 0);
+    const avgRating = data.avg_rating_seen;
+    const avgReviews = data.avg_reviews_seen;
+
+    el.speedStat.textContent = `${formatNumber(speed, 2)}/s`;
+    el.seenListingsStat.textContent = Number.isFinite(seen) ? String(seen) : "0";
+    el.avgRatingStat.textContent = formatMaybeNumber(avgRating, 2);
+    el.avgReviewsStat.textContent = formatMaybeNumber(avgReviews, 1);
+  }
+
+  function formatMaybeNumber(value, digits) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "-";
+    return formatNumber(num, digits);
+  }
+
+  function formatNumber(value, digits) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "0";
+    return num.toFixed(digits);
+  }
+
+  function clampInt(value, min, max, fallback) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    return Math.min(max, Math.max(min, Math.floor(num)));
+  }
+
+  function shortHost(url) {
+    const text = normalizeText(url);
+    if (!text) return "";
+    try {
+      const parsed = new URL(text);
+      return parsed.hostname.replace(/^www\./i, "");
+    } catch (_e) {
+      return "";
+    }
   }
 
   function isNoReceiverError(error) {

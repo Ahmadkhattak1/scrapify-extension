@@ -76,8 +76,12 @@ async function handleEnrichRows(message, sendResponse) {
 }
 
 async function enrichRows(rows, options) {
-  const maxPagesPerSite = clampInt(options.maxPagesPerSite, 1, 5, 3);
+  const maxPagesPerSite = clampInt(options.maxPagesPerSite, 1, 120, 40);
   const timeoutMs = clampInt(options.timeoutMs, 5000, 30000, 12000);
+  const visibleTabs = options.visibleTabs === true;
+  const scanSocialLinks = options.scanSocialLinks !== false;
+  const maxSocialPages = clampInt(options.maxSocialPages, 0, 8, 4);
+  const maxDiscoveredPages = clampInt(options.maxDiscoveredPages, maxPagesPerSite, 800, Math.max(200, maxPagesPerSite * 8));
 
   const summary = {
     total: rows.length,
@@ -85,7 +89,10 @@ async function enrichRows(rows, options) {
     enriched: 0,
     skipped: 0,
     blocked: 0,
-    errors: 0
+    errors: 0,
+    social_scanned: 0,
+    pages_visited: 0,
+    pages_discovered: 0
   };
 
   const outputRows = [];
@@ -98,24 +105,59 @@ async function enrichRows(rows, options) {
       owner_title: normalizeText(sourceRow.owner_title),
       owner_email: normalizeText(sourceRow.owner_email),
       contact_email: normalizeText(sourceRow.contact_email),
-      website_scan_status: normalizeText(sourceRow.website_scan_status)
+      website_scan_status: normalizeText(sourceRow.website_scan_status),
+      site_pages_visited: Number(sourceRow.site_pages_visited || 0),
+      site_pages_discovered: Number(sourceRow.site_pages_discovered || 0),
+      social_pages_scanned: Number(sourceRow.social_pages_scanned || 0)
     };
 
     const website = normalizeWebsiteUrl(sourceRow.website);
 
     if (!website) {
       enrichedRow.website_scan_status = "no_website";
+      enrichedRow.site_pages_visited = 0;
+      enrichedRow.site_pages_discovered = 0;
+      enrichedRow.social_pages_scanned = 0;
       summary.skipped += 1;
       summary.processed += 1;
       outputRows.push(enrichedRow);
-      emitEnrichProgress(summary, sourceRow.name);
+      emitEnrichProgress(summary, {
+        currentName: sourceRow.name,
+        currentUrl: website,
+        phase: "skip",
+        sitePagesVisited: summary.pages_visited,
+        sitePagesDiscovered: summary.pages_discovered
+      });
       continue;
     }
 
     try {
+      emitEnrichProgress(summary, {
+        currentName: sourceRow.name,
+        currentUrl: website,
+        phase: "site_init",
+        sitePagesVisited: summary.pages_visited,
+        sitePagesDiscovered: summary.pages_discovered
+      });
+
       const scan = await scanWebsite(website, {
         maxPagesPerSite,
-        timeoutMs
+        maxDiscoveredPages,
+        timeoutMs,
+        visibleTabs,
+        scanSocialLinks,
+        maxSocialPages,
+        onProgress: (scanProgress) => {
+          const progress = scanProgress || {};
+          emitEnrichProgress(summary, {
+            currentName: sourceRow.name,
+            currentUrl: progress.currentUrl || website,
+            phase: progress.phase || "site_scan",
+            sitePagesVisited: summary.pages_visited + Number(progress.pagesVisited || 0),
+            sitePagesDiscovered: summary.pages_discovered + Number(progress.pagesDiscovered || 0),
+            socialScanned: summary.social_scanned + Number(progress.socialScanned || 0)
+          });
+        }
       });
 
       if (scan.ownerName) enrichedRow.owner_name = scan.ownerName;
@@ -123,10 +165,16 @@ async function enrichRows(rows, options) {
       if (scan.ownerEmail) enrichedRow.owner_email = scan.ownerEmail;
       if (scan.contactEmail) enrichedRow.contact_email = scan.contactEmail;
       enrichedRow.website_scan_status = scan.status;
+      enrichedRow.site_pages_visited = Number(scan.pagesVisited || 0);
+      enrichedRow.site_pages_discovered = Number(scan.pagesDiscovered || 0);
+      enrichedRow.social_pages_scanned = Number(scan.socialScanned || 0);
 
       if (scan.blocked) {
         summary.blocked += 1;
       }
+      summary.social_scanned += Number(scan.socialScanned || 0);
+      summary.pages_visited += Number(scan.pagesVisited || 0);
+      summary.pages_discovered += Number(scan.pagesDiscovered || 0);
 
       if (scan.status === "enriched") {
         summary.enriched += 1;
@@ -135,13 +183,22 @@ async function enrichRows(rows, options) {
       }
     } catch (_rowError) {
       enrichedRow.website_scan_status = "scan_error";
+      enrichedRow.site_pages_visited = 0;
+      enrichedRow.site_pages_discovered = 0;
+      enrichedRow.social_pages_scanned = 0;
       summary.errors += 1;
       summary.skipped += 1;
     }
 
     summary.processed += 1;
     outputRows.push(enrichedRow);
-    emitEnrichProgress(summary, sourceRow.name);
+    emitEnrichProgress(summary, {
+      currentName: sourceRow.name,
+      currentUrl: website,
+      phase: "done",
+      sitePagesVisited: summary.pages_visited,
+      sitePagesDiscovered: summary.pages_discovered
+    });
   }
 
   return {
@@ -150,7 +207,8 @@ async function enrichRows(rows, options) {
   };
 }
 
-function emitEnrichProgress(summary, currentName) {
+function emitEnrichProgress(summary, context) {
+  const ctx = context || {};
   chrome.runtime.sendMessage({
     type: MSG.ENRICH_PROGRESS,
     total: summary.total,
@@ -159,7 +217,12 @@ function emitEnrichProgress(summary, currentName) {
     skipped: summary.skipped,
     blocked: summary.blocked,
     errors: summary.errors,
-    current: normalizeText(currentName)
+    social_scanned: Number(ctx.socialScanned != null ? ctx.socialScanned : summary.social_scanned),
+    site_pages_visited: Number(ctx.sitePagesVisited != null ? ctx.sitePagesVisited : summary.pages_visited),
+    site_pages_discovered: Number(ctx.sitePagesDiscovered != null ? ctx.sitePagesDiscovered : summary.pages_discovered),
+    current: normalizeText(ctx.currentName),
+    current_url: normalizeText(ctx.currentUrl),
+    phase: normalizeText(ctx.phase)
   });
 }
 
@@ -167,28 +230,54 @@ async function scanWebsite(startUrl, options) {
   let tab = null;
   const emails = new Set();
   const ownerCandidates = [];
+  const socialCandidates = new Set();
   let blocked = false;
+  let socialScanned = 0;
+  let pagesVisited = 0;
 
-  const queue = [startUrl];
-  const visited = new Set();
-  const queued = new Set([stripHash(startUrl)]);
   const baseOrigin = new URL(startUrl).origin;
+  const firstUrl = canonicalizeCrawlUrl(startUrl, baseOrigin) || stripHash(startUrl) || startUrl;
+  const firstKey = stripHash(firstUrl) || firstUrl;
+  const queue = [firstUrl];
+  const visited = new Set();
+  const queued = new Set([firstKey]);
+  const discovered = new Set([firstKey]);
+
+  const reportProgress = (phase, currentUrl) => {
+    if (typeof options.onProgress !== "function") return;
+    options.onProgress({
+      phase,
+      currentUrl: currentUrl || "",
+      pagesVisited,
+      pagesDiscovered: discovered.size,
+      socialScanned
+    });
+  };
 
   try {
-    tab = await createHiddenTab(startUrl);
+    tab = await createScanTab(firstUrl, options.visibleTabs === true);
+    reportProgress("site_open", firstUrl);
 
     while (queue.length > 0 && visited.size < options.maxPagesPerSite) {
       const nextUrl = queue.shift();
       const nextKey = stripHash(nextUrl);
-      if (visited.has(nextKey)) continue;
+      if (!nextKey || visited.has(nextKey)) continue;
 
       visited.add(nextKey);
+      pagesVisited = visited.size;
+      reportProgress("site_page", nextUrl);
 
-      await updateTabUrl(tab.id, nextUrl);
-      await waitForTabComplete(tab.id, options.timeoutMs);
-      await sleep(800);
+      let pageData = null;
+      try {
+        await updateTabUrl(tab.id, nextUrl);
+        await waitForTabComplete(tab.id, options.timeoutMs);
+        await sleep(800);
+        pageData = await executeExtraction(tab.id);
+      } catch (_sitePageError) {
+        reportProgress("site_page_error", nextUrl);
+        continue;
+      }
 
-      const pageData = await executeExtraction(tab.id);
       if (!pageData) {
         continue;
       }
@@ -211,22 +300,72 @@ async function scanWebsite(startUrl, options) {
         });
       }
 
-      for (const link of pageData.relatedLinks || []) {
-        const normalizedLink = normalizeWebsiteUrl(link);
+      const prioritizedLinks = prioritizeCrawlLinks([
+        ...(Array.isArray(pageData.relatedLinks) ? pageData.relatedLinks : []),
+        ...(Array.isArray(pageData.internalLinks) ? pageData.internalLinks : [])
+      ]);
+
+      for (const link of prioritizedLinks) {
+        const normalizedLink = canonicalizeCrawlUrl(link, baseOrigin);
         if (!normalizedLink) continue;
 
+        const linkKey = stripHash(normalizedLink);
+        if (!linkKey) continue;
+        if (visited.has(linkKey) || queued.has(linkKey)) continue;
+        if (discovered.size >= options.maxDiscoveredPages) continue;
+
+        discovered.add(linkKey);
+        queued.add(linkKey);
+        queue.push(normalizedLink);
+      }
+
+      for (const social of pageData.socialLinks || []) {
+        const normalizedSocial = normalizeWebsiteUrl(social);
+        if (!normalizedSocial) continue;
+        socialCandidates.add(normalizedSocial);
+      }
+      reportProgress("site_page_done", nextUrl);
+    }
+
+    if (options.scanSocialLinks === true && emails.size === 0 && socialCandidates.size > 0) {
+      const socialQueue = Array.from(socialCandidates).slice(0, options.maxSocialPages || 0);
+      for (const socialUrl of socialQueue) {
+        reportProgress("social_page", socialUrl);
+        let socialData = null;
         try {
-          const parsed = new URL(normalizedLink);
-          if (parsed.origin !== baseOrigin) continue;
-        } catch (_e) {
+          await updateTabUrl(tab.id, socialUrl);
+          await waitForTabComplete(tab.id, options.timeoutMs);
+          await sleep(700);
+          socialData = await executeExtraction(tab.id);
+        } catch (_socialPageError) {
+          socialScanned += 1;
+          reportProgress("social_error", socialUrl);
           continue;
         }
 
-        const linkKey = stripHash(normalizedLink);
-        if (visited.has(linkKey) || queued.has(linkKey)) continue;
+        socialScanned += 1;
+        reportProgress("social_done", socialUrl);
+        if (!socialData) continue;
 
-        queued.add(linkKey);
-        queue.push(normalizedLink);
+        if (socialData.blocked === true) {
+          blocked = true;
+        }
+
+        for (const email of socialData.emails || []) {
+          const normalized = normalizeEmail(email);
+          if (normalized) emails.add(normalized);
+        }
+
+        for (const candidate of socialData.ownerCandidates || []) {
+          if (!candidate || !candidate.name) continue;
+          ownerCandidates.push({
+            name: normalizeText(candidate.name),
+            title: normalizeText(candidate.title),
+            score: Number(candidate.score) || 0
+          });
+        }
+
+        if (emails.size > 0) break;
       }
     }
   } finally {
@@ -253,7 +392,10 @@ async function scanWebsite(startUrl, options) {
     ownerEmail,
     contactEmail,
     status,
-    blocked
+    blocked,
+    socialScanned,
+    pagesVisited,
+    pagesDiscovered: discovered.size
   };
 }
 
@@ -388,9 +530,103 @@ function stripHash(url) {
   }
 }
 
-function createHiddenTab(url) {
+function prioritizeCrawlLinks(links) {
+  if (!Array.isArray(links) || links.length === 0) return [];
+
+  const unique = new Map();
+  for (const rawLink of links) {
+    const link = normalizeWebsiteUrl(rawLink);
+    if (!link || unique.has(link)) continue;
+    unique.set(link, crawlPriorityScore(link));
+  }
+
+  return Array.from(unique.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([link]) => link);
+}
+
+function crawlPriorityScore(url) {
+  const lower = normalizeText(url).toLowerCase();
+  if (!lower) return 0;
+
+  let score = 0;
+  if (/(contact|about|team|leadership|management|staff|company|our-story|who-we-are|founder|owner|meet-the)/i.test(lower)) {
+    score += 7;
+  }
+  if (/(email|support|help|faq|location|locations|office)/i.test(lower)) {
+    score += 4;
+  }
+  if (/\/blog\//i.test(lower)) {
+    score -= 2;
+  }
+  if (/[?&](replytocom|sort|filter|session|preview)=/i.test(lower)) {
+    score -= 3;
+  }
+  if (/\?/.test(lower)) {
+    score -= 1;
+  }
+
+  return score;
+}
+
+function canonicalizeCrawlUrl(rawUrl, baseOrigin) {
+  const normalized = normalizeWebsiteUrl(rawUrl);
+  if (!normalized) return "";
+
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.origin !== baseOrigin) return "";
+    if (!/^https?:$/i.test(parsed.protocol)) return "";
+
+    if (shouldSkipCrawlPath(parsed.pathname)) return "";
+
+    const trackingParams = [
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "gclid",
+      "fbclid",
+      "msclkid",
+      "mc_cid",
+      "mc_eid",
+      "ref",
+      "source"
+    ];
+    for (const name of trackingParams) {
+      parsed.searchParams.delete(name);
+    }
+
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/{2,}/g, "/");
+    if (parsed.pathname.length > 1) {
+      parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    }
+    return parsed.toString();
+  } catch (_e) {
+    return "";
+  }
+}
+
+function shouldSkipCrawlPath(pathname) {
+  const lowerPath = normalizeText(pathname).toLowerCase();
+  if (!lowerPath) return false;
+
+  if (/\.(pdf|zip|rar|7z|gz|png|jpg|jpeg|gif|svg|webp|mp4|mp3|avi|mov|ico|css|js|xml|json)$/i.test(lowerPath)) {
+    return true;
+  }
+
+  if (/(^|\/)(wp-admin|wp-login|login|signin|sign-in|signout|sign-out|logout|checkout|cart|basket|account)(\/|$)/i.test(lowerPath)) {
+    return true;
+  }
+
+  return false;
+}
+
+function createScanTab(url, visible) {
   return new Promise((resolve, reject) => {
-    chrome.tabs.create({ url, active: false }, (tab) => {
+    chrome.tabs.create({ url, active: visible === true }, (tab) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message || "Failed to open website tab"));
         return;
@@ -550,6 +786,7 @@ function extractPageDataScript() {
 
   const bodyText = normalize(document.body ? document.body.innerText || "" : "");
   const emails = new Set();
+  const ownerCandidates = [];
 
   const regexMatches = bodyText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
   for (const value of regexMatches) {
@@ -557,9 +794,98 @@ function extractPageDataScript() {
     if (isLikelyEmail(email)) emails.add(email);
   }
 
+  const tryCollectStructuredData = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+
+    const typeValue = Array.isArray(obj["@type"]) ? obj["@type"].join(" ").toLowerCase() : String(obj["@type"] || "").toLowerCase();
+    const nameValue = normalize(obj.name || "");
+    const jobTitleValue = normalize(obj.jobTitle || "");
+    const emailValue = normalize(obj.email || "").toLowerCase();
+
+    if (emailValue && isLikelyEmail(emailValue)) {
+      emails.add(emailValue);
+    }
+
+    if (/person|organization|localbusiness/.test(typeValue) && nameValue) {
+      if (jobTitleValue) {
+        ownerCandidates.push({ name: nameValue, title: jobTitleValue, score: 4 });
+      } else if (/founder|ceo|president|owner|principal|director|manager/.test(typeValue)) {
+        ownerCandidates.push({ name: nameValue, title: normalize(typeValue), score: 3 });
+      }
+    }
+
+    const founder = obj.founder || obj.founders;
+    if (founder) {
+      const founders = Array.isArray(founder) ? founder : [founder];
+      for (const item of founders) {
+        if (!item) continue;
+        const founderName = normalize(item.name || item.alternateName || "");
+        const founderEmail = normalize(item.email || "").toLowerCase();
+        if (founderName) {
+          ownerCandidates.push({ name: founderName, title: "Founder", score: 5 });
+        }
+        if (founderEmail && isLikelyEmail(founderEmail)) {
+          emails.add(founderEmail);
+        }
+      }
+    }
+
+    const employee = obj.employee || obj.employees;
+    if (employee) {
+      const employees = Array.isArray(employee) ? employee : [employee];
+      for (const item of employees) {
+        if (!item) continue;
+        const employeeName = normalize(item.name || "");
+        const employeeTitle = normalize(item.jobTitle || item.roleName || "");
+        if (employeeName && /(owner|founder|ceo|president|principal|director|manager)/i.test(employeeTitle)) {
+          ownerCandidates.push({ name: employeeName, title: employeeTitle, score: 4 });
+        }
+      }
+    }
+  };
+
+  const jsonLdScripts = Array.from(document.querySelectorAll("script[type='application/ld+json']")).slice(0, 25);
+  for (const script of jsonLdScripts) {
+    const raw = normalize(script.textContent || "");
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      const nodes = Array.isArray(parsed) ? parsed : [parsed];
+      for (const node of nodes) {
+        if (node && node["@graph"] && Array.isArray(node["@graph"])) {
+          for (const graphNode of node["@graph"]) {
+            tryCollectStructuredData(graphNode);
+          }
+        }
+        tryCollectStructuredData(node);
+      }
+    } catch (_e) {
+      // Ignore malformed JSON-LD blocks.
+    }
+  }
+
   const anchors = Array.from(document.querySelectorAll("a[href]"));
   const relatedLinkSet = new Set();
+  const internalLinkSet = new Set();
+  const socialLinkSet = new Set();
   const relatedKeywords = /(about|contact|team|leadership|management|staff|company|our-story|who-we-are|founder|owner)/i;
+  const socialHostPattern = /(facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)/i;
+  const pageOrigin = window.location.origin;
+
+  const isCrawlableInternal = (absoluteUrl) => {
+    try {
+      const parsed = new URL(absoluteUrl);
+      if (parsed.origin !== pageOrigin) return false;
+      if (!/^https?:$/i.test(parsed.protocol)) return false;
+      const lowerPath = normalize(parsed.pathname || "").toLowerCase();
+      if (!lowerPath) return true;
+      if (/\.(pdf|zip|rar|7z|gz|png|jpg|jpeg|gif|svg|webp|mp4|mp3|avi|mov|ico|css|js|xml|json)$/i.test(lowerPath)) return false;
+      if (/(^|\/)(wp-admin|wp-login|login|signin|sign-in|signout|sign-out|logout|checkout|cart|basket|account)(\/|$)/i.test(lowerPath)) return false;
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  };
 
   for (const anchor of anchors) {
     const href = anchor.getAttribute("href") || "";
@@ -580,14 +906,23 @@ function extractPageDataScript() {
 
     if (!absolute) continue;
 
+    if (socialHostPattern.test(absolute)) {
+      socialLinkSet.add(absolute);
+      continue;
+    }
+
+    if (isCrawlableInternal(absolute)) {
+      internalLinkSet.add(absolute);
+    }
+
     const probe = `${text} ${absolute}`;
     if (!relatedKeywords.test(probe)) continue;
 
-    relatedLinkSet.add(absolute);
-    if (relatedLinkSet.size >= 10) break;
+    if (relatedLinkSet.size < 30) {
+      relatedLinkSet.add(absolute);
+    }
   }
 
-  const ownerCandidates = [];
   const ownerKeyword = /(owner|founder|co-founder|president|ceo|chief executive|managing director|principal|partner|director|manager)/i;
   const nodes = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,p,li,strong,b,span,div")).slice(0, 2500);
 
@@ -619,7 +954,9 @@ function extractPageDataScript() {
   return {
     emails: Array.from(emails).slice(0, 50),
     ownerCandidates,
-    relatedLinks: Array.from(relatedLinkSet),
+    relatedLinks: Array.from(relatedLinkSet).slice(0, 40),
+    internalLinks: Array.from(internalLinkSet).slice(0, 250),
+    socialLinks: Array.from(socialLinkSet).slice(0, 8),
     blocked
   };
 }

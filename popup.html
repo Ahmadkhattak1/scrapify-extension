@@ -72,6 +72,20 @@
           <input id="enableEnrichment" type="checkbox" />
           Enrich websites (owner/email, best effort)
         </label>
+        <label>
+          Website pages per site
+          <input id="siteMaxPages" type="number" min="1" max="120" step="1" value="40" />
+        </label>
+        <div class="row toggles">
+          <label class="checkbox">
+            <input id="showEnrichmentTabs" type="checkbox" />
+            Show tabs while enriching
+          </label>
+          <label class="checkbox">
+            <input id="scanSocialLinks" type="checkbox" checked />
+            Hunt email on social links
+          </label>
+        </div>
 
         <section class="columns-block">
           <div class="columns-head">
@@ -97,6 +111,17 @@
           <div><span>Matched</span><strong id="matched">0</strong></div>
           <div><span>Duplicates</span><strong id="duplicates">0</strong></div>
           <div><span>Errors</span><strong id="errors">0</strong></div>
+        </div>
+        <div class="metrics-grid">
+          <div><span>Speed</span><strong id="speedStat">0.00/s</strong></div>
+          <div><span>Seen</span><strong id="seenListingsStat">0</strong></div>
+          <div><span>Avg Rating</span><strong id="avgRatingStat">-</strong></div>
+          <div><span>Avg Reviews</span><strong id="avgReviewsStat">-</strong></div>
+        </div>
+        <div class="metrics-grid metrics-grid-3">
+          <div><span>Site Pages Visited</span><strong id="crawlVisitedStat">0</strong></div>
+          <div><span>Site Pages Found</span><strong id="crawlDiscoveredStat">0</strong></div>
+          <div><span>Social Pages Scanned</span><strong id="socialScannedStat">0</strong></div>
         </div>
         <p id="stateText">Idle</p>
         <p id="errorText" class="error"></p>

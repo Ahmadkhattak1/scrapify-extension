@@ -13,9 +13,16 @@
     seenCardKeys: new Set(),
     seenKeys: new Set(),
     rows: [],
+    startedAtMs: 0,
+    seenListings: 0,
+    seenRatingSum: 0,
+    seenRatingCount: 0,
+    seenReviewsSum: 0,
+    seenReviewsCount: 0,
     processed: 0,
     matched: 0,
     duplicates: 0,
+    fastSkipped: 0,
     errors: 0
   };
 
@@ -105,6 +112,15 @@
         for (const card of unseenCards) {
           if (state.stopRequested) break;
 
+          const quickData = buildQuickCardData(card);
+          updateSeenStats(quickData);
+
+          if (!quickCardPassesFilter(quickData, filters)) {
+            state.fastSkipped += 1;
+            sendProgress();
+            continue;
+          }
+
           try {
             const row = await processCard(card, sourceQuery, sourceUrl);
             state.processed += 1;
@@ -148,6 +164,8 @@
         processed: state.processed,
         matched: state.matched,
         duplicates: state.duplicates,
+        fast_skipped: state.fastSkipped,
+        ...getPerformanceStats(),
         errors: state.errors,
         stopped: state.stopRequested
       };
@@ -335,6 +353,101 @@
     return "";
   }
 
+  function quickCardPassesFilter(quickData, filters) {
+    const f = filters || {};
+    const cardText = quickData && quickData.text ? quickData.text : "";
+    if (!cardText) return true;
+
+    const quickRating = quickData.rating;
+    if (f.minRating !== "" && f.minRating != null && quickRating !== "") {
+      const minRating = Number(f.minRating);
+      if (Number.isFinite(minRating) && quickRating < minRating) return false;
+    }
+    if (f.maxRating !== "" && f.maxRating != null && quickRating !== "") {
+      const maxRating = Number(f.maxRating);
+      if (Number.isFinite(maxRating) && quickRating > maxRating) return false;
+    }
+
+    const quickReviews = quickData.reviews;
+    if (f.minReviews !== "" && f.minReviews != null && quickReviews !== "") {
+      const minReviews = Number(f.minReviews);
+      if (Number.isFinite(minReviews) && quickReviews < minReviews) return false;
+    }
+    if (f.maxReviews !== "" && f.maxReviews != null && quickReviews !== "") {
+      const maxReviews = Number(f.maxReviews);
+      if (Number.isFinite(maxReviews) && quickReviews > maxReviews) return false;
+    }
+
+    const lower = quickData.lower;
+    if (normalizeText(f.nameKeyword) !== "" && !lower.includes(normalizeText(f.nameKeyword).toLowerCase())) {
+      return false;
+    }
+    if (normalizeText(f.categoryInclude) !== "" && !lower.includes(normalizeText(f.categoryInclude).toLowerCase())) {
+      return false;
+    }
+    if (normalizeText(f.categoryExclude) !== "" && lower.includes(normalizeText(f.categoryExclude).toLowerCase())) {
+      return false;
+    }
+
+    return true;
+  }
+
+  function getCardText(card) {
+    if (!card) return "";
+    const link = resolveCardLink(card);
+    const linkLabel = normalizeText((link && link.getAttribute("aria-label")) || "");
+    const rawText = normalizeText(card.textContent || "");
+    return normalizeText(`${linkLabel} ${rawText}`);
+  }
+
+  function buildQuickCardData(card) {
+    const text = getCardText(card);
+    return {
+      text,
+      lower: text.toLowerCase(),
+      rating: parseCardRating(text),
+      reviews: parseCardReviewCount(text)
+    };
+  }
+
+  function parseCardRating(text) {
+    const clean = normalizeText(text).replace(",", ".");
+    if (!clean) return "";
+
+    const starPattern = clean.match(/(\d(?:\.\d)?)\s*[★⭐]/);
+    if (starPattern && starPattern[1]) {
+      const value = Number(starPattern[1]);
+      return Number.isFinite(value) ? value : "";
+    }
+
+    const directPattern = clean.match(/\b([0-5](?:\.\d)?)\b/);
+    if (directPattern && directPattern[1]) {
+      const value = Number(directPattern[1]);
+      return Number.isFinite(value) ? value : "";
+    }
+
+    return "";
+  }
+
+  function parseCardReviewCount(text) {
+    const clean = normalizeText(text);
+    if (!clean) return "";
+
+    const parenPattern = clean.match(/\(([\d,]+)\)/);
+    if (parenPattern && parenPattern[1]) {
+      const value = Number(parenPattern[1].replace(/,/g, ""));
+      return Number.isFinite(value) ? value : "";
+    }
+
+    const wordPattern = clean.match(/([\d,]+)\s+reviews?/i);
+    if (wordPattern && wordPattern[1]) {
+      const value = Number(wordPattern[1].replace(/,/g, ""));
+      return Number.isFinite(value) ? value : "";
+    }
+
+    return "";
+  }
+
   function findResultsFeed() {
     return (
       document.querySelector("div[role='feed']") ||
@@ -443,20 +556,56 @@
     state.seenCardKeys = new Set();
     state.seenKeys = new Set();
     state.rows = [];
+    state.startedAtMs = Date.now();
+    state.seenListings = 0;
+    state.seenRatingSum = 0;
+    state.seenRatingCount = 0;
+    state.seenReviewsSum = 0;
+    state.seenReviewsCount = 0;
     state.processed = 0;
     state.matched = 0;
     state.duplicates = 0;
+    state.fastSkipped = 0;
     state.errors = 0;
   }
 
   function sendProgress() {
+    const perf = getPerformanceStats();
     chrome.runtime.sendMessage({
       type: MSG.SCRAPE_PROGRESS,
       processed: state.processed,
       matched: state.matched,
       duplicates: state.duplicates,
+      fast_skipped: state.fastSkipped,
+      ...perf,
       errors: state.errors
     });
+  }
+
+  function updateSeenStats(quickData) {
+    if (!quickData || !quickData.text) return;
+    state.seenListings += 1;
+
+    if (quickData.rating !== "") {
+      state.seenRatingSum += quickData.rating;
+      state.seenRatingCount += 1;
+    }
+
+    if (quickData.reviews !== "") {
+      state.seenReviewsSum += quickData.reviews;
+      state.seenReviewsCount += 1;
+    }
+  }
+
+  function getPerformanceStats() {
+    const elapsedSec = Math.max((Date.now() - state.startedAtMs) / 1000, 0.001);
+    const ratePerSec = state.seenListings / elapsedSec;
+    return {
+      seen_listings: state.seenListings,
+      rate_per_sec: Number(ratePerSec.toFixed(3)),
+      avg_rating_seen: state.seenRatingCount > 0 ? Number((state.seenRatingSum / state.seenRatingCount).toFixed(3)) : "",
+      avg_reviews_seen: state.seenReviewsCount > 0 ? Number((state.seenReviewsSum / state.seenReviewsCount).toFixed(3)) : ""
+    };
   }
 
   function sleep(ms) {

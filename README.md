@@ -15,8 +15,14 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
   - has phone
 - Optional `Infinite scroll` mode (ignores max rows and keeps scraping until end-of-results or Stop)
 - Optional website enrichment mode (category-agnostic):
+  - crawls internal website pages (configurable pages/site) instead of scanning only landing page
   - scans public pages for owner/founder/president/CEO-style names and emails
+  - can follow social links (Facebook/Instagram/LinkedIn/X/etc.) when website email is missing
+  - optional visible-tab mode to watch enrichment navigation live
   - skips blocked/unavailable websites and keeps core GBP data
+- Fast pre-filtering from list cards for rating/review/name/category constraints to avoid opening every listing
+- Live run analytics in popup: processing speed (entries/sec), seen listings, avg rating, avg reviews
+- Live enrichment analytics: pages visited, pages discovered, social pages scanned
 - Column picker to choose which fields are included in CSV export
 - Deduplication by `place_id` (fallback to normalized Maps URL) with duplicate counter in run status
 - CSV export with metadata columns:
@@ -44,6 +50,10 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 5. Choose export columns (All/None or individual checkboxes).
 6. Click **Start Scrape**.
 7. Optional: enable **Enrich websites (owner/email, best effort)** before export.
+   - set **Website pages per site** (crawl depth)
+   - optional: enable **Show tabs while enriching**
+   - optional: enable **Hunt email on social links**
+   - enrichment auto-starts after scrape completion when enabled
 8. Click **Export CSV** after completion (or after stop).
 
 ## Notes / Limitations

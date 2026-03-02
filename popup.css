@@ -137,6 +137,35 @@ button:disabled {
   font-size: 14px;
 }
 
+.metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.metrics-grid-3 {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.metrics-grid div {
+  background: #f4f7fb;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  text-align: center;
+}
+
+.metrics-grid span {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.metrics-grid strong {
+  display: block;
+  font-size: 13px;
+}
+
 #stateText {
   margin: 0;
   font-size: 12px;
