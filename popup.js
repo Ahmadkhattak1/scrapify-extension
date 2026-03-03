@@ -3,12 +3,85 @@
   const { MSG, DEFAULT_MAX_ROWS, CSV_COLUMNS, COLUMN_LABELS, readFilterConfig, normalizeText, sanitizeColumns } = shared;
   const SCRAPE_SESSION_KEY = "scrapeSession";
   const ENRICH_SESSION_KEY = "enrichSession";
+  const POPUP_UI_SETTINGS_KEY = "popupUiSettings";
+  const EMAIL_COLUMNS = ["email", "owner_email", "contact_email", "primary_email", "primary_email_type", "primary_email_source"];
+  const RAW_EMAIL_COLUMNS = ["owner_email", "contact_email", "primary_email", "primary_email_type", "primary_email_source"];
+  const PHONE_COLUMNS = ["phone", "listing_phone", "website_phone", "website_phone_source"];
+  const RAW_PHONE_COLUMNS = ["listing_phone", "website_phone", "website_phone_source"];
+  const COLUMN_GROUPS = [
+    {
+      id: "core",
+      title: "Core Listing Data",
+      description: "Google Maps listing fields",
+      columns: ["place_id", "name", "rating", "review_count", "category", "address", "website", "hours", "maps_url", "source_query", "source_url", "scraped_at"]
+    },
+    {
+      id: "phone",
+      title: "Phone Output",
+      description: "Unified phone + raw phone fields",
+      columns: ["phone", "listing_phone", "website_phone", "website_phone_source"]
+    },
+    {
+      id: "email",
+      title: "Email Output",
+      description: "Unified automation email + raw email fields",
+      columns: [
+        "email",
+        "owner_name",
+        "owner_title",
+        "owner_email",
+        "contact_email",
+        "primary_email",
+        "primary_email_type",
+        "primary_email_source",
+        "owner_confidence",
+        "email_confidence",
+        "email_source_url",
+        "no_email_reason"
+      ]
+    },
+    {
+      id: "crawl",
+      title: "Enrichment Crawl Meta",
+      description: "Website and social scan diagnostics",
+      columns: ["website_scan_status", "site_pages_visited", "site_pages_discovered", "social_pages_scanned", "social_links"]
+    }
+  ];
+  const COLUMN_BADGES = {
+    email: { text: "Unified", tone: "unified" },
+    owner_email: { text: "Personal", tone: "raw" },
+    contact_email: { text: "Company", tone: "raw" },
+    primary_email: { text: "Auto", tone: "raw" },
+    primary_email_type: { text: "Meta", tone: "meta" },
+    primary_email_source: { text: "Meta", tone: "meta" },
+    phone: { text: "Unified", tone: "unified" },
+    listing_phone: { text: "Listing", tone: "raw" },
+    website_phone: { text: "Scanned", tone: "raw" },
+    website_phone_source: { text: "Meta", tone: "meta" },
+    owner_confidence: { text: "Meta", tone: "meta" },
+    email_confidence: { text: "Meta", tone: "meta" },
+    email_source_url: { text: "Meta", tone: "meta" },
+    no_email_reason: { text: "Meta", tone: "meta" },
+    website_scan_status: { text: "Meta", tone: "meta" },
+    site_pages_visited: { text: "Meta", tone: "meta" },
+    site_pages_discovered: { text: "Meta", tone: "meta" },
+    social_pages_scanned: { text: "Meta", tone: "meta" },
+    social_links: { text: "Meta", tone: "meta" }
+  };
 
   const el = {
     maxRows: document.getElementById("maxRows"),
     infiniteScroll: document.getElementById("infiniteScroll"),
     enableEnrichment: document.getElementById("enableEnrichment"),
     siteMaxPages: document.getElementById("siteMaxPages"),
+    emailPreference: document.getElementById("emailPreference"),
+    emailOutputMode: document.getElementById("emailOutputMode"),
+    emailPreferenceHint: document.getElementById("emailPreferenceHint"),
+    emailColumnsHint: document.getElementById("emailColumnsHint"),
+    phonePreference: document.getElementById("phonePreference"),
+    phoneOutputMode: document.getElementById("phoneOutputMode"),
+    phonePreferenceHint: document.getElementById("phonePreferenceHint"),
+    phoneColumnsHint: document.getElementById("phoneColumnsHint"),
     showEnrichmentTabs: document.getElementById("showEnrichmentTabs"),
     scanSocialLinks: document.getElementById("scanSocialLinks"),
     minRating: document.getElementById("minRating"),
@@ -46,14 +119,22 @@
   let lastRows = null;
   let scrapeRunning = false;
   let enrichRunning = false;
+  let lastScrapeSession = null;
+  let lastEnrichSession = null;
   let selectedColumns = [...CSV_COLUMNS];
   let infiniteScrollEnabled = false;
   let runInfiniteCurrent = false;
+  let maxRowsValue = DEFAULT_MAX_ROWS;
   let enrichmentEnabled = false;
   let siteMaxPagesValue = 40;
+  let emailPreferenceValue = "owner";
+  let emailOutputModeValue = "unified_only";
+  let phonePreferenceValue = "listing";
+  let phoneOutputModeValue = "unified_only";
   let showEnrichmentTabsEnabled = false;
   let scanSocialLinksEnabled = true;
   let scrapeRunTabId = null;
+  let uiSettingsSaveTimer = null;
 
   init();
 
@@ -61,16 +142,28 @@
     el.maxRows.value = String(DEFAULT_MAX_ROWS);
     bindEvents();
     await restoreState();
+    await recoverRunningScrapeState();
+    await recoverRunningEnrichState();
 
+    el.maxRows.value = String(maxRowsValue);
     el.infiniteScroll.checked = infiniteScrollEnabled;
     el.enableEnrichment.checked = enrichmentEnabled;
     el.siteMaxPages.value = String(siteMaxPagesValue);
+    el.emailPreference.value = emailPreferenceValue;
+    el.emailOutputMode.value = emailOutputModeValue;
+    el.phonePreference.value = phonePreferenceValue;
+    el.phoneOutputMode.value = phoneOutputModeValue;
     el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
     el.scanSocialLinks.checked = scanSocialLinksEnabled;
+    syncOutputModesFromSelectedColumns();
 
     syncInfiniteScrollInput();
+    updateEmailPreferenceHint();
+    updatePhonePreferenceHint();
     renderColumnSelector();
     updateColumnsTitle();
+    updateEmailColumnsHint();
+    updatePhoneColumnsHint();
     setRunningState(isBusy());
 
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
@@ -84,10 +177,32 @@
     el.infiniteScroll.addEventListener("change", onInfiniteScrollToggle);
     el.enableEnrichment.addEventListener("change", onEnrichmentToggle);
     el.siteMaxPages.addEventListener("change", onSiteMaxPagesChange);
+    el.emailPreference.addEventListener("change", onEmailPreferenceChange);
+    el.emailOutputMode.addEventListener("change", onEmailOutputModeChange);
+    el.phonePreference.addEventListener("change", onPhonePreferenceChange);
+    el.phoneOutputMode.addEventListener("change", onPhoneOutputModeChange);
     el.showEnrichmentTabs.addEventListener("change", onShowEnrichmentTabsToggle);
     el.scanSocialLinks.addEventListener("change", onScanSocialLinksToggle);
     el.columnsAllBtn.addEventListener("click", onSelectAllColumns);
     el.columnsNoneBtn.addEventListener("click", onClearColumns);
+
+    const settingInputs = [
+      el.maxRows,
+      el.minRating,
+      el.maxRating,
+      el.minReviews,
+      el.maxReviews,
+      el.nameKeyword,
+      el.categoryInclude,
+      el.categoryExclude
+    ];
+    for (const input of settingInputs) {
+      if (!input) continue;
+      input.addEventListener("input", onUiSettingsInputChanged);
+      input.addEventListener("change", onUiSettingsInputChanged);
+    }
+    el.hasWebsite.addEventListener("change", onUiSettingsInputChanged);
+    el.hasPhone.addEventListener("change", onUiSettingsInputChanged);
   }
 
   async function onStart() {
@@ -108,6 +223,7 @@
     if (!config) {
       return;
     }
+    await persistRunSettingsForBackground();
 
     const runId = createRunId();
     scrapeRunTabId = tab.id;
@@ -147,7 +263,15 @@
       }
 
       if (!response || response.ok !== true) {
-        throw new Error((response && response.error) || "Failed to start scrape");
+        const errMsg = normalizeText((response && response.error) || "Failed to start scrape");
+        if (/scrape already running/i.test(errMsg)) {
+          scrapeRunning = true;
+          setRunningState(isBusy());
+          setState("Scrape already running");
+          await recoverRunningScrapeState();
+          return;
+        }
+        throw new Error(errMsg || "Failed to start scrape");
       }
 
       // Fallback path: if popup missed SCRAPE_DONE runtime event, use direct response payload.
@@ -168,18 +292,37 @@
 
   async function onStop() {
     clearError();
-    const targetTabId = await resolveScrapeRunTabId();
-    if (!Number.isFinite(targetTabId)) {
-      setError("No active scrape run found.");
-      return;
+    let stopRequested = false;
+    await recoverRunningScrapeState();
+    await recoverRunningEnrichState();
+
+    if (enrichRunning) {
+      try {
+        const response = await sendRuntimeMessage({ type: MSG.STOP_ENRICH });
+        if (response && response.ok === true) {
+          stopRequested = true;
+          setState("Stopping enrichment...");
+          setLeadSignal("Stop requested", "warn");
+        }
+      } catch (_error) {
+        // Continue and attempt scrape stop as well.
+      }
     }
 
-    try {
-      await ensureContentScriptReady(targetTabId);
-      await sendMessageToTab(targetTabId, { type: MSG.STOP_SCRAPE });
-      setState("Stopping...");
-    } catch (_error) {
-      setError("Could not send stop request");
+    const targetTabId = await resolveScrapeRunTabId();
+    if (Number.isFinite(targetTabId)) {
+      try {
+        await ensureContentScriptReady(targetTabId);
+        await sendMessageToTab(targetTabId, { type: MSG.STOP_SCRAPE });
+        stopRequested = true;
+        setState("Stopping...");
+      } catch (_error) {
+        // Ignore and report at the end if nothing was requested.
+      }
+    }
+
+    if (!stopRequested) {
+      setError("No active scrape/enrichment run found.");
     }
   }
 
@@ -212,6 +355,7 @@
       if (el.enableEnrichment.checked) {
         rowsForExport = await enrichRowsBestEffort(rowsForExport, { force: false });
       }
+      rowsForExport = applyUnifiedOutputToRows(rowsForExport);
 
       const filename = defaultFilename();
       const response = await sendRuntimeMessage({
@@ -248,6 +392,9 @@
     }
 
     if (message.type === MSG.SCRAPE_DONE) {
+      if (Number.isFinite(Number(message.tab_id))) {
+        scrapeRunTabId = Number(message.tab_id);
+      }
       finalizeScrapeResult(message.rows, message.summary);
       return;
     }
@@ -338,7 +485,7 @@
 
   function setRunningState(running) {
     el.startBtn.disabled = running;
-    el.stopBtn.disabled = !scrapeRunning;
+    el.stopBtn.disabled = !(scrapeRunning || enrichRunning);
     el.exportBtn.disabled = running || !Array.isArray(lastRows) || selectedColumns.length === 0;
   }
 
@@ -374,6 +521,7 @@
         "lastRows",
         SCRAPE_SESSION_KEY,
         ENRICH_SESSION_KEY,
+        POPUP_UI_SETTINGS_KEY,
         "selectedColumns",
         "infiniteScrollEnabled",
         "enrichmentEnabled",
@@ -382,7 +530,7 @@
         "scanSocialLinksEnabled"
       ]);
       if (Array.isArray(data.lastRows)) {
-        lastRows = data.lastRows;
+        lastRows = applyUnifiedOutputToRows(data.lastRows);
       }
       if (Array.isArray(data.selectedColumns)) {
         selectedColumns = normalizeSelectedColumns(data.selectedColumns);
@@ -392,8 +540,10 @@
       siteMaxPagesValue = clampInt(data.siteMaxPagesValue, 1, 120, 40);
       showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
       scanSocialLinksEnabled = data.scanSocialLinksEnabled !== false;
+      applySavedUiSettings(data[POPUP_UI_SETTINGS_KEY]);
       applyScrapeSession(data[SCRAPE_SESSION_KEY]);
       applyEnrichSession(data[ENRICH_SESSION_KEY]);
+      syncOutputModesFromSelectedColumns();
       el.exportBtn.disabled = isBusy() || !Array.isArray(lastRows) || selectedColumns.length === 0;
     } catch (_error) {
       el.exportBtn.disabled = true;
@@ -404,21 +554,79 @@
     if (areaName !== "local" || !changes) return;
 
     if (changes.lastRows && Array.isArray(changes.lastRows.newValue)) {
-      lastRows = changes.lastRows.newValue;
+      lastRows = applyUnifiedOutputToRows(changes.lastRows.newValue);
+      applyScrapeCounters(lastScrapeSession || {}, lastRows.length);
+      updatePerformanceMetrics(lastScrapeSession || {});
       setRunningState(isBusy());
     }
 
     if (changes[SCRAPE_SESSION_KEY]) {
-      applyScrapeSession(changes[SCRAPE_SESSION_KEY].newValue);
+      const nextScrapeSession = changes[SCRAPE_SESSION_KEY].newValue;
+      if (nextScrapeSession && typeof nextScrapeSession === "object") {
+        applyScrapeSession(nextScrapeSession);
+      } else {
+        lastScrapeSession = null;
+      }
     }
 
     if (changes[ENRICH_SESSION_KEY]) {
-      applyEnrichSession(changes[ENRICH_SESSION_KEY].newValue);
+      const nextEnrichSession = changes[ENRICH_SESSION_KEY].newValue;
+      if (nextEnrichSession && typeof nextEnrichSession === "object") {
+        applyEnrichSession(nextEnrichSession);
+      } else {
+        lastEnrichSession = null;
+        enrichRunning = false;
+        setRunningState(isBusy());
+      }
+    }
+
+    if (changes[POPUP_UI_SETTINGS_KEY]) {
+      applySavedUiSettings(changes[POPUP_UI_SETTINGS_KEY].newValue);
+      updateEmailPreferenceHint();
+      updateEmailColumnsHint();
+      updatePhonePreferenceHint();
+      updatePhoneColumnsHint();
+    }
+  }
+
+  function applySavedUiSettings(settings) {
+    const saved = settings && typeof settings === "object" ? settings : {};
+    maxRowsValue = clampInt(saved.maxRowsValue, 1, 50000, DEFAULT_MAX_ROWS);
+    emailPreferenceValue = normalizeEmailPreference(saved.emailPreference);
+    emailOutputModeValue = normalizeOutputMode(saved.emailOutputMode);
+    phonePreferenceValue = normalizePhonePreference(saved.phonePreference);
+    phoneOutputModeValue = normalizeOutputMode(saved.phoneOutputMode);
+
+    el.maxRows.value = String(maxRowsValue);
+    el.minRating.value = sanitizeFormString(saved.minRating);
+    el.maxRating.value = sanitizeFormString(saved.maxRating);
+    el.minReviews.value = sanitizeFormString(saved.minReviews);
+    el.maxReviews.value = sanitizeFormString(saved.maxReviews);
+    el.nameKeyword.value = sanitizeFormString(saved.nameKeyword);
+    el.categoryInclude.value = sanitizeFormString(saved.categoryInclude);
+    el.categoryExclude.value = sanitizeFormString(saved.categoryExclude);
+    el.hasWebsite.checked = saved.hasWebsite === true;
+    el.hasPhone.checked = saved.hasPhone === true;
+    if (el.emailPreference) {
+      el.emailPreference.value = emailPreferenceValue;
+    }
+    if (el.emailOutputMode) {
+      el.emailOutputMode.value = emailOutputModeValue;
+    }
+    if (el.phonePreference) {
+      el.phonePreference.value = phonePreferenceValue;
+    }
+    if (el.phoneOutputMode) {
+      el.phoneOutputMode.value = phoneOutputModeValue;
+    }
+    if (Array.isArray(lastRows) && lastRows.length > 0) {
+      lastRows = applyUnifiedOutputToRows(lastRows);
     }
   }
 
   function applyScrapeSession(session) {
     if (!session || typeof session !== "object") return;
+    lastScrapeSession = session;
 
     scrapeRunTabId = Number.isFinite(Number(session.tab_id)) ? Number(session.tab_id) : null;
 
@@ -452,9 +660,10 @@
 
   function applyEnrichSession(session) {
     if (!session || typeof session !== "object") return;
+    lastEnrichSession = session;
 
     const status = normalizeText(session.status).toLowerCase();
-    enrichRunning = status === "running";
+    enrichRunning = status === "queued" || status === "running" || status === "stopping";
 
     const siteVisited = Number(session.site_pages_visited != null ? session.site_pages_visited : session.pages_visited || 0);
     const siteDiscovered = Number(session.site_pages_discovered != null ? session.site_pages_discovered : session.pages_discovered || 0);
@@ -469,7 +678,11 @@
       setLeadSignal(signalText, signalTone);
     }
 
-    if (status === "running") {
+    if (status === "queued") {
+      const total = Number(session.total || 0);
+      setState(`Website enrichment queued${total > 0 ? ` (${total} site${total === 1 ? "" : "s"})` : ""}...`);
+      setLeadSignal("Website enrichment queued", "info");
+    } else if (status === "running") {
       const processed = Number(session.processed || 0);
       const total = Number(session.total || 0);
       const phase = normalizeText(session.phase || "");
@@ -479,6 +692,9 @@
       const hostSuffix = host ? ` @ ${host}` : "";
       const currentSuffix = current ? ` ${current}` : "";
       setState(`Enriching websites ${processed}/${total}${phaseSuffix}${hostSuffix} pages ${siteVisited}/${siteDiscovered}...${currentSuffix}`);
+    } else if (status === "stopping") {
+      setState("Stopping enrichment...");
+      setLeadSignal("Stop requested", "warn");
     } else if (status === "done") {
       const enriched = Number(session.enriched || 0);
       const skipped = Number(session.skipped || 0);
@@ -491,6 +707,11 @@
       } else {
         setLeadSignal("No public emails found during enrichment", "warn");
       }
+    } else if (status === "stopped") {
+      const processed = Number(session.processed || 0);
+      const total = Number(session.total || 0);
+      setState(`Enrichment stopped: ${processed}/${total}, pages ${siteVisited}/${siteDiscovered}`);
+      setLeadSignal("Enrichment stopped by user", "warn");
     } else if (status === "error") {
       setError(normalizeText(session.error) || "Website enrichment failed");
       setState("Enrichment failed");
@@ -500,8 +721,165 @@
     setRunningState(isBusy());
   }
 
+  async function recoverRunningScrapeState() {
+    const tabIds = await collectCandidateScrapeTabs();
+    for (const tabId of tabIds) {
+      const runtime = await requestScrapeState(tabId);
+      if (!runtime || runtime.is_running !== true) continue;
+
+      scrapeRunTabId = tabId;
+      scrapeRunning = true;
+      runInfiniteCurrent = runtime.infinite_scroll === true;
+      applyScrapeCounters(runtime, Array.isArray(lastRows) ? lastRows.length : 0);
+      updatePerformanceMetrics(runtime);
+
+      const quickSkips = Number(runtime.fast_skipped || 0);
+      setState(runInfiniteCurrent ? `Scraping (infinite scroll)... fast-skipped ${quickSkips}` : `Scraping... fast-skipped ${quickSkips}`);
+      setLeadSignal("Scrape is still running", "info");
+      setRunningState(isBusy());
+
+      storageSet({
+        [SCRAPE_SESSION_KEY]: {
+          run_id: normalizeText(runtime.run_id),
+          tab_id: tabId,
+          status: normalizeText(runtime.status || "running") || "running",
+          processed: Number(runtime.processed || 0),
+          matched: Number(runtime.matched || 0),
+          duplicates: Number(runtime.duplicates || 0),
+          fast_skipped: Number(runtime.fast_skipped || 0),
+          errors: Number(runtime.errors || 0),
+          seen_listings: Number(runtime.seen_listings || 0),
+          rate_per_sec: Number(runtime.rate_per_sec || 0),
+          avg_rating_seen: runtime.avg_rating_seen,
+          avg_reviews_seen: runtime.avg_reviews_seen,
+          rows_count: Number(runtime.rows_count || 0),
+          source_query: normalizeText(runtime.source_query),
+          source_url: normalizeText(runtime.source_url),
+          infinite_scroll: runtime.infinite_scroll === true,
+          updated_at: new Date().toISOString()
+        }
+      }).catch(() => {});
+      return true;
+    }
+
+    const staleRunning = scrapeRunning === true;
+    if (staleRunning) {
+      scrapeRunning = false;
+      scrapeRunTabId = null;
+      const staleStatus = normalizeText(lastScrapeSession && lastScrapeSession.status).toLowerCase();
+      if (staleStatus === "running" || staleStatus === "stopping") {
+        const patchedSession = {
+          ...(lastScrapeSession || {}),
+          status: "stopped",
+          updated_at: new Date().toISOString()
+        };
+        lastScrapeSession = patchedSession;
+        storageSet({
+          [SCRAPE_SESSION_KEY]: patchedSession
+        }).catch(() => {});
+      }
+      setRunningState(isBusy());
+    }
+    return false;
+  }
+
+  async function recoverRunningEnrichState() {
+    let runtimeState = null;
+    try {
+      const response = await sendRuntimeMessage({ type: MSG.GET_ENRICH_STATE });
+      if (response && response.ok === true && response.state && response.state.is_running === true) {
+        runtimeState = response.state;
+      }
+    } catch (_error) {
+      runtimeState = null;
+    }
+
+    if (runtimeState) {
+      enrichRunning = true;
+      setRunningState(isBusy());
+      const currentStateText = normalizeText(el.stateText && el.stateText.textContent);
+      if (!currentStateText || /^idle$/i.test(currentStateText)) {
+        setState("Enriching websites...");
+      }
+      return true;
+    }
+
+    const staleStatus = normalizeText(lastEnrichSession && lastEnrichSession.status).toLowerCase();
+    if (staleStatus === "running" || staleStatus === "stopping") {
+      const patchedSession = {
+        ...(lastEnrichSession || {}),
+        status: "stopped",
+        phase: "stopped",
+        updated_at: new Date().toISOString(),
+        lead_signal_text: "Enrichment session reset",
+        lead_signal_tone: "warn"
+      };
+      lastEnrichSession = patchedSession;
+      enrichRunning = false;
+      storageSet({
+        [ENRICH_SESSION_KEY]: patchedSession
+      }).catch(() => {});
+      if (!scrapeRunning) {
+        setState("Idle");
+      }
+      setRunningState(isBusy());
+      return false;
+    }
+
+    enrichRunning = false;
+    setRunningState(isBusy());
+    return false;
+  }
+
+  async function collectCandidateScrapeTabs() {
+    const out = [];
+    const seen = new Set();
+
+    if (Number.isFinite(Number(scrapeRunTabId))) {
+      const id = Number(scrapeRunTabId);
+      seen.add(id);
+      out.push(id);
+    }
+
+    try {
+      const data = await storageGet([SCRAPE_SESSION_KEY]);
+      const session = data[SCRAPE_SESSION_KEY];
+      if (session && Number.isFinite(Number(session.tab_id))) {
+        const id = Number(session.tab_id);
+        if (!seen.has(id)) {
+          seen.add(id);
+          out.push(id);
+        }
+      }
+    } catch (_error) {
+      // Ignore storage probe errors.
+    }
+
+    const tabs = await queryAllTabs();
+    for (const tab of tabs) {
+      if (!tab || !tab.id || !isMapsUrl(tab.url)) continue;
+      if (seen.has(tab.id)) continue;
+      seen.add(tab.id);
+      out.push(tab.id);
+    }
+
+    return out;
+  }
+
+  async function requestScrapeState(tabId) {
+    try {
+      const response = await sendMessageToTab(tabId, { type: MSG.GET_SCRAPE_STATE });
+      if (!response || response.ok !== true || !response.state) return null;
+      return response.state;
+    } catch (_error) {
+      return null;
+    }
+  }
+
   function persistRows(rows) {
-    storageSet({ lastRows: rows }).catch(() => {});
+    const normalizedRows = applyUnifiedOutputToRows(rows);
+    lastRows = normalizedRows;
+    storageSet({ lastRows: normalizedRows }).catch(() => {});
     setRunningState(isBusy());
   }
 
@@ -514,7 +892,6 @@
     const rows = Array.isArray(rowsInput) ? rowsInput : [];
     const summary = summaryInput || {};
 
-    lastRows = rows;
     persistRows(rows);
 
     applyScrapeCounters(summary, rows.length);
@@ -530,9 +907,7 @@
     }
 
     if (!summary.stopped && el.enableEnrichment.checked && rows.length > 0) {
-      void enrichRowsBestEffort(rows, { force: false }).catch((error) => {
-        setError(error && error.message ? error.message : "Website enrichment failed");
-      });
+      setLeadSignal("Website enrichment queued in background", "info");
     }
   }
 
@@ -597,6 +972,14 @@
     });
   }
 
+  function queryAllTabs() {
+    return new Promise((resolve) => {
+      chrome.tabs.query({}, (tabs) => {
+        resolve(Array.isArray(tabs) ? tabs : []);
+      });
+    });
+  }
+
   function storageGet(keys) {
     return new Promise((resolve, reject) => {
       chrome.storage.local.get(keys, (result) => {
@@ -627,31 +1010,293 @@
     return Number.isFinite(num) ? num : null;
   }
 
+  function normalizeEmailPreference(value) {
+    const normalized = normalizeText(value).toLowerCase();
+    if (normalized === "primary" || normalized === "contact" || normalized === "owner") {
+      return normalized;
+    }
+    return "owner";
+  }
+
+  function normalizePhonePreference(value) {
+    const normalized = normalizeText(value).toLowerCase();
+    if (normalized === "listing" || normalized === "website") {
+      return normalized;
+    }
+    return "listing";
+  }
+
+  function normalizeOutputMode(value) {
+    const normalized = normalizeText(value).toLowerCase();
+    if (normalized === "unified_only" || normalized === "unified_plus_raw" || normalized === "raw_only") {
+      return normalized;
+    }
+    return "unified_only";
+  }
+
+  function getEmailPrecedence(preferenceValue) {
+    const preference = normalizeEmailPreference(preferenceValue);
+    if (preference === "primary") {
+      return ["Primary Email (Auto)", "Owner Email (Personal)", "Contact Email (Company)"];
+    }
+    if (preference === "contact") {
+      return ["Contact Email (Company)", "Primary Email (Auto)", "Owner Email (Personal)"];
+    }
+    return ["Owner Email (Personal)", "Primary Email (Auto)", "Contact Email (Company)"];
+  }
+
+  function getPhonePrecedence(preferenceValue) {
+    const preference = normalizePhonePreference(preferenceValue);
+    if (preference === "website") {
+      return ["Website Phone (Scanned)", "Listing Phone"];
+    }
+    return ["Listing Phone", "Website Phone (Scanned)"];
+  }
+
+  function updateEmailPreferenceHint() {
+    if (!el.emailPreferenceHint) return;
+    const order = getEmailPrecedence(emailPreferenceValue);
+    el.emailPreferenceHint.textContent = `Email priority: ${order.join(" -> ")}.`;
+  }
+
+  function updatePhonePreferenceHint() {
+    if (!el.phonePreferenceHint) return;
+    const order = getPhonePrecedence(phonePreferenceValue);
+    el.phonePreferenceHint.textContent = `Phone priority: ${order.join(" -> ")}.`;
+  }
+
+  function applyUnifiedOutputToRows(rows) {
+    const withEmail = applyUnifiedEmailToRows(rows);
+    return applyUnifiedPhoneToRows(withEmail);
+  }
+
+  function applyUnifiedEmailToRows(rows) {
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row) => {
+      const source = row || {};
+      const unifiedEmail = resolveUnifiedEmail(source);
+      if (normalizeText(source.email) === unifiedEmail) {
+        return source;
+      }
+      return {
+        ...source,
+        email: unifiedEmail
+      };
+    });
+  }
+
+  function applyUnifiedPhoneToRows(rows) {
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row) => {
+      const source = row || {};
+      const listingPhone = sanitizePhoneText(normalizeText(source.listing_phone || source.phone));
+      const websitePhone = sanitizePhoneText(normalizeText(source.website_phone));
+      const websitePhoneSource = normalizeText(source.website_phone_source);
+      const unifiedPhone = resolveUnifiedPhone(source);
+      if (
+        sanitizePhoneText(source.phone) === unifiedPhone &&
+        sanitizePhoneText(source.listing_phone) === listingPhone &&
+        sanitizePhoneText(source.website_phone) === websitePhone &&
+        normalizeText(source.website_phone_source) === websitePhoneSource
+      ) {
+        return source;
+      }
+      return {
+        ...source,
+        phone: unifiedPhone,
+        listing_phone: listingPhone,
+        website_phone: websitePhone,
+        website_phone_source: websitePhoneSource
+      };
+    });
+  }
+
+  function resolveUnifiedEmail(row) {
+    const value = row || {};
+    const ownerEmail = normalizeText(value.owner_email);
+    const primaryEmail = normalizeText(value.primary_email);
+    const contactEmail = normalizeText(value.contact_email);
+
+    const preference = normalizeEmailPreference(emailPreferenceValue);
+    const precedence =
+      preference === "primary"
+        ? [primaryEmail, ownerEmail, contactEmail]
+        : preference === "contact"
+          ? [contactEmail, primaryEmail, ownerEmail]
+          : [ownerEmail, primaryEmail, contactEmail];
+
+    return precedence.find((email) => email !== "") || "";
+  }
+
+  function resolveUnifiedPhone(row) {
+    const value = row || {};
+    const listingPhone = sanitizePhoneText(normalizeText(value.listing_phone || value.phone));
+    const websitePhone = sanitizePhoneText(normalizeText(value.website_phone));
+    const preference = normalizePhonePreference(phonePreferenceValue);
+    const precedence = preference === "website"
+      ? [websitePhone, listingPhone]
+      : [listingPhone, websitePhone];
+    return precedence.find((phone) => phone !== "") || "";
+  }
+
+  function sanitizePhoneText(value) {
+    const raw = normalizeText(value);
+    if (!raw) return "";
+    const withoutPrefixNoise = raw.replace(/^[^\d+()]+/, "");
+    const matched = withoutPrefixNoise.match(/(?:\+?\d[\d().\s-]{7,}\d)/);
+    const candidate = normalizeText((matched ? matched[0] : withoutPrefixNoise).replace(/[^\d+().\s-]/g, " "));
+    const digits = candidate.replace(/\D/g, "");
+    if (digits.length < 7 || digits.length > 15) return "";
+    return candidate;
+  }
+
+  function sanitizeFormString(value) {
+    return normalizeText(value);
+  }
+
+  function onUiSettingsInputChanged() {
+    maxRowsValue = clampInt(el.maxRows.value, 1, 50000, DEFAULT_MAX_ROWS);
+    schedulePersistUiSettings();
+  }
+
+  function schedulePersistUiSettings() {
+    if (uiSettingsSaveTimer) {
+      clearTimeout(uiSettingsSaveTimer);
+    }
+
+    uiSettingsSaveTimer = setTimeout(() => {
+      uiSettingsSaveTimer = null;
+      persistUiSettings();
+    }, 150);
+  }
+
+  function persistUiSettings() {
+    maxRowsValue = clampInt(el.maxRows.value, 1, 50000, DEFAULT_MAX_ROWS);
+    emailPreferenceValue = normalizeEmailPreference(el.emailPreference && el.emailPreference.value);
+    emailOutputModeValue = normalizeOutputMode(el.emailOutputMode && el.emailOutputMode.value);
+    phonePreferenceValue = normalizePhonePreference(el.phonePreference && el.phonePreference.value);
+    phoneOutputModeValue = normalizeOutputMode(el.phoneOutputMode && el.phoneOutputMode.value);
+    const uiSettings = {
+      maxRowsValue,
+      emailPreference: emailPreferenceValue,
+      emailOutputMode: emailOutputModeValue,
+      phonePreference: phonePreferenceValue,
+      phoneOutputMode: phoneOutputModeValue,
+      minRating: sanitizeFormString(el.minRating.value),
+      maxRating: sanitizeFormString(el.maxRating.value),
+      minReviews: sanitizeFormString(el.minReviews.value),
+      maxReviews: sanitizeFormString(el.maxReviews.value),
+      nameKeyword: sanitizeFormString(el.nameKeyword.value),
+      categoryInclude: sanitizeFormString(el.categoryInclude.value),
+      categoryExclude: sanitizeFormString(el.categoryExclude.value),
+      hasWebsite: el.hasWebsite.checked === true,
+      hasPhone: el.hasPhone.checked === true
+    };
+
+    storageSet({
+      [POPUP_UI_SETTINGS_KEY]: uiSettings
+    }).catch(() => {});
+  }
+
   function onInfiniteScrollToggle() {
     infiniteScrollEnabled = el.infiniteScroll.checked;
     syncInfiniteScrollInput();
     storageSet({ infiniteScrollEnabled }).catch(() => {});
+    schedulePersistUiSettings();
   }
 
   function onEnrichmentToggle() {
     enrichmentEnabled = el.enableEnrichment.checked;
     storageSet({ enrichmentEnabled }).catch(() => {});
+    schedulePersistUiSettings();
   }
 
   function onSiteMaxPagesChange() {
     siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 40);
     el.siteMaxPages.value = String(siteMaxPagesValue);
     storageSet({ siteMaxPagesValue }).catch(() => {});
+    schedulePersistUiSettings();
+  }
+
+  function onEmailPreferenceChange() {
+    emailPreferenceValue = normalizeEmailPreference(el.emailPreference.value);
+    el.emailPreference.value = emailPreferenceValue;
+    updateEmailPreferenceHint();
+    updateEmailColumnsHint();
+    schedulePersistUiSettings();
+
+    if (Array.isArray(lastRows) && lastRows.length > 0) {
+      persistRows(lastRows);
+    }
+  }
+
+  function onEmailOutputModeChange() {
+    emailOutputModeValue = normalizeOutputMode(el.emailOutputMode.value);
+    el.emailOutputMode.value = emailOutputModeValue;
+    applyEmailModeToSelection();
+    renderColumnSelector();
+    updateColumnsTitle();
+    updateEmailColumnsHint();
+    persistSelectedColumns();
+    schedulePersistUiSettings();
+    setRunningState(isBusy());
+    if (Array.isArray(lastRows) && lastRows.length > 0) {
+      persistRows(lastRows);
+    }
+  }
+
+  function onPhonePreferenceChange() {
+    phonePreferenceValue = normalizePhonePreference(el.phonePreference.value);
+    el.phonePreference.value = phonePreferenceValue;
+    updatePhonePreferenceHint();
+    updatePhoneColumnsHint();
+    schedulePersistUiSettings();
+
+    if (Array.isArray(lastRows) && lastRows.length > 0) {
+      persistRows(lastRows);
+    }
+  }
+
+  function onPhoneOutputModeChange() {
+    phoneOutputModeValue = normalizeOutputMode(el.phoneOutputMode.value);
+    el.phoneOutputMode.value = phoneOutputModeValue;
+    applyPhoneModeToSelection();
+    renderColumnSelector();
+    updateColumnsTitle();
+    updatePhoneColumnsHint();
+    persistSelectedColumns();
+    schedulePersistUiSettings();
+    setRunningState(isBusy());
+    if (Array.isArray(lastRows) && lastRows.length > 0) {
+      persistRows(lastRows);
+    }
   }
 
   function onShowEnrichmentTabsToggle() {
     showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked;
     storageSet({ showEnrichmentTabsEnabled }).catch(() => {});
+    schedulePersistUiSettings();
   }
 
   function onScanSocialLinksToggle() {
     scanSocialLinksEnabled = el.scanSocialLinks.checked;
     storageSet({ scanSocialLinksEnabled }).catch(() => {});
+    schedulePersistUiSettings();
+  }
+
+  async function persistRunSettingsForBackground() {
+    enrichmentEnabled = el.enableEnrichment.checked === true;
+    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 40);
+    showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked === true;
+    scanSocialLinksEnabled = el.scanSocialLinks.checked === true;
+    el.siteMaxPages.value = String(siteMaxPagesValue);
+
+    await storageSet({
+      enrichmentEnabled,
+      siteMaxPagesValue,
+      showEnrichmentTabsEnabled,
+      scanSocialLinksEnabled
+    }).catch(() => {});
   }
 
   function syncInfiniteScrollInput() {
@@ -667,36 +1312,236 @@
   function renderColumnSelector() {
     el.columnList.textContent = "";
     const selectedSet = new Set(selectedColumns);
+    const groupedColumns = new Set();
 
-    for (const column of CSV_COLUMNS) {
-      const label = document.createElement("label");
-      label.className = "checkbox column-checkbox";
+    for (const group of COLUMN_GROUPS) {
+      const section = document.createElement("section");
+      section.className = "column-group";
 
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.value = column;
-      input.checked = selectedSet.has(column);
-      input.addEventListener("change", onColumnSelectionChange);
+      const head = document.createElement("div");
+      head.className = "column-group-head";
+      const title = document.createElement("strong");
+      title.textContent = group.title;
+      const description = document.createElement("span");
+      description.textContent = group.description;
+      head.appendChild(title);
+      head.appendChild(description);
+      section.appendChild(head);
 
-      const text = document.createTextNode(COLUMN_LABELS[column] || column);
-      label.appendChild(input);
-      label.appendChild(text);
-      el.columnList.appendChild(label);
+      const grid = document.createElement("div");
+      grid.className = "column-grid";
+
+      for (const column of group.columns) {
+        groupedColumns.add(column);
+        if (!CSV_COLUMNS.includes(column)) continue;
+        grid.appendChild(buildColumnCheckbox(column, selectedSet));
+      }
+
+      section.appendChild(grid);
+      el.columnList.appendChild(section);
     }
+
+    const extras = CSV_COLUMNS.filter((column) => !groupedColumns.has(column));
+    if (extras.length > 0) {
+      const section = document.createElement("section");
+      section.className = "column-group";
+
+      const head = document.createElement("div");
+      head.className = "column-group-head";
+      const title = document.createElement("strong");
+      title.textContent = "Other Fields";
+      const description = document.createElement("span");
+      description.textContent = "Additional columns";
+      head.appendChild(title);
+      head.appendChild(description);
+      section.appendChild(head);
+
+      const grid = document.createElement("div");
+      grid.className = "column-grid";
+      for (const column of extras) {
+        grid.appendChild(buildColumnCheckbox(column, selectedSet));
+      }
+      section.appendChild(grid);
+      el.columnList.appendChild(section);
+    }
+  }
+
+  function buildColumnCheckbox(column, selectedSet) {
+    const label = document.createElement("label");
+    label.className = "checkbox column-checkbox";
+
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = column;
+    input.checked = selectedSet.has(column);
+    input.addEventListener("change", onColumnSelectionChange);
+
+    const textWrap = document.createElement("span");
+    textWrap.className = "column-label";
+    const name = document.createElement("span");
+    name.textContent = COLUMN_LABELS[column] || column;
+    textWrap.appendChild(name);
+
+    const badge = COLUMN_BADGES[column];
+    if (badge && badge.text) {
+      const pill = document.createElement("span");
+      pill.className = `column-pill${badge.tone === "raw" ? " raw" : badge.tone === "meta" ? " meta" : ""}`;
+      pill.textContent = badge.text;
+      textWrap.appendChild(pill);
+    }
+
+    label.appendChild(input);
+    label.appendChild(textWrap);
+    return label;
+  }
+
+  function applyEmailModeToSelection() {
+    const selected = new Set(selectedColumns);
+    const mode = normalizeOutputMode(emailOutputModeValue);
+    if (mode === "unified_only") {
+      selected.add("email");
+      for (const column of RAW_EMAIL_COLUMNS) {
+        selected.delete(column);
+      }
+    } else if (mode === "unified_plus_raw") {
+      for (const column of EMAIL_COLUMNS) {
+        selected.add(column);
+      }
+    } else if (mode === "raw_only") {
+      selected.delete("email");
+      for (const column of RAW_EMAIL_COLUMNS) {
+        selected.add(column);
+      }
+    }
+    selectedColumns = normalizeSelectedColumns(Array.from(selected));
+  }
+
+  function applyPhoneModeToSelection() {
+    const selected = new Set(selectedColumns);
+    const mode = normalizeOutputMode(phoneOutputModeValue);
+    if (mode === "unified_only") {
+      selected.add("phone");
+      for (const column of RAW_PHONE_COLUMNS) {
+        selected.delete(column);
+      }
+    } else if (mode === "unified_plus_raw") {
+      for (const column of PHONE_COLUMNS) {
+        selected.add(column);
+      }
+    } else if (mode === "raw_only") {
+      selected.delete("phone");
+      for (const column of RAW_PHONE_COLUMNS) {
+        selected.add(column);
+      }
+    }
+    selectedColumns = normalizeSelectedColumns(Array.from(selected));
+  }
+
+  function inferOutputModeFromColumns(selectedSet, unifiedColumn, rawColumns) {
+    const hasUnified = selectedSet.has(unifiedColumn);
+    const hasRaw = rawColumns.some((column) => selectedSet.has(column));
+    if (hasUnified && !hasRaw) return "unified_only";
+    if (hasUnified && hasRaw) return "unified_plus_raw";
+    if (!hasUnified && hasRaw) return "raw_only";
+    return "unified_only";
+  }
+
+  function syncOutputModesFromSelectedColumns() {
+    const selectedSet = new Set(selectedColumns);
+    emailOutputModeValue = inferOutputModeFromColumns(selectedSet, "email", RAW_EMAIL_COLUMNS);
+    phoneOutputModeValue = inferOutputModeFromColumns(selectedSet, "phone", RAW_PHONE_COLUMNS);
+    if (el.emailOutputMode) {
+      el.emailOutputMode.value = emailOutputModeValue;
+    }
+    if (el.phoneOutputMode) {
+      el.phoneOutputMode.value = phoneOutputModeValue;
+    }
+  }
+
+  function updateEmailColumnsHint() {
+    if (!el.emailColumnsHint) return;
+    const selected = new Set(selectedColumns);
+    const hasUnified = selected.has("email");
+    const selectedRaw = RAW_EMAIL_COLUMNS.filter((column) => selected.has(column));
+    const order = getEmailPrecedence(emailPreferenceValue);
+
+    el.emailColumnsHint.className = "hint-text";
+    if (!hasUnified && selectedRaw.length === 0) {
+      el.emailColumnsHint.textContent = "No email columns selected.";
+      el.emailColumnsHint.classList.add("warn");
+      return;
+    }
+
+    if (hasUnified && selectedRaw.length === 0) {
+      el.emailColumnsHint.textContent = `Unified mode: one Email column using ${order.join(" -> ")}.`;
+      el.emailColumnsHint.classList.add("success");
+      return;
+    }
+
+    if (hasUnified) {
+      el.emailColumnsHint.textContent = `Unified + raw mode: Email plus ${selectedRaw.length} raw email field(s).`;
+      return;
+    }
+
+    el.emailColumnsHint.textContent = `Raw-only mode: ${selectedRaw.length} raw email field(s).`;
+    el.emailColumnsHint.classList.add("warn");
+  }
+
+  function updatePhoneColumnsHint() {
+    if (!el.phoneColumnsHint) return;
+    const selected = new Set(selectedColumns);
+    const hasUnified = selected.has("phone");
+    const selectedRaw = RAW_PHONE_COLUMNS.filter((column) => selected.has(column));
+    const order = getPhonePrecedence(phonePreferenceValue);
+
+    el.phoneColumnsHint.className = "hint-text";
+    if (!hasUnified && selectedRaw.length === 0) {
+      el.phoneColumnsHint.textContent = "No phone columns selected.";
+      el.phoneColumnsHint.classList.add("warn");
+      return;
+    }
+
+    if (hasUnified && selectedRaw.length === 0) {
+      el.phoneColumnsHint.textContent = `Unified mode: one Phone column using ${order.join(" -> ")}.`;
+      el.phoneColumnsHint.classList.add("success");
+      return;
+    }
+
+    if (hasUnified) {
+      el.phoneColumnsHint.textContent = `Unified + raw mode: Phone plus ${selectedRaw.length} raw phone field(s).`;
+      return;
+    }
+
+    el.phoneColumnsHint.textContent = `Raw-only mode: ${selectedRaw.length} raw phone field(s).`;
+    el.phoneColumnsHint.classList.add("warn");
   }
 
   function onSelectAllColumns() {
     selectedColumns = [...CSV_COLUMNS];
+    emailOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "email", RAW_EMAIL_COLUMNS);
+    phoneOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "phone", RAW_PHONE_COLUMNS);
+    el.emailOutputMode.value = emailOutputModeValue;
+    el.phoneOutputMode.value = phoneOutputModeValue;
     renderColumnSelector();
     updateColumnsTitle();
+    updateEmailColumnsHint();
+    updatePhoneColumnsHint();
+    schedulePersistUiSettings();
     persistSelectedColumns();
     setRunningState(isBusy());
   }
 
   function onClearColumns() {
     selectedColumns = [];
+    emailOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "email", RAW_EMAIL_COLUMNS);
+    phoneOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "phone", RAW_PHONE_COLUMNS);
+    el.emailOutputMode.value = emailOutputModeValue;
+    el.phoneOutputMode.value = phoneOutputModeValue;
     renderColumnSelector();
     updateColumnsTitle();
+    updateEmailColumnsHint();
+    updatePhoneColumnsHint();
+    schedulePersistUiSettings();
     persistSelectedColumns();
     setRunningState(isBusy());
   }
@@ -704,7 +1549,15 @@
   function onColumnSelectionChange() {
     const checked = Array.from(el.columnList.querySelectorAll("input[type='checkbox']:checked")).map((node) => node.value);
     selectedColumns = normalizeSelectedColumns(checked);
+    const selectedSet = new Set(selectedColumns);
+    emailOutputModeValue = inferOutputModeFromColumns(selectedSet, "email", RAW_EMAIL_COLUMNS);
+    phoneOutputModeValue = inferOutputModeFromColumns(selectedSet, "phone", RAW_PHONE_COLUMNS);
+    el.emailOutputMode.value = emailOutputModeValue;
+    el.phoneOutputMode.value = phoneOutputModeValue;
     updateColumnsTitle();
+    updateEmailColumnsHint();
+    updatePhoneColumnsHint();
+    schedulePersistUiSettings();
     persistSelectedColumns();
     setRunningState(isBusy());
   }
@@ -734,13 +1587,20 @@
   }
 
   function isEnrichmentColumn(column) {
-    return column === "owner_name" ||
+    return column === "email" ||
+      column === "owner_name" ||
       column === "owner_title" ||
       column === "owner_email" ||
       column === "contact_email" ||
       column === "primary_email" ||
       column === "primary_email_type" ||
       column === "primary_email_source" ||
+      column === "owner_confidence" ||
+      column === "email_confidence" ||
+      column === "email_source_url" ||
+      column === "no_email_reason" ||
+      column === "website_phone" ||
+      column === "website_phone_source" ||
       column === "website_scan_status" ||
       column === "site_pages_visited" ||
       column === "site_pages_discovered" ||
@@ -750,7 +1610,17 @@
 
   function rowsAlreadyEnriched(rows) {
     if (!Array.isArray(rows) || rows.length === 0) return false;
-    return rows.some((row) => normalizeText(row && row.website_scan_status) !== "");
+    let hasCompletedStatuses = false;
+
+    for (const row of rows) {
+      const status = normalizeText(row && row.website_scan_status).toLowerCase();
+      if (!status || status === "queued" || status === "not_requested" || status === "running" || status === "stopping" || status === "init") {
+        return false;
+      }
+      hasCompletedStatuses = true;
+    }
+
+    return hasCompletedStatuses;
   }
 
   async function enrichRowsBestEffort(rows, options) {
@@ -783,13 +1653,19 @@
       }
 
       const rowsForExport = Array.isArray(enrichResponse.rows) ? enrichResponse.rows : rows;
-      lastRows = rowsForExport;
       persistRows(rowsForExport);
 
       const enrichSummary = enrichResponse.summary || {};
+      const stopped = enrichSummary.stopped === true;
       el.crawlVisitedStat.textContent = String(Number(enrichSummary.pages_visited || 0));
       el.crawlDiscoveredStat.textContent = String(Number(enrichSummary.pages_discovered || 0));
       el.socialScannedStat.textContent = String(Number(enrichSummary.social_scanned || 0));
+      if (stopped) {
+        setState(`Enrichment stopped: ${enrichSummary.processed || 0}/${enrichSummary.total || rowsForExport.length}, pages ${enrichSummary.pages_visited || 0}/${enrichSummary.pages_discovered || 0}`);
+        setLeadSignal("Enrichment stopped by user", "warn");
+        return rowsForExport;
+      }
+
       setState(`Enrichment: ${enrichSummary.enriched || 0} enriched, ${enrichSummary.skipped || 0} skipped, ${enrichSummary.blocked || 0} blocked, pages ${enrichSummary.pages_visited || 0}/${enrichSummary.pages_discovered || 0}`);
       const personalCount = Number(enrichSummary.personal_email_found || 0);
       const companyCount = Number(enrichSummary.company_email_found || 0);
@@ -854,8 +1730,23 @@
     const data = payload || {};
     const speed = Number(data.rate_per_sec || 0);
     const seen = Number(data.seen_listings || 0);
-    const avgRating = data.avg_rating_seen;
-    const avgReviews = data.avg_reviews_seen;
+    let avgRating = data.avg_rating_seen;
+    let avgReviews = data.avg_reviews_seen;
+
+    const fallbackAvgRating = averageFromRows(lastRows, "rating", 0.01, 5);
+    const fallbackAvgReviews = averageFromRows(lastRows, "review_count", 0, Number.POSITIVE_INFINITY);
+
+    if (!Number.isFinite(Number(avgRating)) && Number.isFinite(Number(fallbackAvgRating))) {
+      avgRating = fallbackAvgRating;
+    }
+
+    const avgReviewsNum = Number(avgReviews);
+    const shouldBackfillReviews =
+      !Number.isFinite(avgReviewsNum) ||
+      (avgReviewsNum === 0 && (seen > 0 || (Array.isArray(lastRows) && lastRows.length > 0)));
+    if (shouldBackfillReviews && Number.isFinite(Number(fallbackAvgReviews))) {
+      avgReviews = fallbackAvgReviews;
+    }
 
     el.speedStat.textContent = `${formatNumber(speed, 2)}/s`;
     el.seenListingsStat.textContent = Number.isFinite(seen) ? String(seen) : "0";
@@ -863,7 +1754,44 @@
     el.avgReviewsStat.textContent = formatMaybeNumber(avgReviews, 1);
   }
 
+  function averageFromRows(rows, field, minValue, maxValue) {
+    if (!Array.isArray(rows) || rows.length === 0) return "";
+    let sum = 0;
+    let count = 0;
+
+    for (const row of rows) {
+      const value = parseMetricNumber(row && row[field]);
+      if (!Number.isFinite(value)) continue;
+      if (value < minValue || value > maxValue) continue;
+      sum += value;
+      count += 1;
+    }
+
+    if (count === 0) return "";
+    return sum / count;
+  }
+
+  function parseMetricNumber(value) {
+    if (value == null) return NaN;
+    if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+
+    const text = normalizeText(value).toLowerCase().replace(/\s+/g, "");
+    if (!text) return NaN;
+
+    const match = text.match(/^(\d[\d,]*)(?:\.(\d+))?([kmb])?$/i);
+    if (!match) return NaN;
+
+    const whole = Number((match[1] || "").replace(/,/g, ""));
+    if (!Number.isFinite(whole)) return NaN;
+    const fraction = match[2] ? Number(`0.${match[2]}`) : 0;
+    if (!Number.isFinite(fraction)) return NaN;
+
+    const multiplier = match[3] ? (match[3].toLowerCase() === "k" ? 1000 : match[3].toLowerCase() === "m" ? 1000000 : 1000000000) : 1;
+    return (whole + fraction) * multiplier;
+  }
+
   function formatMaybeNumber(value, digits) {
+    if (value === "" || value == null) return "-";
     const num = Number(value);
     if (!Number.isFinite(num)) return "-";
     return formatNumber(num, digits);

@@ -47,8 +47,23 @@ label {
   color: var(--muted);
 }
 
+.hint-text {
+  margin: -2px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.hint-text.warn {
+  color: #b54708;
+}
+
+.hint-text.success {
+  color: #127a3e;
+}
+
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+select {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 6px 8px;
@@ -230,6 +245,33 @@ button:disabled {
 
 .column-list {
   display: grid;
+  gap: 8px;
+}
+
+.column-group {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  background: #fff;
+}
+
+.column-group-head {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+
+.column-group-head strong {
+  font-size: 11px;
+}
+
+.column-group-head span {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.column-grid {
+  display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 4px 8px;
 }
@@ -237,4 +279,33 @@ button:disabled {
 .column-checkbox {
   font-size: 11px;
   color: var(--text);
+  align-items: flex-start;
+}
+
+.column-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1.2;
+}
+
+.column-pill {
+  border-radius: 10px;
+  border: 1px solid #b9c7db;
+  background: #edf3ff;
+  color: #0b3d91;
+  font-size: 10px;
+  padding: 1px 5px;
+}
+
+.column-pill.raw {
+  background: #f2f4f7;
+  border-color: #c7ced9;
+  color: #344054;
+}
+
+.column-pill.meta {
+  background: #eef7f3;
+  border-color: #b8decf;
+  color: #0f5132;
 }

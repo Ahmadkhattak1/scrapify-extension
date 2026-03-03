@@ -76,6 +76,41 @@
           Website pages per site
           <input id="siteMaxPages" type="number" min="1" max="120" step="1" value="40" />
         </label>
+        <label>
+          Unified email preference
+          <select id="emailPreference">
+            <option value="owner">Owner first (recommended)</option>
+            <option value="primary">Primary first</option>
+            <option value="contact">Company/contact first</option>
+          </select>
+        </label>
+        <label>
+          Email output mode
+          <select id="emailOutputMode">
+            <option value="unified_only">Unified only (recommended)</option>
+            <option value="unified_plus_raw">Unified + raw fields</option>
+            <option value="raw_only">Raw fields only</option>
+          </select>
+        </label>
+        <p id="emailPreferenceHint" class="hint-text"></p>
+        <p id="emailColumnsHint" class="hint-text"></p>
+        <label>
+          Unified phone preference
+          <select id="phonePreference">
+            <option value="listing">Listing first (recommended)</option>
+            <option value="website">Website first</option>
+          </select>
+        </label>
+        <label>
+          Phone output mode
+          <select id="phoneOutputMode">
+            <option value="unified_only">Unified only (recommended)</option>
+            <option value="unified_plus_raw">Unified + raw fields</option>
+            <option value="raw_only">Raw fields only</option>
+          </select>
+        </label>
+        <p id="phonePreferenceHint" class="hint-text"></p>
+        <p id="phoneColumnsHint" class="hint-text"></p>
         <div class="row toggles">
           <label class="checkbox">
             <input id="showEnrichmentTabs" type="checkbox" />

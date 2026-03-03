@@ -5,7 +5,17 @@
   window.__GBP_MAPS_SCRAPER_BOOTSTRAPPED__ = true;
 
   const shared = window.GbpShared;
-  const { MSG, DEFAULT_MAX_ROWS, normalizeText, parseRating, parseReviewCount, normalizeMapsUrl, dedupeKey, applyFilters } = shared;
+  const {
+    MSG,
+    DEFAULT_MAX_ROWS,
+    normalizeText,
+    parseRating,
+    parseReviewCount,
+    normalizeMapsUrl,
+    normalizeBusinessWebsiteUrl,
+    dedupeKey,
+    applyFilters
+  } = shared;
   const SCRAPE_SESSION_KEY = "scrapeSession";
   const ROW_SNAPSHOT_INTERVAL = 8;
 
@@ -68,6 +78,15 @@
       state.stopRequested = true;
       persistScrapeSession({ status: "stopping", force: true });
       sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message.type === MSG.GET_SCRAPE_STATE) {
+      sendResponse({
+        ok: true,
+        type: MSG.SCRAPE_STATE,
+        state: getScrapeRuntimeState()
+      });
       return false;
     }
 
@@ -142,7 +161,7 @@
           if (state.stopRequested) break;
 
           const quickData = buildQuickCardData(card);
-          updateSeenStats(quickData);
+          const seenCapture = updateSeenStats(quickData);
 
           if (!quickCardPassesFilter(quickData, filters)) {
             state.fastSkipped += 1;
@@ -153,6 +172,7 @@
           try {
             const row = await processCard(card, sourceQuery, sourceUrl);
             state.processed += 1;
+            backfillSeenStatsFromRow(row, seenCapture);
 
             if (row && applyFilters(row, filters)) {
               const key = dedupeKey(row);
@@ -236,12 +256,30 @@
 
   async function processCard(card, sourceQuery, sourceUrl) {
     const fallbackRow = extractBusinessRowFromCard(card, sourceQuery, sourceUrl);
+    const expectedIdentity = getExpectedDetailIdentity(card, fallbackRow);
 
     safeClick(card);
-    await sleep(900);
-    await waitForDetails(3000);
+    await sleep(700);
+    let detailMatched = await waitForDetails(expectedIdentity, 3200);
+    if (!detailMatched) {
+      safeClick(card);
+      await sleep(750);
+      detailMatched = await waitForDetails(expectedIdentity, 3200);
+    }
+    if (!detailMatched && fallbackRow) {
+      return fallbackRow;
+    }
 
     const detailRow = extractBusinessRow(sourceQuery, sourceUrl);
+    if (
+      detailRow &&
+      expectedIdentity &&
+      expectedIdentity.hasIdentity === true &&
+      !isRowMatchingExpected(detailRow, expectedIdentity)
+    ) {
+      return fallbackRow || detailRow;
+    }
+
     if (detailRow && fallbackRow) {
       return mergeRows(detailRow, fallbackRow);
     }
@@ -262,9 +300,13 @@
       "";
 
     const reviewsText =
+      attrFrom("button[aria-label*='review']", "aria-label") ||
+      attrFrom("span[aria-label*='review']", "aria-label") ||
+      attrFrom("button[jsaction*='pane.reviewChart.moreReviews']", "aria-label") ||
       textFrom("div.F7nice span[aria-label*='review']") ||
-      textFrom("button[aria-label*='review']") ||
       textFrom("span[aria-label*='reviews']") ||
+      textFrom("[role='main'] span[aria-label*='review']") ||
+      textFrom("div.F7nice") ||
       "";
 
     const category =
@@ -281,11 +323,9 @@
       textFrom("button[data-item-id^='phone:tel']") ||
       textFrom("button[aria-label^='Phone']") ||
       textFrom("button[aria-label*='Phone:']");
+    const listingPhone = sanitizePhoneText(normalizeFieldValue(phone, "Phone"));
 
-    const websiteHref =
-      hrefFrom("a[data-item-id='authority']") ||
-      hrefFrom("a[aria-label^='Website']") ||
-      hrefFrom("a[aria-label*='Website:']");
+    const websiteHref = extractWebsiteFromDetailPanel();
 
     const hours =
       textFrom("div.t39EBf") ||
@@ -302,8 +342,24 @@
       review_count: parseReviewCount(reviewsText),
       category: normalizeText(category),
       address: normalizeFieldValue(address, "Address"),
-      phone: normalizeFieldValue(phone, "Phone"),
-      website: normalizeMapsUrl(websiteHref),
+      phone: listingPhone,
+      listing_phone: listingPhone,
+      website_phone: "",
+      website_phone_source: "",
+      website: websiteHref,
+      email: "",
+      owner_name: "",
+      owner_title: "",
+      owner_email: "",
+      contact_email: "",
+      primary_email: "",
+      primary_email_type: "",
+      primary_email_source: "",
+      website_scan_status: websiteHref ? "not_requested" : "no_website",
+      site_pages_visited: 0,
+      site_pages_discovered: 0,
+      social_pages_scanned: 0,
+      social_links: "",
       hours: normalizeText(hours),
       maps_url: mapsUrl,
       source_query: normalizeText(sourceQuery),
@@ -322,12 +378,25 @@
     return text;
   }
 
+  function sanitizePhoneText(value) {
+    const raw = normalizeText(value);
+    if (!raw) return "";
+    const withoutPrefixNoise = raw.replace(/^[^\d+()]+/, "");
+    const matched = withoutPrefixNoise.match(/(?:\+?\d[\d().\s-]{7,}\d)/);
+    const candidate = normalizeText((matched ? matched[0] : withoutPrefixNoise).replace(/[^\d+().\s-]/g, " "));
+    const digits = candidate.replace(/\D/g, "");
+    if (digits.length < 7 || digits.length > 15) return "";
+    return candidate;
+  }
+
   function extractBusinessRowFromCard(card, sourceQuery, sourceUrl) {
     if (!card) return null;
     const link = resolveCardLink(card);
     const cardText = normalizeText(card.textContent || "");
     const quickData = buildQuickCardData(card);
     const lines = cardText.split(/\n+/).map((line) => normalizeText(line)).filter(Boolean);
+    const websiteFromCard = extractWebsiteFromCard(card);
+    const phoneFromCard = lines.map((line) => sanitizePhoneText(line)).find(Boolean) || "";
 
     const name =
       normalizeText((link && link.getAttribute("aria-label")) || "") ||
@@ -346,14 +415,217 @@
       review_count: quickData.reviews !== "" ? quickData.reviews : parseReviewCount(cardText),
       category: lines[1] || "",
       address: "",
-      phone: "",
-      website: "",
+      phone: phoneFromCard,
+      listing_phone: phoneFromCard,
+      website_phone: "",
+      website_phone_source: "",
+      website: websiteFromCard,
+      email: "",
+      owner_name: "",
+      owner_title: "",
+      owner_email: "",
+      contact_email: "",
+      primary_email: "",
+      primary_email_type: "",
+      primary_email_source: "",
+      website_scan_status: websiteFromCard ? "not_requested" : "no_website",
+      site_pages_visited: 0,
+      site_pages_discovered: 0,
+      social_pages_scanned: 0,
+      social_links: "",
       hours: "",
       maps_url: mapsUrl,
       source_query: normalizeText(sourceQuery),
       source_url: normalizeMapsUrl(sourceUrl),
       scraped_at: new Date().toISOString()
     };
+  }
+
+  function extractWebsiteFromCard(card) {
+    if (!card) return "";
+
+    const roots = [card, card.closest("[role='article']"), card.parentElement].filter(Boolean);
+    const selectors = [
+      "a[data-item-id*='authority'][href]",
+      "a[data-item-id*='website'][href]",
+      "a[aria-label^='Website'][href]",
+      "a[aria-label*='Website:'][href]",
+      "a[href]"
+    ];
+
+    for (const root of roots) {
+      for (const selector of selectors) {
+        const nodes = Array.from(root.querySelectorAll(selector)).slice(0, 80);
+        for (const node of nodes) {
+          const href = normalizeBusinessWebsiteUrl((node.getAttribute && node.getAttribute("href")) || node.href || "");
+          if (isValidWebsiteLink(href)) {
+            return href;
+          }
+          const textHit = findWebsiteInText(
+            `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
+          );
+          if (textHit) {
+            return textHit;
+          }
+        }
+      }
+    }
+
+    for (const root of roots) {
+      const textHit = findWebsiteInText(normalizeText(root.textContent || ""));
+      if (textHit) {
+        return textHit;
+      }
+    }
+
+    return "";
+  }
+
+  function getExpectedDetailIdentity(card, fallbackRow) {
+    const row = fallbackRow && typeof fallbackRow === "object" ? fallbackRow : {};
+    const link = resolveCardLink(card);
+    const href = normalizeMapsUrl((link && (link.href || link.getAttribute("href"))) || row.maps_url || "");
+    const placeId = normalizeText(parsePlaceIdFromUrl(href) || row.place_id);
+    const cardName =
+      normalizeText((link && link.getAttribute("aria-label")) || "") ||
+      normalizeText(row.name) ||
+      normalizeText(card && card.getAttribute && card.getAttribute("aria-label"));
+
+    const normalizedName = normalizeNameForMatch(cardName);
+    return {
+      href,
+      placeId,
+      name: normalizedName,
+      hasIdentity: Boolean(href || placeId || normalizedName)
+    };
+  }
+
+  function isRowMatchingExpected(row, expectedIdentity) {
+    if (!row || !expectedIdentity) return true;
+    if (expectedIdentity.hasIdentity !== true) return true;
+
+    const rowPlaceId = normalizeText(row.place_id);
+    if (expectedIdentity.placeId && rowPlaceId) {
+      return expectedIdentity.placeId === rowPlaceId;
+    }
+
+    const rowMapsUrl = normalizeMapsUrl(row.maps_url || window.location.href);
+    const rowSlug = mapsPlaceSlug(rowMapsUrl);
+    const expectedSlug = mapsPlaceSlug(expectedIdentity.href);
+    if (expectedSlug && rowSlug && expectedSlug === rowSlug) {
+      return true;
+    }
+
+    const rowName = normalizeNameForMatch(row.name);
+    if (expectedIdentity.name && rowName) {
+      if (rowName === expectedIdentity.name) return true;
+      if (rowName.includes(expectedIdentity.name) || expectedIdentity.name.includes(rowName)) return true;
+    }
+
+    return false;
+  }
+
+  function extractWebsiteFromDetailPanel() {
+    const linkSelectors = [
+      "a[data-item-id='authority']",
+      "a[data-item-id*='authority']",
+      "a[data-item-id*='website']",
+      "a[aria-label^='Website']",
+      "a[aria-label*='Website:']",
+      "a[aria-label*='website']",
+      "[role='main'] a[href^='http'][aria-label*='Website']",
+      "[role='main'] a[jsaction*='authority'][href]"
+    ];
+
+    for (const selector of linkSelectors) {
+      const nodes = Array.from(document.querySelectorAll(selector));
+      for (const node of nodes) {
+        const href = normalizeBusinessWebsiteUrl((node.getAttribute && node.getAttribute("href")) || node.href || "");
+        if (isValidWebsiteLink(href)) return href;
+
+        const textHit = findWebsiteInText(
+          `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
+        );
+        if (textHit) return textHit;
+      }
+    }
+
+    const textSelectors = [
+      "button[data-item-id='authority']",
+      "button[data-item-id*='authority']",
+      "button[data-item-id*='website']",
+      "button[aria-label^='Website']",
+      "button[aria-label*='Website:']",
+      "[role='main'] [aria-label*='Website']"
+    ];
+
+    for (const selector of textSelectors) {
+      const nodes = Array.from(document.querySelectorAll(selector));
+      for (const node of nodes) {
+        const textHit = findWebsiteInText(
+          `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
+        );
+        if (textHit) return textHit;
+      }
+    }
+
+    // Fallback: parse domain-like text in detail info rows.
+    const detailTextHints = [
+      normalizeText(textFrom("[role='main']")),
+      normalizeText(textFrom("h1.DUwDvf")),
+      normalizeText(textFrom("div[role='main'] div"))
+    ].filter(Boolean);
+
+    for (const hint of detailTextHints) {
+      const textHit = findWebsiteInText(hint);
+      if (textHit) return textHit;
+    }
+
+    return "";
+  }
+
+  function findWebsiteInText(text) {
+    const raw = normalizeText(text);
+    if (!raw) return "";
+
+    const pattern = /(?:https?:\/\/)?(?:www\.)?[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s<>()\[\]{}"']*)?/gi;
+    let match = pattern.exec(raw);
+    while (match) {
+      const matchedText = normalizeText(match[0]);
+      const startIndex = Number(match.index || 0);
+      const prevChar = startIndex > 0 ? raw.charAt(startIndex - 1) : "";
+      if (prevChar === "@") {
+        match = pattern.exec(raw);
+        continue;
+      }
+      const candidate = matchedText.replace(/[),.;]+$/, "");
+      if (!candidate || candidate.includes("@")) {
+        match = pattern.exec(raw);
+        continue;
+      }
+      const normalized = normalizeBusinessWebsiteUrl(candidate);
+      if (isValidWebsiteLink(normalized)) {
+        return normalized;
+      }
+      match = pattern.exec(raw);
+    }
+
+    return "";
+  }
+
+  function isValidWebsiteLink(url) {
+    const normalized = normalizeBusinessWebsiteUrl(url);
+    if (!normalized) return false;
+
+    try {
+      const parsed = new URL(normalized);
+      const host = normalizeText(parsed.hostname).toLowerCase();
+      if (!host) return false;
+      if (host.includes("google.")) return false;
+      return true;
+    } catch (_error) {
+      return false;
+    }
   }
 
   function mergeRows(primary, fallback) {
@@ -459,6 +731,8 @@
 
   function parseCardRating(card, text) {
     const candidates = [
+      attrFromWithin(card, "span.MW4etd", "textContent"),
+      attrFromWithin(card, "span[aria-label*='rating']", "aria-label"),
       attrFromWithin(card, "span[role='img'][aria-label*='star']", "aria-label"),
       attrFromWithin(card, "span[aria-label*='star']", "aria-label"),
       attrFromWithin(card, "span[aria-hidden='true']", "textContent"),
@@ -475,6 +749,8 @@
 
   function parseCardReviewCount(card, text) {
     const candidates = [
+      attrFromWithin(card, "span.UY7F9", "textContent"),
+      attrFromWithin(card, "span[aria-label*='reviews']", "aria-label"),
       attrFromWithin(card, "button[aria-label*='review']", "aria-label"),
       attrFromWithin(card, "span[aria-label*='review']", "aria-label"),
       normalizeText(text)
@@ -495,19 +771,31 @@
     const starPattern = clean.match(/([0-5](?:\.\d)?)\s*(?:stars?|★|⭐)/i);
     if (starPattern && starPattern[1]) {
       const value = Number(starPattern[1]);
-      if (Number.isFinite(value)) return value;
+      if (Number.isFinite(value) && value > 0 && value <= 5) return value;
     }
 
     const ratedPattern = clean.match(/rated\s*([0-5](?:\.\d)?)/i);
     if (ratedPattern && ratedPattern[1]) {
       const value = Number(ratedPattern[1]);
-      if (Number.isFinite(value)) return value;
+      if (Number.isFinite(value) && value > 0 && value <= 5) return value;
     }
 
     const compactPattern = clean.match(/\b([0-5](?:\.\d)?)\s*\(([\d,]+)\)/);
     if (compactPattern && compactPattern[1]) {
       const value = Number(compactPattern[1]);
-      if (Number.isFinite(value)) return value;
+      if (Number.isFinite(value) && value > 0 && value <= 5) return value;
+    }
+
+    const bulletPattern = clean.match(/\b([0-5](?:\.\d)?)\s*[·•]\s*([\d,]+)\b/);
+    if (bulletPattern && bulletPattern[1]) {
+      const value = Number(bulletPattern[1]);
+      if (Number.isFinite(value) && value > 0 && value <= 5) return value;
+    }
+
+    const reviewsContextPattern = clean.match(/\b([0-5](?:\.\d)?)\s+[\d,]+\s+reviews?\b/i);
+    if (reviewsContextPattern && reviewsContextPattern[1]) {
+      const value = Number(reviewsContextPattern[1]);
+      if (Number.isFinite(value) && value > 0 && value <= 5) return value;
     }
 
     return "";
@@ -517,19 +805,62 @@
     const clean = normalizeText(text);
     if (!clean) return "";
 
-    const wordPattern = clean.match(/([\d,]+)\s+reviews?/i);
+    const wordPattern = clean.match(/(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\s+reviews?\b/i);
     if (wordPattern && wordPattern[1]) {
-      const value = Number(wordPattern[1].replace(/,/g, ""));
+      const value = parseAbbreviatedCount(wordPattern[1]);
       if (Number.isFinite(value)) return value;
     }
 
-    const parenPattern = clean.match(/\(([\d,]+)\)/);
+    const parenPattern = clean.match(/\((\d[\d,]*(?:\.\d+)?\s*[kmb]?)\)/i);
     if (parenPattern && parenPattern[1]) {
-      const value = Number(parenPattern[1].replace(/,/g, ""));
+      const value = parseAbbreviatedCount(parenPattern[1]);
       if (Number.isFinite(value)) return value;
+    }
+
+    const bulletPattern = clean.match(/\b([0-5](?:\.\d)?)\s*[·•]\s*(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\b/i);
+    if (bulletPattern && bulletPattern[2]) {
+      const value = parseAbbreviatedCount(bulletPattern[2]);
+      if (Number.isFinite(value)) return value;
+    }
+
+    const compactPattern = clean.match(/\b([0-5](?:\.\d)?)\s*\((\d[\d,]*(?:\.\d+)?\s*[kmb]?)\)/i);
+    if (compactPattern && compactPattern[2]) {
+      const value = parseAbbreviatedCount(compactPattern[2]);
+      if (Number.isFinite(value)) return value;
+    }
+
+    const standalonePattern = clean.match(/\b(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\b/i);
+    if (standalonePattern && standalonePattern[1]) {
+      const value = parseAbbreviatedCount(standalonePattern[1]);
+      if (!Number.isFinite(value)) return "";
+      const hasMagnitudeSignal = /[kmb]/i.test(standalonePattern[1]) || /,/.test(standalonePattern[1]);
+      if (hasMagnitudeSignal || value >= 10) return value;
     }
 
     return "";
+  }
+
+  function parseAbbreviatedCount(value) {
+    const raw = normalizeText(value).toLowerCase().replace(/\s+/g, "");
+    if (!raw) return "";
+    const match = raw.match(/^(\d[\d,]*)(?:\.(\d+))?([kmb])?$/i);
+    if (!match) return "";
+
+    const whole = Number((match[1] || "").replace(/,/g, ""));
+    if (!Number.isFinite(whole)) return "";
+    const fractionText = match[2] || "";
+    const suffix = (match[3] || "").toLowerCase();
+    if (!suffix && fractionText) return "";
+
+    if (!suffix) return whole;
+
+    const fraction = fractionText ? Number(`0.${fractionText}`) : 0;
+    if (!Number.isFinite(fraction)) return "";
+
+    const base = whole + fraction;
+    const multiplier = suffix === "k" ? 1000 : suffix === "m" ? 1000000 : suffix === "b" ? 1000000000 : 1;
+    const scaled = Math.round(base * multiplier);
+    return Number.isFinite(scaled) ? scaled : "";
   }
 
   function attrFromWithin(root, selector, attrName) {
@@ -600,15 +931,64 @@
     node.click();
   }
 
-  async function waitForDetails(timeoutMs) {
+  async function waitForDetails(expectedIdentity, timeoutMs) {
     const timeoutAt = Date.now() + timeoutMs;
     while (Date.now() < timeoutAt) {
       const hasName = Boolean(document.querySelector("h1.DUwDvf") || document.querySelector("[role='main'] h1"));
-      if (hasName) {
-        return;
+      if (hasName && isDetailPanelMatch(expectedIdentity)) {
+        return true;
       }
       await sleep(120);
     }
+    return false;
+  }
+
+  function isDetailPanelMatch(expectedIdentity) {
+    if (!expectedIdentity || expectedIdentity.hasIdentity !== true) {
+      return true;
+    }
+
+    const detailUrl = normalizeMapsUrl(window.location.href);
+    const detailPlaceId = normalizeText(parsePlaceIdFromUrl(detailUrl));
+    if (expectedIdentity.placeId && detailPlaceId) {
+      return expectedIdentity.placeId === detailPlaceId;
+    }
+
+    const detailSlug = mapsPlaceSlug(detailUrl);
+    const expectedSlug = mapsPlaceSlug(expectedIdentity.href);
+    if (expectedSlug && detailSlug && expectedSlug === detailSlug) {
+      return true;
+    }
+
+    const detailName = normalizeNameForMatch(
+      textFrom("h1.DUwDvf") || textFrom("[role='main'] h1") || ""
+    );
+    if (expectedIdentity.name && detailName) {
+      if (detailName === expectedIdentity.name) return true;
+      if (detailName.includes(expectedIdentity.name) || expectedIdentity.name.includes(detailName)) return true;
+    }
+
+    return false;
+  }
+
+  function mapsPlaceSlug(url) {
+    const value = normalizeMapsUrl(url);
+    if (!value) return "";
+    const match = value.match(/\/maps\/place\/([^/@?]+)/i);
+    if (!match || !match[1]) return "";
+    try {
+      return decodeURIComponent(match[1]).toLowerCase();
+    } catch (_error) {
+      return normalizeText(match[1]).toLowerCase();
+    }
+  }
+
+  function normalizeNameForMatch(value) {
+    return normalizeText(value)
+      .toLowerCase()
+      .replace(/[^a-z0-9'& -]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   function textFrom(selector) {
@@ -710,6 +1090,27 @@
     chrome.storage.local.set(payload, () => {});
   }
 
+  function getScrapeRuntimeState() {
+    const perf = getPerformanceStats();
+    return {
+      is_running: state.isRunning,
+      stop_requested: state.stopRequested,
+      run_id: state.runId,
+      tab_id: Number.isFinite(Number(state.runTabId)) ? Number(state.runTabId) : null,
+      status: state.isRunning ? (state.stopRequested ? "stopping" : "running") : "idle",
+      processed: state.processed,
+      matched: state.matched,
+      duplicates: state.duplicates,
+      fast_skipped: state.fastSkipped,
+      errors: state.errors,
+      rows_count: state.rows.length,
+      source_query: state.sourceQuery,
+      source_url: state.sourceUrl,
+      infinite_scroll: state.runInfiniteScroll,
+      ...perf
+    };
+  }
+
   function resetState() {
     state.stopRequested = false;
     state.runId = "";
@@ -756,18 +1157,62 @@
     });
   }
 
+  function normalizeSeenRating(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0 || num > 5) return "";
+    return num;
+  }
+
+  function normalizeSeenReviews(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0) return "";
+    return num;
+  }
+
   function updateSeenStats(quickData) {
-    if (!quickData || !quickData.text) return;
+    const captured = {
+      rating: false,
+      reviews: false
+    };
+    if (!quickData || !quickData.text) return captured;
+
     state.seenListings += 1;
 
-    if (quickData.rating !== "") {
-      state.seenRatingSum += quickData.rating;
+    const rating = normalizeSeenRating(quickData.rating);
+    if (rating !== "") {
+      state.seenRatingSum += rating;
       state.seenRatingCount += 1;
+      captured.rating = true;
     }
 
-    if (quickData.reviews !== "") {
-      state.seenReviewsSum += quickData.reviews;
+    const reviews = normalizeSeenReviews(quickData.reviews);
+    if (reviews !== "") {
+      state.seenReviewsSum += reviews;
       state.seenReviewsCount += 1;
+      captured.reviews = true;
+    }
+
+    return captured;
+  }
+
+  function backfillSeenStatsFromRow(row, captured) {
+    if (!row || typeof row !== "object") return;
+    const seen = captured || {};
+
+    if (!seen.rating) {
+      const rating = normalizeSeenRating(row.rating);
+      if (rating !== "") {
+        state.seenRatingSum += rating;
+        state.seenRatingCount += 1;
+      }
+    }
+
+    if (!seen.reviews) {
+      const reviews = normalizeSeenReviews(row.review_count);
+      if (reviews !== "") {
+        state.seenReviewsSum += reviews;
+        state.seenReviewsCount += 1;
+      }
     }
   }
 

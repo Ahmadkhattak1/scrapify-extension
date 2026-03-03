@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GBP Scrape Results</title>
+    <link rel="stylesheet" href="results.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="top">
+        <div>
+          <h1>Scrape Results</h1>
+          <p id="metaText" class="meta">Waiting for data...</p>
+        </div>
+        <div class="actions">
+          <button id="refreshBtn" type="button">Refresh</button>
+          <button id="exportBtn" type="button" class="primary" disabled>Export CSV</button>
+        </div>
+      </header>
+
+      <section class="panel">
+        <div class="summary">
+          <span id="statusChip" class="status-chip idle">Idle</span>
+          <span id="rowsCount">0 rows</span>
+          <span id="colsCount">0 columns</span>
+          <span id="renderHint"></span>
+        </div>
+
+        <p id="emptyState" class="empty">No rows yet. Run a scrape first.</p>
+
+        <div id="tableWrap" class="table-wrap hidden">
+          <table id="resultsTable">
+            <thead id="tableHead"></thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <p id="errorText" class="error"></p>
+    </main>
+
+    <script src="shared.js"></script>
+    <script src="results.js"></script>
+  </body>
+</html>
