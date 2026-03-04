@@ -19,6 +19,11 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
   - skips common blog/news/article paths to avoid low-value crawl pages
   - scans public pages for owner/founder/president/CEO-style names and emails
   - tracks discovered social links and can scan Facebook pages for fallback email when website email is missing
+  - optional external lead discovery mode:
+    - trigger: when website is missing or website scan returns no email
+    - order: Website -> Google Search
+    - discovery uses Google Search only and evaluates the top 3 results per query
+    - budget defaults: Google (2 queries/3 results)
   - optional visible-tab mode opens scan tabs without stealing focus from your active tab
   - skips blocked/unavailable websites and keeps core GBP data
 - Persistent run/session snapshots in `chrome.storage.local` so progress/results survive popup close/reopen
@@ -30,6 +35,7 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 - Fast pre-filtering from list cards for rating/review/name/category constraints to avoid opening every listing
 - Live run analytics in popup: processing speed (entries/sec), seen listings, avg rating, avg reviews
 - Live enrichment analytics: pages visited, pages discovered, social pages scanned
+- Email KPI stats: total emails found and discovery-recovered emails
 - Column picker to choose which fields are included in CSV export
 - Popup remembers user settings (filters, max rows, toggles, and export columns) across reopen/reload
 - Deduplication by `place_id` (fallback to normalized Maps URL) with duplicate counter in run status
@@ -61,6 +67,8 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
    - set **Website pages per site** (crawl depth)
    - optional: enable **Show tabs while enriching**
    - optional: enable **Hunt email on social links**
+   - optional: enable **Enable external lead discovery**
+   - optional: toggle **Google Search (top 3 results)**
    - enrichment auto-starts after scrape completion when enabled
 8. Click **Export CSV** after completion (or after stop).
 
@@ -68,6 +76,8 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 - English UI-first selector strategy; non-English UI may partially work.
 - Google Maps DOM changes can break selectors and require updates.
 - Website enrichment is best-effort and limited to publicly visible data.
+- External discovery may increase runtime due extra Google lookups.
+- Existing Maps website is preserved when present; alternate discovery domains are stored in discovery metadata fields.
 - Some websites block automation (CAPTCHA/anti-bot); blocked scans are marked and skipped.
 - One active query per run.
 

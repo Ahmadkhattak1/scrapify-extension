@@ -42,21 +42,6 @@
           </label>
         </div>
 
-        <label>
-          Name keyword
-          <input id="nameKeyword" type="text" placeholder="e.g. dentist" />
-        </label>
-
-        <label>
-          Category include
-          <input id="categoryInclude" type="text" placeholder="e.g. restaurant" />
-        </label>
-
-        <label>
-          Category exclude
-          <input id="categoryExclude" type="text" placeholder="e.g. hotel" />
-        </label>
-
         <div class="row toggles">
           <label class="checkbox">
             <input id="hasWebsite" type="checkbox" />
@@ -70,43 +55,49 @@
 
         <label class="checkbox">
           <input id="enableEnrichment" type="checkbox" />
-          Enrich websites (owner/email, best effort)
+          Enrich websites
         </label>
         <label>
-          Website pages per site
-          <input id="siteMaxPages" type="number" min="1" max="120" step="1" value="40" />
+          Website pages per site (focused crawl)
+          <input id="siteMaxPages" type="number" min="1" max="120" step="1" value="12" />
         </label>
         <label>
-          Unified email preference
+          Best email priority
           <select id="emailPreference">
             <option value="owner">Owner first (recommended)</option>
-            <option value="primary">Primary first</option>
-            <option value="contact">Company/contact first</option>
+            <option value="primary">Best auto first</option>
+            <option value="contact">Company first</option>
           </select>
         </label>
         <label>
-          Email output mode
+          <span class="label-with-info">
+            Email columns
+            <span class="info-dot" title="Controls how many email columns are exported."></span>
+          </span>
           <select id="emailOutputMode">
-            <option value="unified_only">Unified only (recommended)</option>
-            <option value="unified_plus_raw">Unified + raw fields</option>
-            <option value="raw_only">Raw fields only</option>
+            <option value="unified_only">Only best email (recommended)</option>
+            <option value="unified_plus_raw">Best email + owner/company</option>
+            <option value="raw_only">Owner/company only</option>
           </select>
         </label>
         <p id="emailPreferenceHint" class="hint-text"></p>
         <p id="emailColumnsHint" class="hint-text"></p>
         <label>
-          Unified phone preference
+          Best phone priority
           <select id="phonePreference">
             <option value="listing">Listing first (recommended)</option>
             <option value="website">Website first</option>
           </select>
         </label>
         <label>
-          Phone output mode
+          <span class="label-with-info">
+            Phone columns
+            <span class="info-dot" title="Controls how many phone columns are exported."></span>
+          </span>
           <select id="phoneOutputMode">
-            <option value="unified_only">Unified only (recommended)</option>
-            <option value="unified_plus_raw">Unified + raw fields</option>
-            <option value="raw_only">Raw fields only</option>
+            <option value="unified_only">Only best phone (recommended)</option>
+            <option value="unified_plus_raw">Best phone + detailed fields</option>
+            <option value="raw_only">Detailed fields only</option>
           </select>
         </label>
         <p id="phonePreferenceHint" class="hint-text"></p>
@@ -121,11 +112,20 @@
             Hunt email on Facebook links
           </label>
         </div>
+        <label class="checkbox">
+          <input id="leadDiscoveryEnabled" type="checkbox" />
+          Enable Google Search lead discovery
+        </label>
+        <label class="checkbox">
+          <input id="discoveryGoogleEnabled" type="checkbox" checked />
+          Google Search (top 3 results)
+        </label>
 
         <section class="columns-block">
           <div class="columns-head">
             <strong id="columnsTitle">Export columns</strong>
             <div class="columns-actions">
+              <button id="toggleAdvancedBtn" type="button" class="chip-btn">Advanced Off</button>
               <button id="columnsAllBtn" type="button" class="chip-btn">All</button>
               <button id="columnsNoneBtn" type="button" class="chip-btn">None</button>
             </div>
@@ -157,6 +157,10 @@
           <div><span>Site Pages Visited</span><strong id="crawlVisitedStat">0</strong></div>
           <div><span>Site Pages Found</span><strong id="crawlDiscoveredStat">0</strong></div>
           <div><span>Social Pages Scanned</span><strong id="socialScannedStat">0</strong></div>
+        </div>
+        <div class="metrics-grid metrics-grid-kpi">
+          <div><span>Emails Found</span><strong id="emailsFoundStat">0</strong></div>
+          <div><span>Discovery Emails</span><strong id="discoveryEmailsFoundStat">0</strong></div>
         </div>
         <p id="stateText">Idle</p>
         <p id="leadSignalText" class="lead-signal"></p>

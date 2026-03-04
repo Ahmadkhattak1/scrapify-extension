@@ -49,6 +49,10 @@
     "site_pages_discovered",
     "social_pages_scanned",
     "social_links",
+    "discovery_status",
+    "discovery_source",
+    "discovery_query",
+    "discovered_website",
     "hours",
     "maps_url",
     "source_query",
@@ -71,20 +75,24 @@
     email: "Email",
     owner_name: "Owner Name",
     owner_title: "Owner Title",
-    owner_email: "Owner Email (Personal)",
-    contact_email: "Contact Email (Company)",
-    primary_email: "Primary Email (Auto)",
-    primary_email_type: "Primary Email Type",
-    primary_email_source: "Primary Email Source",
-    owner_confidence: "Owner Confidence",
-    email_confidence: "Email Confidence",
+    owner_email: "Owner Email",
+    contact_email: "Company Email",
+    primary_email: "Best Email (Auto)",
+    primary_email_type: "Best Email Type",
+    primary_email_source: "Best Email Source",
+    owner_confidence: "Owner Match Score",
+    email_confidence: "Email Match Score",
     email_source_url: "Email Source URL",
     no_email_reason: "No Email Reason",
-    website_scan_status: "Website Scan Status",
+    website_scan_status: "Website Scan Result",
     site_pages_visited: "Site Pages Visited",
     site_pages_discovered: "Site Pages Discovered",
     social_pages_scanned: "Social Pages Scanned",
     social_links: "Social Links",
+    discovery_status: "Discovery Status",
+    discovery_source: "Discovery Source",
+    discovery_query: "Discovery Query",
+    discovered_website: "Discovered Website",
     hours: "Hours",
     maps_url: "Maps URL",
     source_query: "Source Query",
@@ -101,13 +109,110 @@
       .trim();
   }
 
+  function isLikelyPhoneDigits(digits) {
+    const compact = normalizeText(digits).replace(/\D/g, "");
+    return compact.length >= 10 && compact.length <= 15;
+  }
+
+  function formatNorthAmericaPhone(digits) {
+    const compact = normalizeText(digits).replace(/\D/g, "");
+    if (compact.length === 10) {
+      return `(${compact.slice(0, 3)}) ${compact.slice(3, 6)}-${compact.slice(6)}`;
+    }
+    if (compact.length === 11 && compact.startsWith("1")) {
+      return `(${compact.slice(1, 4)}) ${compact.slice(4, 7)}-${compact.slice(7)}`;
+    }
+    return "";
+  }
+
+  function normalizePhoneText(value) {
+    const raw = normalizeText(value);
+    if (!raw) return "";
+
+    const withoutExtension = raw.replace(/\b(?:ext\.?|extension|x)\s*[:.]?\s*\d{1,6}\b/gi, " ");
+    const candidates = withoutExtension.match(/\+?\s*\(?\d[\d().\s-]{7,}\d/g) || [];
+
+    let selectedDigits = "";
+    let selectedHasPlus = false;
+    let bestScore = -1;
+
+    const tryCandidate = (candidate) => {
+      const cleaned = normalizeText(candidate).replace(/[^\d+().\s-]/g, " ");
+      const digits = cleaned.replace(/\D/g, "");
+      if (!isLikelyPhoneDigits(digits)) return;
+
+      const hasPlus = /^\s*\+/.test(cleaned);
+      let score = digits.length;
+      if (digits.length === 10 && !hasPlus) score += 30;
+      if (digits.length === 11 && digits.startsWith("1")) score += 28;
+      if (hasPlus) score += 6;
+      if (/[()]/.test(cleaned)) score += 2;
+
+      if (score > bestScore) {
+        bestScore = score;
+        selectedDigits = digits;
+        selectedHasPlus = hasPlus;
+      }
+    };
+
+    if (candidates.length > 0) {
+      for (const candidate of candidates) {
+        tryCandidate(candidate);
+      }
+    } else {
+      tryCandidate(withoutExtension);
+    }
+
+    if (!selectedDigits) return "";
+
+    const naFormatted = formatNorthAmericaPhone(selectedDigits);
+    if (naFormatted) {
+      if (selectedDigits.length === 10 && selectedHasPlus) {
+        return `+${selectedDigits}`;
+      }
+      return naFormatted;
+    }
+
+    if (selectedHasPlus || selectedDigits.length > 10) {
+      return `+${selectedDigits}`;
+    }
+
+    return selectedDigits;
+  }
+
   function parseRating(value) {
     if (value == null) return "";
-    const text = normalizeText(value).replace(",", ".");
-    const match = text.match(/\d+(?:\.\d+)?/);
-    if (!match) return "";
-    const parsed = Number.parseFloat(match[0]);
-    return Number.isFinite(parsed) ? parsed : "";
+    const clean = normalizeText(value).replace(/,/g, ".");
+    if (!clean) return "";
+
+    const ratingPatterns = [
+      /\b([0-5](?:\.\d)?)\s*(?:stars?|★|⭐)\b/i,
+      /\brated\s*([0-5](?:\.\d)?)/i,
+      /\b([0-5](?:\.\d)?)\s*out of\s*5\b/i,
+      /\b([0-5](?:\.\d)?)\s*\/\s*5\b/i,
+      /\b([0-5](?:\.\d)?)\s*[·•]\s*\d[\d,.\s]*[kmb]?\b/i,
+      /\b([0-5](?:\.\d)?)\s*\(\s*\d[\d,.\s]*[kmb]?\s*\)/i,
+      /\b([0-5](?:\.\d)?)\s+\d[\d,.\s]*[kmb]?\s+reviews?\b/i
+    ];
+
+    for (const pattern of ratingPatterns) {
+      const match = clean.match(pattern);
+      if (!match || !match[1]) continue;
+      const parsed = Number(match[1]);
+      if (Number.isFinite(parsed) && parsed > 0 && parsed <= 5) {
+        return parsed;
+      }
+    }
+
+    const strictStandalonePattern = clean.match(/^\s*([0-5](?:\.\d)?)\s*$/);
+    if (strictStandalonePattern && strictStandalonePattern[1]) {
+      const parsed = Number(strictStandalonePattern[1]);
+      if (Number.isFinite(parsed) && parsed > 0 && parsed <= 5) {
+        return parsed;
+      }
+    }
+
+    return "";
   }
 
   function parseReviewCount(value) {
@@ -115,27 +220,34 @@
     const text = normalizeText(value);
     if (!text) return "";
 
-    const reviewWord = text.match(/(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\s+reviews?\b/i);
+    const reviewWord = text.match(/(\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\s+reviews?\b/i);
     if (reviewWord && reviewWord[1]) {
       const parsed = parseAbbreviatedCount(reviewWord[1]);
       if (Number.isFinite(parsed)) return parsed;
     }
 
-    const parenPattern = text.match(/\((\d[\d,]*(?:\.\d+)?\s*[kmb]?)\)/i);
-    if (parenPattern && parenPattern[1]) {
-      const parsed = parseAbbreviatedCount(parenPattern[1]);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-
-    const bulletPattern = text.match(/\b([0-5](?:\.\d)?)\s*[·•]\s*(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\b/i);
+    const bulletPattern = text.match(/\b([0-5](?:\.\d)?)\s*[·•]\s*(\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\b/i);
     if (bulletPattern && bulletPattern[2]) {
       const parsed = parseAbbreviatedCount(bulletPattern[2]);
       if (Number.isFinite(parsed)) return parsed;
     }
 
-    const fallbackPattern = text.match(/\b(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\b/i);
-    if (fallbackPattern && fallbackPattern[1]) {
-      const parsed = parseAbbreviatedCount(fallbackPattern[1]);
+    const compactPattern = text.match(/\b([0-5](?:\.\d)?)\s*\((\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\)/i);
+    if (compactPattern && compactPattern[2]) {
+      const parsed = parseAbbreviatedCount(compactPattern[2]);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+
+    // Only allow standalone numeric parsing when the whole candidate is numeric-ish.
+    const strictStandalonePattern = text.match(/^\(?\s*(\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\s*\)?$/i);
+    if (strictStandalonePattern && strictStandalonePattern[1]) {
+      const rawStandalone = normalizeText(strictStandalonePattern[1]);
+      const standaloneDigits = rawStandalone.replace(/\D/g, "");
+      const standaloneHasSuffix = /[kmb]$/i.test(rawStandalone);
+      if (!standaloneHasSuffix && standaloneDigits.length > 7) {
+        return "";
+      }
+      const parsed = parseAbbreviatedCount(strictStandalonePattern[1]);
       if (Number.isFinite(parsed)) return parsed;
     }
 
@@ -145,18 +257,79 @@
   function parseAbbreviatedCount(value) {
     const raw = normalizeText(value).toLowerCase().replace(/\s+/g, "");
     if (!raw) return "";
-    const match = raw.match(/^(\d[\d,]*)(?:\.(\d+))?([kmb])?$/i);
-    if (!match) return "";
 
-    const whole = Number((match[1] || "").replace(/,/g, ""));
-    if (!Number.isFinite(whole)) return "";
-    const fraction = match[2] ? Number(`0.${match[2]}`) : 0;
-    if (!Number.isFinite(fraction)) return "";
-    const suffix = (match[3] || "").toLowerCase();
-    if (!suffix && match[2]) return "";
+    const suffixMatch = raw.match(/([kmb])$/i);
+    const suffix = suffixMatch ? suffixMatch[1].toLowerCase() : "";
+    const numeric = suffix ? raw.slice(0, -1) : raw;
+    if (!numeric || !/^\d[\d.,'’]*$/.test(numeric)) return "";
+    if (!suffix && /^\d+$/.test(numeric) && numeric.length > 7) return "";
+
+    let normalized = "";
+    const groupedThousandsPattern = /^\d{1,3}(?:[.,'’]\d{3})+$/;
+
+    if (groupedThousandsPattern.test(numeric)) {
+      normalized = numeric.replace(/[.,'’]/g, "");
+    } else if (suffix && numeric.includes(".") && numeric.includes(",")) {
+      const commaIndex = numeric.lastIndexOf(",");
+      const dotIndex = numeric.lastIndexOf(".");
+      const compact = numeric.replace(/['’]/g, "");
+      normalized = commaIndex > dotIndex
+        ? compact.replace(/\./g, "").replace(",", ".")
+        : compact.replace(/,/g, "");
+    } else if (suffix && /^\d+[.,]\d+$/.test(numeric)) {
+      normalized = numeric.replace(/['’]/g, "").replace(",", ".");
+    } else if (/^\d+$/.test(numeric)) {
+      normalized = numeric;
+    } else {
+      return "";
+    }
+
+    if (!suffix && /^\d+$/.test(normalized) && normalized.length > 7) {
+      return "";
+    }
+
+    const base = Number(normalized);
+    if (!Number.isFinite(base)) return "";
+
+    if (!suffix) {
+      return Math.round(base);
+    }
+
     const multiplier = suffix === "k" ? 1000 : suffix === "m" ? 1000000 : suffix === "b" ? 1000000000 : 1;
-    const scaled = Math.round((whole + fraction) * multiplier);
+    const scaled = Math.round(base * multiplier);
     return Number.isFinite(scaled) ? scaled : "";
+  }
+
+  function parseFlexibleNumber(value) {
+    if (value === "" || value == null) return "";
+    if (typeof value === "number") return Number.isFinite(value) ? value : "";
+
+    const raw = normalizeText(value).replace(/\s+/g, "");
+    if (!raw) return "";
+
+    let normalized = raw;
+    const hasComma = normalized.includes(",");
+    const hasDot = normalized.includes(".");
+
+    if (hasComma && hasDot) {
+      const decimalIsComma = normalized.lastIndexOf(",") > normalized.lastIndexOf(".");
+      normalized = decimalIsComma
+        ? normalized.replace(/\./g, "").replace(",", ".")
+        : normalized.replace(/,/g, "");
+    } else if (hasComma) {
+      if (/^\d{1,3}(?:,\d{3})+$/.test(normalized)) {
+        normalized = normalized.replace(/,/g, "");
+      } else if (/^\d+,\d+$/.test(normalized)) {
+        normalized = normalized.replace(",", ".");
+      } else {
+        normalized = normalized.replace(/,/g, "");
+      }
+    } else if (hasDot && /^\d{1,3}(?:\.\d{3})+$/.test(normalized)) {
+      normalized = normalized.replace(/\./g, "");
+    }
+
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : "";
   }
 
   function normalizeMapsUrl(url) {
@@ -378,28 +551,32 @@
 
   function applyFilters(row, filters) {
     const f = filters || {};
+    const ratingValue = parseRating(row && row.rating);
+    const rating = ratingValue === "" ? Number.NaN : Number(ratingValue);
+    const reviewValue = parseReviewCount(row && row.review_count);
+    const reviews = reviewValue === "" ? Number.NaN : Number(reviewValue);
 
     if (f.minRating !== "" && f.minRating != null) {
-      const minRating = Number(f.minRating);
-      const rating = Number(row.rating);
+      const minRating = parseFlexibleNumber(f.minRating);
+      if (minRating === "") return false;
       if (!Number.isFinite(rating) || rating < minRating) return false;
     }
 
     if (f.maxRating !== "" && f.maxRating != null) {
-      const maxRating = Number(f.maxRating);
-      const rating = Number(row.rating);
+      const maxRating = parseFlexibleNumber(f.maxRating);
+      if (maxRating === "") return false;
       if (!Number.isFinite(rating) || rating > maxRating) return false;
     }
 
     if (f.minReviews !== "" && f.minReviews != null) {
-      const minReviews = Number(f.minReviews);
-      const reviews = Number(row.review_count);
+      const minReviews = parseFlexibleNumber(f.minReviews);
+      if (minReviews === "") return false;
       if (!Number.isFinite(reviews) || reviews < minReviews) return false;
     }
 
     if (f.maxReviews !== "" && f.maxReviews != null) {
-      const maxReviews = Number(f.maxReviews);
-      const reviews = Number(row.review_count);
+      const maxReviews = parseFlexibleNumber(f.maxReviews);
+      if (maxReviews === "") return false;
       if (!Number.isFinite(reviews) || reviews > maxReviews) return false;
     }
 
@@ -466,9 +643,7 @@
   }
 
   function toNumberOrEmpty(value) {
-    if (value === "" || value == null) return "";
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : "";
+    return parseFlexibleNumber(value);
   }
 
   function readFilterConfig(formValues) {
@@ -492,6 +667,8 @@
     CSV_COLUMNS,
     COLUMN_LABELS,
     normalizeText,
+    normalizePhoneText,
+    parseFlexibleNumber,
     parseRating,
     parseReviewCount,
     normalizeMapsUrl,

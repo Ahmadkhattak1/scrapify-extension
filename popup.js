@@ -1,50 +1,87 @@
 (function () {
   const shared = window.GbpShared;
-  const { MSG, DEFAULT_MAX_ROWS, CSV_COLUMNS, COLUMN_LABELS, readFilterConfig, normalizeText, sanitizeColumns } = shared;
+  const { MSG, DEFAULT_MAX_ROWS, CSV_COLUMNS, COLUMN_LABELS, readFilterConfig, applyFilters, normalizeText, normalizePhoneText, sanitizeColumns } = shared;
   const SCRAPE_SESSION_KEY = "scrapeSession";
   const ENRICH_SESSION_KEY = "enrichSession";
   const POPUP_UI_SETTINGS_KEY = "popupUiSettings";
-  const EMAIL_COLUMNS = ["email", "owner_email", "contact_email", "primary_email", "primary_email_type", "primary_email_source"];
-  const RAW_EMAIL_COLUMNS = ["owner_email", "contact_email", "primary_email", "primary_email_type", "primary_email_source"];
+  const ACTIVE_SCRAPE_FILTERS_KEY = "activeScrapeFilters";
+  const EMAIL_COLUMNS = ["email", "owner_name", "owner_title", "owner_email", "contact_email"];
+  const RAW_EMAIL_COLUMNS = ["owner_name", "owner_title", "owner_email", "contact_email"];
   const PHONE_COLUMNS = ["phone", "listing_phone", "website_phone", "website_phone_source"];
   const RAW_PHONE_COLUMNS = ["listing_phone", "website_phone", "website_phone_source"];
+  const ADVANCED_COLUMNS = new Set([
+    "place_id",
+    "hours",
+    "source_query",
+    "source_url",
+    "scraped_at",
+    "primary_email",
+    "primary_email_type",
+    "primary_email_source",
+    "owner_confidence",
+    "email_confidence",
+    "email_source_url",
+    "no_email_reason",
+    "website_scan_status",
+    "site_pages_visited",
+    "site_pages_discovered",
+    "social_pages_scanned",
+    "social_links",
+    "discovery_status",
+    "discovery_source",
+    "discovery_query",
+    "discovered_website"
+  ]);
+  const DEFAULT_SELECTED_COLUMNS = [
+    "name",
+    "rating",
+    "review_count",
+    "category",
+    "address",
+    "website",
+    "maps_url",
+    "phone",
+    "listing_phone",
+    "website_phone",
+    "website_phone_source",
+    "email",
+    "owner_name",
+    "owner_title",
+    "owner_email",
+    "contact_email"
+  ];
   const COLUMN_GROUPS = [
     {
       id: "core",
       title: "Core Listing Data",
-      description: "Google Maps listing fields",
-      columns: ["place_id", "name", "rating", "review_count", "category", "address", "website", "hours", "maps_url", "source_query", "source_url", "scraped_at"]
+      description: "Main listing fields",
+      columns: ["name", "rating", "review_count", "category", "address", "website", "maps_url"]
     },
     {
       id: "phone",
       title: "Phone Output",
-      description: "Unified phone + raw phone fields",
+      description: "Best phone + detail fields",
       columns: ["phone", "listing_phone", "website_phone", "website_phone_source"]
     },
     {
       id: "email",
       title: "Email Output",
-      description: "Unified automation email + raw email fields",
-      columns: [
-        "email",
-        "owner_name",
-        "owner_title",
-        "owner_email",
-        "contact_email",
-        "primary_email",
-        "primary_email_type",
-        "primary_email_source",
-        "owner_confidence",
-        "email_confidence",
-        "email_source_url",
-        "no_email_reason"
-      ]
+      description: "Best email + owner/company fields",
+      columns: ["email", "owner_name", "owner_title", "owner_email", "contact_email"]
     },
     {
       id: "crawl",
       title: "Enrichment Crawl Meta",
       description: "Website and social scan diagnostics",
-      columns: ["website_scan_status", "site_pages_visited", "site_pages_discovered", "social_pages_scanned", "social_links"]
+      columns: ["website_scan_status", "site_pages_visited", "site_pages_discovered", "social_pages_scanned", "social_links"],
+      advanced: true
+    },
+    {
+      id: "discovery",
+      title: "Discovery Meta",
+      description: "External lead discovery diagnostics",
+      columns: ["discovery_status", "discovery_source", "discovery_query", "discovered_website"],
+      advanced: true
     }
   ];
   const COLUMN_BADGES = {
@@ -66,7 +103,11 @@
     site_pages_visited: { text: "Meta", tone: "meta" },
     site_pages_discovered: { text: "Meta", tone: "meta" },
     social_pages_scanned: { text: "Meta", tone: "meta" },
-    social_links: { text: "Meta", tone: "meta" }
+    social_links: { text: "Meta", tone: "meta" },
+    discovery_status: { text: "Meta", tone: "meta" },
+    discovery_source: { text: "Meta", tone: "meta" },
+    discovery_query: { text: "Meta", tone: "meta" },
+    discovered_website: { text: "Meta", tone: "meta" }
   };
 
   const el = {
@@ -84,17 +125,17 @@
     phoneColumnsHint: document.getElementById("phoneColumnsHint"),
     showEnrichmentTabs: document.getElementById("showEnrichmentTabs"),
     scanSocialLinks: document.getElementById("scanSocialLinks"),
+    leadDiscoveryEnabled: document.getElementById("leadDiscoveryEnabled"),
+    discoveryGoogleEnabled: document.getElementById("discoveryGoogleEnabled"),
     minRating: document.getElementById("minRating"),
     maxRating: document.getElementById("maxRating"),
     minReviews: document.getElementById("minReviews"),
     maxReviews: document.getElementById("maxReviews"),
-    nameKeyword: document.getElementById("nameKeyword"),
-    categoryInclude: document.getElementById("categoryInclude"),
-    categoryExclude: document.getElementById("categoryExclude"),
     hasWebsite: document.getElementById("hasWebsite"),
     hasPhone: document.getElementById("hasPhone"),
     columnList: document.getElementById("columnList"),
     columnsTitle: document.getElementById("columnsTitle"),
+    toggleAdvancedBtn: document.getElementById("toggleAdvancedBtn"),
     columnsAllBtn: document.getElementById("columnsAllBtn"),
     columnsNoneBtn: document.getElementById("columnsNoneBtn"),
     startBtn: document.getElementById("startBtn"),
@@ -111,6 +152,8 @@
     crawlVisitedStat: document.getElementById("crawlVisitedStat"),
     crawlDiscoveredStat: document.getElementById("crawlDiscoveredStat"),
     socialScannedStat: document.getElementById("socialScannedStat"),
+    emailsFoundStat: document.getElementById("emailsFoundStat"),
+    discoveryEmailsFoundStat: document.getElementById("discoveryEmailsFoundStat"),
     stateText: document.getElementById("stateText"),
     leadSignalText: document.getElementById("leadSignalText"),
     errorText: document.getElementById("errorText")
@@ -121,18 +164,21 @@
   let enrichRunning = false;
   let lastScrapeSession = null;
   let lastEnrichSession = null;
-  let selectedColumns = [...CSV_COLUMNS];
+  let selectedColumns = normalizeSelectedColumns(DEFAULT_SELECTED_COLUMNS);
+  let showAdvancedFields = false;
   let infiniteScrollEnabled = false;
   let runInfiniteCurrent = false;
   let maxRowsValue = DEFAULT_MAX_ROWS;
   let enrichmentEnabled = false;
-  let siteMaxPagesValue = 40;
+  let siteMaxPagesValue = 12;
   let emailPreferenceValue = "owner";
   let emailOutputModeValue = "unified_only";
   let phonePreferenceValue = "listing";
   let phoneOutputModeValue = "unified_only";
   let showEnrichmentTabsEnabled = false;
   let scanSocialLinksEnabled = true;
+  let leadDiscoveryEnabled = false;
+  let discoveryGoogleEnabled = true;
   let scrapeRunTabId = null;
   let uiSettingsSaveTimer = null;
 
@@ -155,7 +201,11 @@
     el.phoneOutputMode.value = phoneOutputModeValue;
     el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
     el.scanSocialLinks.checked = scanSocialLinksEnabled;
+    el.leadDiscoveryEnabled.checked = leadDiscoveryEnabled;
+    el.discoveryGoogleEnabled.checked = discoveryGoogleEnabled;
     syncOutputModesFromSelectedColumns();
+    syncLeadDiscoveryInputs();
+    updateAdvancedToggleLabel();
 
     syncInfiniteScrollInput();
     updateEmailPreferenceHint();
@@ -183,6 +233,9 @@
     el.phoneOutputMode.addEventListener("change", onPhoneOutputModeChange);
     el.showEnrichmentTabs.addEventListener("change", onShowEnrichmentTabsToggle);
     el.scanSocialLinks.addEventListener("change", onScanSocialLinksToggle);
+    el.leadDiscoveryEnabled.addEventListener("change", onLeadDiscoveryToggle);
+    el.discoveryGoogleEnabled.addEventListener("change", onDiscoveryGoogleToggle);
+    el.toggleAdvancedBtn.addEventListener("click", onToggleAdvancedFields);
     el.columnsAllBtn.addEventListener("click", onSelectAllColumns);
     el.columnsNoneBtn.addEventListener("click", onClearColumns);
 
@@ -191,10 +244,7 @@
       el.minRating,
       el.maxRating,
       el.minReviews,
-      el.maxReviews,
-      el.nameKeyword,
-      el.categoryInclude,
-      el.categoryExclude
+      el.maxReviews
     ];
     for (const input of settingInputs) {
       if (!input) continue;
@@ -420,6 +470,9 @@
       const siteVisited = Number(message.site_pages_visited || 0);
       const siteDiscovered = Number(message.site_pages_discovered || 0);
       const socialScanned = Number(message.social_scanned || 0);
+      const personal = Number(message.personal_email_found || 0);
+      const company = Number(message.company_email_found || 0);
+      const discoveryEmails = Number(message.discovery_email_recovered || 0);
       const currentSuffix = current ? ` ${current}` : "";
       const phaseSuffix = phase ? ` (${phase})` : "";
       const hostSuffix = host ? ` @ ${host}` : "";
@@ -428,6 +481,9 @@
       el.crawlVisitedStat.textContent = String(Number.isFinite(siteVisited) ? siteVisited : 0);
       el.crawlDiscoveredStat.textContent = String(Number.isFinite(siteDiscovered) ? siteDiscovered : 0);
       el.socialScannedStat.textContent = String(Number.isFinite(socialScanned) ? socialScanned : 0);
+      const totalEmailsFound = Math.max(0, personal + company);
+      el.emailsFoundStat.textContent = String(totalEmailsFound);
+      el.discoveryEmailsFoundStat.textContent = String(Math.max(0, discoveryEmails));
       setLeadSignal(normalizeText(message.lead_signal_text), normalizeText(message.lead_signal_tone || "info"));
       return;
     }
@@ -469,9 +525,6 @@
       maxRating: el.maxRating.value,
       minReviews: el.minReviews.value,
       maxReviews: el.maxReviews.value,
-      nameKeyword: el.nameKeyword.value,
-      categoryInclude: el.categoryInclude.value,
-      categoryExclude: el.categoryExclude.value,
       hasWebsite: el.hasWebsite.checked,
       hasPhone: el.hasPhone.checked
     };
@@ -501,6 +554,8 @@
     el.crawlVisitedStat.textContent = "0";
     el.crawlDiscoveredStat.textContent = "0";
     el.socialScannedStat.textContent = "0";
+    el.emailsFoundStat.textContent = "0";
+    el.discoveryEmailsFoundStat.textContent = "0";
   }
 
   function setState(text) {
@@ -527,7 +582,9 @@
         "enrichmentEnabled",
         "siteMaxPagesValue",
         "showEnrichmentTabsEnabled",
-        "scanSocialLinksEnabled"
+        "scanSocialLinksEnabled",
+        "leadDiscoveryEnabled",
+        "discoveryGoogleEnabled"
       ]);
       if (Array.isArray(data.lastRows)) {
         lastRows = applyUnifiedOutputToRows(data.lastRows);
@@ -537,13 +594,16 @@
       }
       infiniteScrollEnabled = data.infiniteScrollEnabled === true;
       enrichmentEnabled = data.enrichmentEnabled === true;
-      siteMaxPagesValue = clampInt(data.siteMaxPagesValue, 1, 120, 40);
+      siteMaxPagesValue = clampInt(data.siteMaxPagesValue, 1, 120, 12);
       showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
       scanSocialLinksEnabled = data.scanSocialLinksEnabled !== false;
+      leadDiscoveryEnabled = data.leadDiscoveryEnabled === true;
+      discoveryGoogleEnabled = data.discoveryGoogleEnabled !== false;
       applySavedUiSettings(data[POPUP_UI_SETTINGS_KEY]);
       applyScrapeSession(data[SCRAPE_SESSION_KEY]);
       applyEnrichSession(data[ENRICH_SESSION_KEY]);
       syncOutputModesFromSelectedColumns();
+      syncLeadDiscoveryInputs();
       el.exportBtn.disabled = isBusy() || !Array.isArray(lastRows) || selectedColumns.length === 0;
     } catch (_error) {
       el.exportBtn.disabled = true;
@@ -586,6 +646,23 @@
       updateEmailColumnsHint();
       updatePhonePreferenceHint();
       updatePhoneColumnsHint();
+      renderColumnSelector();
+      updateColumnsTitle();
+    }
+
+    if (changes.leadDiscoveryEnabled) {
+      leadDiscoveryEnabled = changes.leadDiscoveryEnabled.newValue === true;
+      if (el.leadDiscoveryEnabled) {
+        el.leadDiscoveryEnabled.checked = leadDiscoveryEnabled;
+      }
+      syncLeadDiscoveryInputs();
+    }
+    if (changes.discoveryGoogleEnabled) {
+      discoveryGoogleEnabled = changes.discoveryGoogleEnabled.newValue !== false;
+      if (el.discoveryGoogleEnabled) {
+        el.discoveryGoogleEnabled.checked = discoveryGoogleEnabled;
+      }
+      syncLeadDiscoveryInputs();
     }
   }
 
@@ -596,15 +673,13 @@
     emailOutputModeValue = normalizeOutputMode(saved.emailOutputMode);
     phonePreferenceValue = normalizePhonePreference(saved.phonePreference);
     phoneOutputModeValue = normalizeOutputMode(saved.phoneOutputMode);
+    showAdvancedFields = saved.showAdvancedFields === true;
 
     el.maxRows.value = String(maxRowsValue);
     el.minRating.value = sanitizeFormString(saved.minRating);
     el.maxRating.value = sanitizeFormString(saved.maxRating);
     el.minReviews.value = sanitizeFormString(saved.minReviews);
     el.maxReviews.value = sanitizeFormString(saved.maxReviews);
-    el.nameKeyword.value = sanitizeFormString(saved.nameKeyword);
-    el.categoryInclude.value = sanitizeFormString(saved.categoryInclude);
-    el.categoryExclude.value = sanitizeFormString(saved.categoryExclude);
     el.hasWebsite.checked = saved.hasWebsite === true;
     el.hasPhone.checked = saved.hasPhone === true;
     if (el.emailPreference) {
@@ -619,6 +694,10 @@
     if (el.phoneOutputMode) {
       el.phoneOutputMode.value = phoneOutputModeValue;
     }
+    if (!showAdvancedFields && Array.isArray(selectedColumns)) {
+      selectedColumns = normalizeSelectedColumns(selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)));
+    }
+    updateAdvancedToggleLabel();
     if (Array.isArray(lastRows) && lastRows.length > 0) {
       lastRows = applyUnifiedOutputToRows(lastRows);
     }
@@ -668,9 +747,14 @@
     const siteVisited = Number(session.site_pages_visited != null ? session.site_pages_visited : session.pages_visited || 0);
     const siteDiscovered = Number(session.site_pages_discovered != null ? session.site_pages_discovered : session.pages_discovered || 0);
     const socialScanned = Number(session.social_scanned || 0);
+    const personal = Number(session.personal_email_found || 0);
+    const company = Number(session.company_email_found || 0);
+    const discoveryEmails = Number(session.discovery_email_recovered || 0);
     el.crawlVisitedStat.textContent = String(Number.isFinite(siteVisited) ? siteVisited : 0);
     el.crawlDiscoveredStat.textContent = String(Number.isFinite(siteDiscovered) ? siteDiscovered : 0);
     el.socialScannedStat.textContent = String(Number.isFinite(socialScanned) ? socialScanned : 0);
+    el.emailsFoundStat.textContent = String(Math.max(0, personal + company));
+    el.discoveryEmailsFoundStat.textContent = String(Math.max(0, discoveryEmails));
 
     const signalText = normalizeText(session.lead_signal_text);
     const signalTone = normalizeText(session.lead_signal_tone || "info");
@@ -700,10 +784,11 @@
       const skipped = Number(session.skipped || 0);
       const blocked = Number(session.blocked || 0);
       setState(`Enrichment: ${enriched} enriched, ${skipped} skipped, ${blocked} blocked, pages ${siteVisited}/${siteDiscovered}`);
-      const personal = Number(session.personal_email_found || 0);
-      const company = Number(session.company_email_found || 0);
       if (personal > 0 || company > 0) {
-        setLeadSignal(`Saved emails: personal ${personal}, company fallback ${company}`, "success");
+        setLeadSignal(
+          `Saved emails: personal ${personal}, company fallback ${company}, discovery ${Math.max(0, discoveryEmails)}`,
+          "success"
+        );
       } else {
         setLeadSignal("No public emails found during enrichment", "warn");
       }
@@ -889,8 +974,19 @@
     scrapeRunTabId = null;
     setRunningState(isBusy());
 
-    const rows = Array.isArray(rowsInput) ? rowsInput : [];
+    const incomingRows = Array.isArray(rowsInput) ? rowsInput : [];
     const summary = summaryInput || {};
+    const activeFilters = readFilterConfig({
+      minRating: el.minRating.value,
+      maxRating: el.maxRating.value,
+      minReviews: el.minReviews.value,
+      maxReviews: el.maxReviews.value,
+      hasWebsite: el.hasWebsite.checked,
+      hasPhone: el.hasPhone.checked
+    });
+    const rows = hasAnyActiveFilter(activeFilters)
+      ? incomingRows.filter((row) => applyFilters(row, activeFilters))
+      : incomingRows;
 
     persistRows(rows);
 
@@ -1010,6 +1106,21 @@
     return Number.isFinite(num) ? num : null;
   }
 
+  function hasAnyActiveFilter(filters) {
+    const f = filters || {};
+    return (
+      f.minRating !== "" ||
+      f.maxRating !== "" ||
+      f.minReviews !== "" ||
+      f.maxReviews !== "" ||
+      normalizeText(f.nameKeyword) !== "" ||
+      normalizeText(f.categoryInclude) !== "" ||
+      normalizeText(f.categoryExclude) !== "" ||
+      f.hasWebsite === true ||
+      f.hasPhone === true
+    );
+  }
+
   function normalizeEmailPreference(value) {
     const normalized = normalizeText(value).toLowerCase();
     if (normalized === "primary" || normalized === "contact" || normalized === "owner") {
@@ -1037,32 +1148,32 @@
   function getEmailPrecedence(preferenceValue) {
     const preference = normalizeEmailPreference(preferenceValue);
     if (preference === "primary") {
-      return ["Primary Email (Auto)", "Owner Email (Personal)", "Contact Email (Company)"];
+      return ["Best Auto Email", "Owner Email", "Company Email"];
     }
     if (preference === "contact") {
-      return ["Contact Email (Company)", "Primary Email (Auto)", "Owner Email (Personal)"];
+      return ["Company Email", "Best Auto Email", "Owner Email"];
     }
-    return ["Owner Email (Personal)", "Primary Email (Auto)", "Contact Email (Company)"];
+    return ["Owner Email", "Best Auto Email", "Company Email"];
   }
 
   function getPhonePrecedence(preferenceValue) {
     const preference = normalizePhonePreference(preferenceValue);
     if (preference === "website") {
-      return ["Website Phone (Scanned)", "Listing Phone"];
+      return ["Website Phone", "Listing Phone"];
     }
-    return ["Listing Phone", "Website Phone (Scanned)"];
+    return ["Listing Phone", "Website Phone"];
   }
 
   function updateEmailPreferenceHint() {
     if (!el.emailPreferenceHint) return;
     const order = getEmailPrecedence(emailPreferenceValue);
-    el.emailPreferenceHint.textContent = `Email priority: ${order.join(" -> ")}.`;
+    el.emailPreferenceHint.textContent = `Priority: ${order.join(" -> ")}`;
   }
 
   function updatePhonePreferenceHint() {
     if (!el.phonePreferenceHint) return;
     const order = getPhonePrecedence(phonePreferenceValue);
-    el.phonePreferenceHint.textContent = `Phone priority: ${order.join(" -> ")}.`;
+    el.phonePreferenceHint.textContent = `Priority: ${order.join(" -> ")}`;
   }
 
   function applyUnifiedOutputToRows(rows) {
@@ -1140,14 +1251,7 @@
   }
 
   function sanitizePhoneText(value) {
-    const raw = normalizeText(value);
-    if (!raw) return "";
-    const withoutPrefixNoise = raw.replace(/^[^\d+()]+/, "");
-    const matched = withoutPrefixNoise.match(/(?:\+?\d[\d().\s-]{7,}\d)/);
-    const candidate = normalizeText((matched ? matched[0] : withoutPrefixNoise).replace(/[^\d+().\s-]/g, " "));
-    const digits = candidate.replace(/\D/g, "");
-    if (digits.length < 7 || digits.length > 15) return "";
-    return candidate;
+    return normalizePhoneText(value);
   }
 
   function sanitizeFormString(value) {
@@ -1182,13 +1286,11 @@
       emailOutputMode: emailOutputModeValue,
       phonePreference: phonePreferenceValue,
       phoneOutputMode: phoneOutputModeValue,
+      showAdvancedFields: showAdvancedFields === true,
       minRating: sanitizeFormString(el.minRating.value),
       maxRating: sanitizeFormString(el.maxRating.value),
       minReviews: sanitizeFormString(el.minReviews.value),
       maxReviews: sanitizeFormString(el.maxReviews.value),
-      nameKeyword: sanitizeFormString(el.nameKeyword.value),
-      categoryInclude: sanitizeFormString(el.categoryInclude.value),
-      categoryExclude: sanitizeFormString(el.categoryExclude.value),
       hasWebsite: el.hasWebsite.checked === true,
       hasPhone: el.hasPhone.checked === true
     };
@@ -1212,7 +1314,7 @@
   }
 
   function onSiteMaxPagesChange() {
-    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 40);
+    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 12);
     el.siteMaxPages.value = String(siteMaxPagesValue);
     storageSet({ siteMaxPagesValue }).catch(() => {});
     schedulePersistUiSettings();
@@ -1284,18 +1386,63 @@
     schedulePersistUiSettings();
   }
 
+  function onLeadDiscoveryToggle() {
+    leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
+    storageSet({ leadDiscoveryEnabled }).catch(() => {});
+    syncLeadDiscoveryInputs();
+    schedulePersistUiSettings();
+  }
+
+  function onDiscoveryGoogleToggle() {
+    discoveryGoogleEnabled = el.discoveryGoogleEnabled.checked === true;
+    storageSet({ discoveryGoogleEnabled }).catch(() => {});
+    syncLeadDiscoveryInputs();
+    schedulePersistUiSettings();
+  }
+
+  function onToggleAdvancedFields() {
+    showAdvancedFields = !showAdvancedFields;
+    if (!showAdvancedFields) {
+      const filtered = selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column));
+      selectedColumns = normalizeSelectedColumns(filtered);
+      syncOutputModesFromSelectedColumns();
+      updateEmailColumnsHint();
+      updatePhoneColumnsHint();
+      persistSelectedColumns();
+    }
+    updateAdvancedToggleLabel();
+    renderColumnSelector();
+    updateColumnsTitle();
+    schedulePersistUiSettings();
+  }
+
   async function persistRunSettingsForBackground() {
     enrichmentEnabled = el.enableEnrichment.checked === true;
-    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 40);
+    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 12);
     showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked === true;
     scanSocialLinksEnabled = el.scanSocialLinks.checked === true;
+    leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
+    discoveryGoogleEnabled = el.discoveryGoogleEnabled.checked === true;
     el.siteMaxPages.value = String(siteMaxPagesValue);
+    syncLeadDiscoveryInputs();
+
+    const activeScrapeFilters = readFilterConfig({
+      minRating: el.minRating.value,
+      maxRating: el.maxRating.value,
+      minReviews: el.minReviews.value,
+      maxReviews: el.maxReviews.value,
+      hasWebsite: el.hasWebsite.checked,
+      hasPhone: el.hasPhone.checked
+    });
 
     await storageSet({
       enrichmentEnabled,
       siteMaxPagesValue,
       showEnrichmentTabsEnabled,
-      scanSocialLinksEnabled
+      scanSocialLinksEnabled,
+      leadDiscoveryEnabled,
+      discoveryGoogleEnabled,
+      [ACTIVE_SCRAPE_FILTERS_KEY]: activeScrapeFilters
     }).catch(() => {});
   }
 
@@ -1309,12 +1456,32 @@
     }
   }
 
+  function syncLeadDiscoveryInputs() {
+    if (!el.leadDiscoveryEnabled) return;
+    if (el.discoveryGoogleEnabled) el.discoveryGoogleEnabled.disabled = false;
+  }
+
+  function updateAdvancedToggleLabel() {
+    if (!el.toggleAdvancedBtn) return;
+    el.toggleAdvancedBtn.textContent = showAdvancedFields ? "Advanced On" : "Advanced Off";
+    el.toggleAdvancedBtn.title = showAdvancedFields
+      ? "Hide metadata fields"
+      : "Show metadata fields";
+  }
+
   function renderColumnSelector() {
     el.columnList.textContent = "";
     const selectedSet = new Set(selectedColumns);
     const groupedColumns = new Set();
 
     for (const group of COLUMN_GROUPS) {
+      if (group.advanced === true && !showAdvancedFields) {
+        for (const column of group.columns) {
+          groupedColumns.add(column);
+        }
+        continue;
+      }
+
       const section = document.createElement("section");
       section.className = "column-group";
 
@@ -1334,6 +1501,7 @@
       for (const column of group.columns) {
         groupedColumns.add(column);
         if (!CSV_COLUMNS.includes(column)) continue;
+        if (!showAdvancedFields && ADVANCED_COLUMNS.has(column)) continue;
         grid.appendChild(buildColumnCheckbox(column, selectedSet));
       }
 
@@ -1341,7 +1509,11 @@
       el.columnList.appendChild(section);
     }
 
-    const extras = CSV_COLUMNS.filter((column) => !groupedColumns.has(column));
+    const extras = CSV_COLUMNS.filter((column) => {
+      if (groupedColumns.has(column)) return false;
+      if (!showAdvancedFields && ADVANCED_COLUMNS.has(column)) return false;
+      return true;
+    });
     if (extras.length > 0) {
       const section = document.createElement("section");
       section.className = "column-group";
@@ -1473,17 +1645,17 @@
     }
 
     if (hasUnified && selectedRaw.length === 0) {
-      el.emailColumnsHint.textContent = `Unified mode: one Email column using ${order.join(" -> ")}.`;
+      el.emailColumnsHint.textContent = `Exports one email column using ${order.join(" -> ")}`;
       el.emailColumnsHint.classList.add("success");
       return;
     }
 
     if (hasUnified) {
-      el.emailColumnsHint.textContent = `Unified + raw mode: Email plus ${selectedRaw.length} raw email field(s).`;
+      el.emailColumnsHint.textContent = `Exports best email plus ${selectedRaw.length} detail field(s).`;
       return;
     }
 
-    el.emailColumnsHint.textContent = `Raw-only mode: ${selectedRaw.length} raw email field(s).`;
+    el.emailColumnsHint.textContent = `Exports ${selectedRaw.length} owner/company detail field(s).`;
     el.emailColumnsHint.classList.add("warn");
   }
 
@@ -1502,22 +1674,24 @@
     }
 
     if (hasUnified && selectedRaw.length === 0) {
-      el.phoneColumnsHint.textContent = `Unified mode: one Phone column using ${order.join(" -> ")}.`;
+      el.phoneColumnsHint.textContent = `Exports one phone column using ${order.join(" -> ")}`;
       el.phoneColumnsHint.classList.add("success");
       return;
     }
 
     if (hasUnified) {
-      el.phoneColumnsHint.textContent = `Unified + raw mode: Phone plus ${selectedRaw.length} raw phone field(s).`;
+      el.phoneColumnsHint.textContent = `Exports best phone plus ${selectedRaw.length} detail field(s).`;
       return;
     }
 
-    el.phoneColumnsHint.textContent = `Raw-only mode: ${selectedRaw.length} raw phone field(s).`;
+    el.phoneColumnsHint.textContent = `Exports ${selectedRaw.length} detailed phone field(s).`;
     el.phoneColumnsHint.classList.add("warn");
   }
 
   function onSelectAllColumns() {
-    selectedColumns = [...CSV_COLUMNS];
+    selectedColumns = showAdvancedFields
+      ? [...CSV_COLUMNS]
+      : normalizeSelectedColumns(CSV_COLUMNS.filter((column) => !ADVANCED_COLUMNS.has(column)));
     emailOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "email", RAW_EMAIL_COLUMNS);
     phoneOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "phone", RAW_PHONE_COLUMNS);
     el.emailOutputMode.value = emailOutputModeValue;
@@ -1563,7 +1737,13 @@
   }
 
   function updateColumnsTitle() {
-    el.columnsTitle.textContent = `Export columns (${selectedColumns.length}/${CSV_COLUMNS.length})`;
+    const availableCount = showAdvancedFields
+      ? CSV_COLUMNS.length
+      : CSV_COLUMNS.filter((column) => !ADVANCED_COLUMNS.has(column)).length;
+    const selectedVisibleCount = showAdvancedFields
+      ? selectedColumns.length
+      : selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)).length;
+    el.columnsTitle.textContent = `Export columns (${selectedVisibleCount}/${availableCount})`;
   }
 
   function persistSelectedColumns() {
@@ -1571,13 +1751,16 @@
   }
 
   function normalizeSelectedColumns(columns) {
-    if (!Array.isArray(columns)) return [...CSV_COLUMNS];
+    if (!Array.isArray(columns)) return [...DEFAULT_SELECTED_COLUMNS];
     const out = [];
     const seen = new Set();
     for (const column of columns) {
       if (!CSV_COLUMNS.includes(column) || seen.has(column)) continue;
       seen.add(column);
       out.push(column);
+    }
+    if (out.length === 0) {
+      return [...DEFAULT_SELECTED_COLUMNS];
     }
     return out;
   }
@@ -1605,7 +1788,11 @@
       column === "site_pages_visited" ||
       column === "site_pages_discovered" ||
       column === "social_pages_scanned" ||
-      column === "social_links";
+      column === "social_links" ||
+      column === "discovery_status" ||
+      column === "discovery_source" ||
+      column === "discovery_query" ||
+      column === "discovered_website";
   }
 
   function rowsAlreadyEnriched(rows) {
@@ -1640,11 +1827,24 @@
         type: MSG.ENRICH_ROWS,
         rows,
         options: {
-          maxPagesPerSite: clampInt(el.siteMaxPages.value, 1, 120, 40),
+          maxPagesPerSite: clampInt(el.siteMaxPages.value, 1, 120, 12),
           timeoutMs: 10000,
           visibleTabs: Boolean(el.showEnrichmentTabs.checked),
           scanSocialLinks: Boolean(el.scanSocialLinks.checked),
-          maxSocialPages: 4
+          maxSocialPages: 2,
+          leadDiscoveryEnabled: Boolean(el.leadDiscoveryEnabled.checked),
+          discoverySources: {
+            google: Boolean(el.discoveryGoogleEnabled.checked),
+            linkedin: false,
+            yelp: false
+          },
+          discoveryTrigger: "missing_website_or_missing_email",
+          discoveryBudget: {
+            googleQueries: 2,
+            googlePages: 3,
+            linkedinPages: 0,
+            yelpPages: 0
+          }
         }
       });
 
@@ -1660,6 +1860,11 @@
       el.crawlVisitedStat.textContent = String(Number(enrichSummary.pages_visited || 0));
       el.crawlDiscoveredStat.textContent = String(Number(enrichSummary.pages_discovered || 0));
       el.socialScannedStat.textContent = String(Number(enrichSummary.social_scanned || 0));
+      const personalCount = Number(enrichSummary.personal_email_found || 0);
+      const companyCount = Number(enrichSummary.company_email_found || 0);
+      const discoveryRecovered = Number(enrichSummary.discovery_email_recovered || 0);
+      el.emailsFoundStat.textContent = String(Math.max(0, personalCount + companyCount));
+      el.discoveryEmailsFoundStat.textContent = String(Math.max(0, discoveryRecovered));
       if (stopped) {
         setState(`Enrichment stopped: ${enrichSummary.processed || 0}/${enrichSummary.total || rowsForExport.length}, pages ${enrichSummary.pages_visited || 0}/${enrichSummary.pages_discovered || 0}`);
         setLeadSignal("Enrichment stopped by user", "warn");
@@ -1667,10 +1872,11 @@
       }
 
       setState(`Enrichment: ${enrichSummary.enriched || 0} enriched, ${enrichSummary.skipped || 0} skipped, ${enrichSummary.blocked || 0} blocked, pages ${enrichSummary.pages_visited || 0}/${enrichSummary.pages_discovered || 0}`);
-      const personalCount = Number(enrichSummary.personal_email_found || 0);
-      const companyCount = Number(enrichSummary.company_email_found || 0);
       if (personalCount > 0 || companyCount > 0) {
-        setLeadSignal(`Saved emails: personal ${personalCount}, company fallback ${companyCount}`, "success");
+        setLeadSignal(
+          `Saved emails: personal ${personalCount}, company fallback ${companyCount}, discovery ${Math.max(0, discoveryRecovered)}`,
+          "success"
+        );
       } else {
         setLeadSignal("No public emails found during enrichment", "warn");
       }

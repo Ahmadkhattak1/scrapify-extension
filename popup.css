@@ -47,6 +47,31 @@ label {
   color: var(--muted);
 }
 
+.label-with-info {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.info-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 1px solid #9fb2cb;
+  background: #eef4ff;
+  color: #0b3d91;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: help;
+}
+
+.info-dot::before {
+  content: "i";
+}
+
 .hint-text {
   margin: -2px 0 0;
   font-size: 11px;
@@ -179,6 +204,12 @@ button:disabled {
 .metrics-grid strong {
   display: block;
   font-size: 13px;
+}
+
+.metrics-grid.metrics-grid-kpi div {
+  border-style: solid;
+  border-color: #b9c7db;
+  background: #eef4ff;
 }
 
 #stateText {

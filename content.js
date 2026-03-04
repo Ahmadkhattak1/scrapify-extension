@@ -9,6 +9,8 @@
     MSG,
     DEFAULT_MAX_ROWS,
     normalizeText,
+    normalizePhoneText,
+    parseFlexibleNumber,
     parseRating,
     parseReviewCount,
     normalizeMapsUrl,
@@ -26,12 +28,14 @@
     runTabId: null,
     runStartedAtIso: "",
     runInfiniteScroll: false,
+    activeFilters: {},
     sourceQuery: "",
     sourceUrl: "",
     lastProgressPersistAtMs: 0,
     persistedRowsCount: 0,
     seenCardKeys: new Set(),
     seenKeys: new Set(),
+    websiteHostOwners: new Map(),
     rows: [],
     startedAtMs: 0,
     seenListings: 0,
@@ -103,7 +107,8 @@
     const maxRows = Number(config.maxRows) > 0 ? Number(config.maxRows) : DEFAULT_MAX_ROWS;
     const infiniteScroll = Boolean(config.infiniteScroll);
     state.runInfiniteScroll = infiniteScroll;
-    const filters = config.filters || {};
+    const filters = normalizeRuntimeFilters(config.filters || {});
+    state.activeFilters = { ...filters };
     const sourceQuery = getCurrentQuery();
     const sourceUrl = window.location.href;
     state.sourceQuery = normalizeText(sourceQuery);
@@ -112,6 +117,7 @@
     persistScrapeSession({
       status: "running",
       infinite_scroll: infiniteScroll,
+      filters: state.activeFilters,
       force: true
     });
 
@@ -163,29 +169,33 @@
           const quickData = buildQuickCardData(card);
           const seenCapture = updateSeenStats(quickData);
 
-          if (!quickCardPassesFilter(quickData, filters)) {
+          if (!quickCardPassesFilter(card, quickData, filters)) {
             state.fastSkipped += 1;
             sendProgress();
             continue;
           }
 
           try {
-            const row = await processCard(card, sourceQuery, sourceUrl);
+            const row = mergeQuickMetricsIntoRow(
+              await processCard(card, sourceQuery, sourceUrl),
+              quickData
+            );
             state.processed += 1;
             backfillSeenStatsFromRow(row, seenCapture);
 
             if (row && applyFilters(row, filters)) {
-              const key = dedupeKey(row);
+              const guardedRow = applyWebsiteOwnershipGuard(row);
+              const key = dedupeKey(guardedRow);
               if (key) {
                 if (state.seenKeys.has(key)) {
                   state.duplicates += 1;
                 } else {
                   state.seenKeys.add(key);
-                  state.rows.push(row);
+                  state.rows.push(guardedRow);
                   state.matched += 1;
                 }
               } else {
-                state.rows.push(row);
+                state.rows.push(guardedRow);
                 state.matched += 1;
               }
             }
@@ -209,6 +219,14 @@
         }
       }
 
+      if (hasAnyActiveFilter(filters) && state.rows.length > 0) {
+        const finalFilteredRows = state.rows.filter((row) => applyFilters(row, filters));
+        if (finalFilteredRows.length !== state.rows.length) {
+          state.rows = finalFilteredRows;
+          state.matched = finalFilteredRows.length;
+        }
+      }
+
       const summary = {
         processed: state.processed,
         matched: state.matched,
@@ -222,6 +240,7 @@
       persistScrapeSession({
         status: summary.stopped ? "stopped" : "done",
         summary,
+        filters: state.activeFilters,
         rows: state.rows,
         force: true
       });
@@ -231,7 +250,8 @@
         run_id: state.runId,
         tab_id: state.runTabId,
         rows: state.rows,
-        summary
+        summary,
+        filters: state.activeFilters
       });
 
       return { rows: state.rows, summary };
@@ -297,18 +317,19 @@
     const ratingText =
       attrFrom("div.F7nice span[aria-hidden='true']", "textContent") ||
       attrFrom("span.ceNzKf", "textContent") ||
+      attrFrom("[role='main'] span[aria-label*='star' i]", "aria-label") ||
+      attrFrom("[role='main'] span[aria-label*='rating' i]", "aria-label") ||
       "";
 
     const reviewsText =
-      attrFrom("button[aria-label*='review']", "aria-label") ||
-      attrFrom("span[aria-label*='review']", "aria-label") ||
+      attrFrom("button[aria-label*='review' i]", "aria-label") ||
+      attrFrom("span[aria-label*='review' i]", "aria-label") ||
       attrFrom("button[jsaction*='pane.reviewChart.moreReviews']", "aria-label") ||
-      textFrom("div.F7nice span[aria-label*='review']") ||
-      textFrom("span[aria-label*='reviews']") ||
-      textFrom("[role='main'] span[aria-label*='review']") ||
+      textFrom("div.F7nice span[aria-label*='review' i]") ||
+      textFrom("span[aria-label*='reviews' i]") ||
+      textFrom("[role='main'] span[aria-label*='review' i]") ||
       textFrom("div.F7nice") ||
       "";
-
     const category =
       textFrom("button.DkEaL") ||
       textFrom("button[jsaction*='category']") ||
@@ -334,12 +355,20 @@
 
     const mapsUrl = normalizeMapsUrl(window.location.href);
     const placeId = parsePlaceIdFromUrl(mapsUrl);
+    const parsedRating =
+      parseRating(ratingText) !== "" ? parseRating(ratingText)
+      : parseRating(reviewsText) !== "" ? parseRating(reviewsText)
+      : "";
+    const parsedReviewCount =
+      parseReviewCount(reviewsText) !== "" ? parseReviewCount(reviewsText)
+      : parseReviewCount(ratingText) !== "" ? parseReviewCount(ratingText)
+      : "";
 
     return {
       place_id: normalizeText(placeId),
       name: normalizeText(name),
-      rating: parseRating(ratingText),
-      review_count: parseReviewCount(reviewsText),
+      rating: parsedRating,
+      review_count: parsedReviewCount,
       category: normalizeText(category),
       address: normalizeFieldValue(address, "Address"),
       phone: listingPhone,
@@ -360,6 +389,10 @@
       site_pages_discovered: 0,
       social_pages_scanned: 0,
       social_links: "",
+      discovery_status: "not_requested",
+      discovery_source: "",
+      discovery_query: "",
+      discovered_website: "",
       hours: normalizeText(hours),
       maps_url: mapsUrl,
       source_query: normalizeText(sourceQuery),
@@ -379,14 +412,7 @@
   }
 
   function sanitizePhoneText(value) {
-    const raw = normalizeText(value);
-    if (!raw) return "";
-    const withoutPrefixNoise = raw.replace(/^[^\d+()]+/, "");
-    const matched = withoutPrefixNoise.match(/(?:\+?\d[\d().\s-]{7,}\d)/);
-    const candidate = normalizeText((matched ? matched[0] : withoutPrefixNoise).replace(/[^\d+().\s-]/g, " "));
-    const digits = candidate.replace(/\D/g, "");
-    if (digits.length < 7 || digits.length > 15) return "";
-    return candidate;
+    return normalizePhoneText(value);
   }
 
   function extractBusinessRowFromCard(card, sourceQuery, sourceUrl) {
@@ -433,6 +459,10 @@
       site_pages_discovered: 0,
       social_pages_scanned: 0,
       social_links: "",
+      discovery_status: "not_requested",
+      discovery_source: "",
+      discovery_query: "",
+      discovered_website: "",
       hours: "",
       maps_url: mapsUrl,
       source_query: normalizeText(sourceQuery),
@@ -444,18 +474,18 @@
   function extractWebsiteFromCard(card) {
     if (!card) return "";
 
-    const roots = [card, card.closest("[role='article']"), card.parentElement].filter(Boolean);
+    const cardRoot = card.closest("[role='article']") || card;
+    const roots = [cardRoot, card].filter(Boolean);
     const selectors = [
       "a[data-item-id*='authority'][href]",
       "a[data-item-id*='website'][href]",
       "a[aria-label^='Website'][href]",
-      "a[aria-label*='Website:'][href]",
-      "a[href]"
+      "a[aria-label*='Website:'][href]"
     ];
 
     for (const root of roots) {
       for (const selector of selectors) {
-        const nodes = Array.from(root.querySelectorAll(selector)).slice(0, 80);
+        const nodes = Array.from(root.querySelectorAll(selector)).slice(0, 40);
         for (const node of nodes) {
           const href = normalizeBusinessWebsiteUrl((node.getAttribute && node.getAttribute("href")) || node.href || "");
           if (isValidWebsiteLink(href)) {
@@ -468,13 +498,6 @@
             return textHit;
           }
         }
-      }
-    }
-
-    for (const root of roots) {
-      const textHit = findWebsiteInText(normalizeText(root.textContent || ""));
-      if (textHit) {
-        return textHit;
       }
     }
 
@@ -569,18 +592,6 @@
       }
     }
 
-    // Fallback: parse domain-like text in detail info rows.
-    const detailTextHints = [
-      normalizeText(textFrom("[role='main']")),
-      normalizeText(textFrom("h1.DUwDvf")),
-      normalizeText(textFrom("div[role='main'] div"))
-    ].filter(Boolean);
-
-    for (const hint of detailTextHints) {
-      const textHit = findWebsiteInText(hint);
-      if (textHit) return textHit;
-    }
-
     return "";
   }
 
@@ -628,6 +639,104 @@
     }
   }
 
+  function normalizeWebsiteHost(url) {
+    const normalized = normalizeBusinessWebsiteUrl(url);
+    if (!normalized) return "";
+    try {
+      const parsed = new URL(normalized);
+      const host = normalizeText(parsed.hostname).toLowerCase().replace(/^www\./, "");
+      return host;
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function normalizeBusinessNameKey(name) {
+    const tokens = normalizeText(name)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length >= 2);
+    if (tokens.length === 0) return "";
+
+    const stop = new Set(["the", "and", "of", "llc", "inc", "ltd", "co", "company", "services", "service"]);
+    return tokens.filter((token) => !stop.has(token)).join(" ");
+  }
+
+  function areLikelySameBusinessName(nameA, nameB) {
+    const left = normalizeBusinessNameKey(nameA);
+    const right = normalizeBusinessNameKey(nameB);
+    if (!left || !right) return false;
+    if (left === right) return true;
+
+    const leftTokens = left.split(/\s+/);
+    const rightTokens = right.split(/\s+/);
+    const leftSet = new Set(leftTokens);
+    const rightSet = new Set(rightTokens);
+    let overlap = 0;
+    for (const token of leftSet) {
+      if (rightSet.has(token)) overlap += 1;
+    }
+    const union = new Set([...leftSet, ...rightSet]).size;
+    if (union === 0) return false;
+    const jaccard = overlap / union;
+    return jaccard >= 0.75;
+  }
+
+  function applyWebsiteOwnershipGuard(row) {
+    if (!row || typeof row !== "object") return row;
+    const website = normalizeBusinessWebsiteUrl(row.website);
+    if (!website) {
+      row.website = "";
+      if (!normalizeText(row.website_scan_status)) {
+        row.website_scan_status = "no_website";
+      }
+      return row;
+    }
+
+    const host = normalizeWebsiteHost(website);
+    if (!host) {
+      row.website = "";
+      row.website_scan_status = "no_website";
+      return row;
+    }
+
+    const placeId = normalizeText(row.place_id);
+    const mapsUrl = normalizeMapsUrl(row.maps_url || "");
+    const businessName = normalizeText(row.name);
+    const existing = state.websiteHostOwners.get(host);
+
+    if (!existing) {
+      state.websiteHostOwners.set(host, {
+        placeIds: new Set(placeId ? [placeId] : []),
+        mapsUrls: new Set(mapsUrl ? [mapsUrl] : []),
+        names: new Set(businessName ? [businessName] : []),
+        primaryName: businessName
+      });
+      row.website = website;
+      row.website_scan_status = "not_requested";
+      return row;
+    }
+
+    const sameIdentity =
+      (placeId && existing.placeIds.has(placeId)) ||
+      (mapsUrl && existing.mapsUrls.has(mapsUrl)) ||
+      (businessName && existing.primaryName && areLikelySameBusinessName(businessName, existing.primaryName));
+
+    if (!sameIdentity) {
+      row.website = "";
+      row.website_scan_status = "no_website";
+      return row;
+    }
+
+    if (placeId) existing.placeIds.add(placeId);
+    if (mapsUrl) existing.mapsUrls.add(mapsUrl);
+    if (businessName) existing.names.add(businessName);
+    row.website = website;
+    row.website_scan_status = "not_requested";
+    return row;
+  }
+
   function mergeRows(primary, fallback) {
     if (!fallback) return primary;
     const merged = { ...primary };
@@ -636,6 +745,23 @@
         merged[key] = fallback[key];
       }
     }
+    return merged;
+  }
+
+  function mergeQuickMetricsIntoRow(row, quickData) {
+    if (!row || typeof row !== "object") return row;
+    const merged = { ...row };
+
+    // Card-level metrics are tied to the specific listing card and are safer than
+    // broad detail-panel text fallbacks, so prefer them whenever available.
+    if (quickData && quickData.rating !== "") {
+      merged.rating = quickData.rating;
+    }
+
+    if (quickData && quickData.reviews !== "") {
+      merged.review_count = quickData.reviews;
+    }
+
     return merged;
   }
 
@@ -672,29 +798,29 @@
     return "";
   }
 
-  function quickCardPassesFilter(quickData, filters) {
+  function quickCardPassesFilter(card, quickData, filters) {
     const f = filters || {};
     const cardText = quickData && quickData.text ? quickData.text : "";
     if (!cardText) return true;
 
-    const quickRating = quickData.rating;
-    if (f.minRating !== "" && f.minRating != null && quickRating !== "") {
-      const minRating = Number(f.minRating);
-      if (Number.isFinite(minRating) && quickRating < minRating) return false;
-    }
-    if (f.maxRating !== "" && f.maxRating != null && quickRating !== "") {
-      const maxRating = Number(f.maxRating);
-      if (Number.isFinite(maxRating) && quickRating > maxRating) return false;
-    }
+    const quickRating = parseFlexibleNumber(quickData && quickData.rating);
+    const quickReviews = parseFlexibleNumber(quickData && quickData.reviews);
+    const minRating = parseFlexibleNumber(f.minRating);
+    const maxRating = parseFlexibleNumber(f.maxRating);
+    const minReviews = parseFlexibleNumber(f.minReviews);
+    const maxReviews = parseFlexibleNumber(f.maxReviews);
 
-    const quickReviews = quickData.reviews;
-    if (f.minReviews !== "" && f.minReviews != null && quickReviews !== "") {
-      const minReviews = Number(f.minReviews);
-      if (Number.isFinite(minReviews) && quickReviews < minReviews) return false;
+    if (minRating !== "" && quickRating !== "" && quickRating < minRating) {
+      return false;
     }
-    if (f.maxReviews !== "" && f.maxReviews != null && quickReviews !== "") {
-      const maxReviews = Number(f.maxReviews);
-      if (Number.isFinite(maxReviews) && quickReviews > maxReviews) return false;
+    if (maxRating !== "" && quickRating !== "" && quickRating > maxRating) {
+      return false;
+    }
+    if (minReviews !== "" && quickReviews !== "" && quickReviews < minReviews) {
+      return false;
+    }
+    if (maxReviews !== "" && quickReviews !== "" && quickReviews > maxReviews) {
+      return false;
     }
 
     const lower = quickData.lower;
@@ -732,9 +858,9 @@
   function parseCardRating(card, text) {
     const candidates = [
       attrFromWithin(card, "span.MW4etd", "textContent"),
-      attrFromWithin(card, "span[aria-label*='rating']", "aria-label"),
-      attrFromWithin(card, "span[role='img'][aria-label*='star']", "aria-label"),
-      attrFromWithin(card, "span[aria-label*='star']", "aria-label"),
+      attrFromWithin(card, "span[aria-label*='rating' i]", "aria-label"),
+      attrFromWithin(card, "span[role='img'][aria-label*='star' i]", "aria-label"),
+      attrFromWithin(card, "span[aria-label*='star' i]", "aria-label"),
       attrFromWithin(card, "span[aria-hidden='true']", "textContent"),
       normalizeText(text)
     ];
@@ -748,13 +874,19 @@
   }
 
   function parseCardReviewCount(card, text) {
+    const normalizedText = normalizeText(text);
     const candidates = [
       attrFromWithin(card, "span.UY7F9", "textContent"),
-      attrFromWithin(card, "span[aria-label*='reviews']", "aria-label"),
-      attrFromWithin(card, "button[aria-label*='review']", "aria-label"),
-      attrFromWithin(card, "span[aria-label*='review']", "aria-label"),
-      normalizeText(text)
+      attrFromWithin(card, "span[aria-label*='reviews' i]", "aria-label"),
+      attrFromWithin(card, "button[aria-label*='review' i]", "aria-label"),
+      attrFromWithin(card, "span[aria-label*='review' i]", "aria-label")
     ];
+    if (
+      /\breviews?\b/i.test(normalizedText) ||
+      /\b[0-5](?:\.\d)?\s*(?:[·•]|\(\s*\d)/i.test(normalizedText)
+    ) {
+      candidates.push(normalizedText);
+    }
 
     for (const candidate of candidates) {
       const value = parseReviewCountFromReviewContext(candidate);
@@ -805,36 +937,34 @@
     const clean = normalizeText(text);
     if (!clean) return "";
 
-    const wordPattern = clean.match(/(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\s+reviews?\b/i);
+    const wordPattern = clean.match(/(\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\s+reviews?\b/i);
     if (wordPattern && wordPattern[1]) {
       const value = parseAbbreviatedCount(wordPattern[1]);
       if (Number.isFinite(value)) return value;
     }
 
-    const parenPattern = clean.match(/\((\d[\d,]*(?:\.\d+)?\s*[kmb]?)\)/i);
-    if (parenPattern && parenPattern[1]) {
-      const value = parseAbbreviatedCount(parenPattern[1]);
-      if (Number.isFinite(value)) return value;
-    }
-
-    const bulletPattern = clean.match(/\b([0-5](?:\.\d)?)\s*[·•]\s*(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\b/i);
+    const bulletPattern = clean.match(/\b([0-5](?:\.\d)?)\s*[·•]\s*(\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\b/i);
     if (bulletPattern && bulletPattern[2]) {
       const value = parseAbbreviatedCount(bulletPattern[2]);
       if (Number.isFinite(value)) return value;
     }
 
-    const compactPattern = clean.match(/\b([0-5](?:\.\d)?)\s*\((\d[\d,]*(?:\.\d+)?\s*[kmb]?)\)/i);
+    const compactPattern = clean.match(/\b([0-5](?:\.\d)?)\s*\((\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\)/i);
     if (compactPattern && compactPattern[2]) {
       const value = parseAbbreviatedCount(compactPattern[2]);
       if (Number.isFinite(value)) return value;
     }
 
-    const standalonePattern = clean.match(/\b(\d[\d,]*(?:\.\d+)?\s*[kmb]?)\b/i);
-    if (standalonePattern && standalonePattern[1]) {
-      const value = parseAbbreviatedCount(standalonePattern[1]);
-      if (!Number.isFinite(value)) return "";
-      const hasMagnitudeSignal = /[kmb]/i.test(standalonePattern[1]) || /,/.test(standalonePattern[1]);
-      if (hasMagnitudeSignal || value >= 10) return value;
+    const strictStandalonePattern = clean.match(/^\(?\s*(\d[\d,.'’\u00A0\u202F\s]*[kmb]?)\s*\)?$/i);
+    if (strictStandalonePattern && strictStandalonePattern[1]) {
+      const rawStandalone = normalizeText(strictStandalonePattern[1]);
+      const standaloneDigits = rawStandalone.replace(/\D/g, "");
+      const standaloneHasSuffix = /[kmb]$/i.test(rawStandalone);
+      if (!standaloneHasSuffix && standaloneDigits.length > 7) {
+        return "";
+      }
+      const value = parseAbbreviatedCount(strictStandalonePattern[1]);
+      if (Number.isFinite(value)) return value;
     }
 
     return "";
@@ -843,21 +973,41 @@
   function parseAbbreviatedCount(value) {
     const raw = normalizeText(value).toLowerCase().replace(/\s+/g, "");
     if (!raw) return "";
-    const match = raw.match(/^(\d[\d,]*)(?:\.(\d+))?([kmb])?$/i);
-    if (!match) return "";
+    const suffixMatch = raw.match(/([kmb])$/i);
+    const suffix = suffixMatch ? suffixMatch[1].toLowerCase() : "";
+    const numeric = suffix ? raw.slice(0, -1) : raw;
+    if (!numeric || !/^\d[\d.,'’]*$/.test(numeric)) return "";
+    if (!suffix && /^\d+$/.test(numeric) && numeric.length > 7) return "";
 
-    const whole = Number((match[1] || "").replace(/,/g, ""));
-    if (!Number.isFinite(whole)) return "";
-    const fractionText = match[2] || "";
-    const suffix = (match[3] || "").toLowerCase();
-    if (!suffix && fractionText) return "";
+    let normalized = "";
+    const groupedThousandsPattern = /^\d{1,3}(?:[.,'’]\d{3})+$/;
 
-    if (!suffix) return whole;
+    if (groupedThousandsPattern.test(numeric)) {
+      normalized = numeric.replace(/[.,'’]/g, "");
+    } else if (suffix && numeric.includes(".") && numeric.includes(",")) {
+      const commaIndex = numeric.lastIndexOf(",");
+      const dotIndex = numeric.lastIndexOf(".");
+      const compact = numeric.replace(/['’]/g, "");
+      normalized = commaIndex > dotIndex
+        ? compact.replace(/\./g, "").replace(",", ".")
+        : compact.replace(/,/g, "");
+    } else if (suffix && /^\d+[.,]\d+$/.test(numeric)) {
+      normalized = numeric.replace(/['’]/g, "").replace(",", ".");
+    } else if (/^\d+$/.test(numeric)) {
+      normalized = numeric;
+    } else {
+      return "";
+    }
 
-    const fraction = fractionText ? Number(`0.${fractionText}`) : 0;
-    if (!Number.isFinite(fraction)) return "";
+    if (!suffix && /^\d+$/.test(normalized) && normalized.length > 7) {
+      return "";
+    }
 
-    const base = whole + fraction;
+    const base = Number(normalized);
+    if (!Number.isFinite(base)) return "";
+
+    if (!suffix) return Math.round(base);
+
     const multiplier = suffix === "k" ? 1000 : suffix === "m" ? 1000000 : suffix === "b" ? 1000000000 : 1;
     const scaled = Math.round(base * multiplier);
     return Number.isFinite(scaled) ? scaled : "";
@@ -887,7 +1037,7 @@
     ];
 
     for (const selector of selectors) {
-      const nodes = Array.from(feed.querySelectorAll(selector));
+      const nodes = Array.from(feed.querySelectorAll(selector)).map((node) => normalizeCardNode(node));
       const unique = dedupeNodes(nodes).filter(isVisible);
       if (unique.length > 0) {
         return unique;
@@ -897,11 +1047,24 @@
     return [];
   }
 
+  function normalizeCardNode(node) {
+    if (!node || typeof node.closest !== "function") return node;
+    return (
+      node.closest("div[role='article']") ||
+      node.closest("div.Nv2PK") ||
+      node
+    );
+  }
+
   function dedupeNodes(nodes) {
     const seen = new Set();
     const out = [];
     for (const node of nodes) {
-      const key = node.href || node.getAttribute("aria-label") || node.textContent;
+      if (!node) continue;
+      const link = resolveCardLink(node);
+      const href = normalizeMapsUrl((link && (link.href || link.getAttribute("href"))) || "");
+      const label = normalizeText((link && link.getAttribute("aria-label")) || node.getAttribute("aria-label") || "");
+      const key = href || label || normalizeText(node.textContent || "").slice(0, 160);
       if (!key || seen.has(key)) continue;
       seen.add(key);
       out.push(node);
@@ -926,9 +1089,10 @@
 
   function safeClick(node) {
     if (!node) return;
-    node.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    node.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-    node.click();
+    const target = resolveCardLink(node) || node;
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    target.click();
   }
 
   async function waitForDetails(expectedIdentity, timeoutMs) {
@@ -1058,6 +1222,7 @@
       rows_count: rows.length,
       source_query: state.sourceQuery,
       source_url: state.sourceUrl,
+      filters: state.activeFilters,
       infinite_scroll: state.runInfiniteScroll,
       updated_at: new Date().toISOString()
     };
@@ -1073,6 +1238,9 @@
     }
     if (opts.error) {
       snapshot.error = normalizeText(opts.error);
+    }
+    if (opts.filters && typeof opts.filters === "object") {
+      snapshot.filters = { ...opts.filters };
     }
     snapshot.started_at = state.runStartedAtIso || new Date().toISOString();
     if (status === "done" || status === "stopped" || status === "error") {
@@ -1106,6 +1274,7 @@
       rows_count: state.rows.length,
       source_query: state.sourceQuery,
       source_url: state.sourceUrl,
+      filters: state.activeFilters,
       infinite_scroll: state.runInfiniteScroll,
       ...perf
     };
@@ -1117,12 +1286,14 @@
     state.runTabId = null;
     state.runStartedAtIso = "";
     state.runInfiniteScroll = false;
+    state.activeFilters = {};
     state.sourceQuery = "";
     state.sourceUrl = "";
     state.lastProgressPersistAtMs = 0;
     state.persistedRowsCount = 0;
     state.seenCardKeys = new Set();
     state.seenKeys = new Set();
+    state.websiteHostOwners = new Map();
     state.rows = [];
     state.startedAtMs = Date.now();
     state.seenListings = 0;
@@ -1147,6 +1318,7 @@
       matched: state.matched,
       duplicates: state.duplicates,
       fast_skipped: state.fastSkipped,
+      filters: state.activeFilters,
       ...perf,
       errors: state.errors
     };
@@ -1225,6 +1397,36 @@
       avg_rating_seen: state.seenRatingCount > 0 ? Number((state.seenRatingSum / state.seenRatingCount).toFixed(3)) : "",
       avg_reviews_seen: state.seenReviewsCount > 0 ? Number((state.seenReviewsSum / state.seenReviewsCount).toFixed(3)) : ""
     };
+  }
+
+  function normalizeRuntimeFilters(input) {
+    const source = input && typeof input === "object" ? input : {};
+    return {
+      minRating: parseFlexibleNumber(source.minRating),
+      maxRating: parseFlexibleNumber(source.maxRating),
+      minReviews: parseFlexibleNumber(source.minReviews),
+      maxReviews: parseFlexibleNumber(source.maxReviews),
+      nameKeyword: normalizeText(source.nameKeyword),
+      categoryInclude: normalizeText(source.categoryInclude),
+      categoryExclude: normalizeText(source.categoryExclude),
+      hasWebsite: source.hasWebsite === true,
+      hasPhone: source.hasPhone === true
+    };
+  }
+
+  function hasAnyActiveFilter(filters) {
+    const f = filters && typeof filters === "object" ? filters : {};
+    return (
+      f.minRating !== "" ||
+      f.maxRating !== "" ||
+      f.minReviews !== "" ||
+      f.maxReviews !== "" ||
+      normalizeText(f.nameKeyword) !== "" ||
+      normalizeText(f.categoryInclude) !== "" ||
+      normalizeText(f.categoryExclude) !== "" ||
+      f.hasWebsite === true ||
+      f.hasPhone === true
+    );
   }
 
   function sleep(ms) {

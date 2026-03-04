@@ -1,9 +1,10 @@
 (function () {
   const shared = window.GbpShared;
-  const { MSG, CSV_COLUMNS, COLUMN_LABELS, sanitizeColumns, normalizeText } = shared;
+  const { MSG, CSV_COLUMNS, COLUMN_LABELS, sanitizeColumns, normalizeText, normalizePhoneText } = shared;
   const MAX_RENDER_ROWS = 1000;
-  const URL_COLUMNS = new Set(["website", "maps_url", "source_url"]);
+  const URL_COLUMNS = new Set(["website", "maps_url", "source_url", "discovered_website"]);
   const EMAIL_COLUMNS = new Set(["email", "owner_email", "contact_email", "primary_email"]);
+  const PHONE_COLUMNS = new Set(["phone", "listing_phone", "website_phone"]);
   const requestedRunId = readRequestedRunId();
 
   const el = {
@@ -152,7 +153,8 @@
   }
 
   function renderCell(td, column, value) {
-    const clean = normalizeCell(value);
+    const rawClean = normalizeCell(value);
+    const clean = PHONE_COLUMNS.has(column) ? normalizePhoneText(rawClean) || rawClean : rawClean;
 
     if (!clean) {
       td.classList.add("empty-cell");
@@ -279,9 +281,10 @@
     }
 
     try {
+      const rowsForExport = rows.map((row) => normalizePhoneColumnsForExport(row, columns));
       const response = await sendRuntimeMessage({
         type: MSG.EXPORT_CSV,
-        rows,
+        rows: rowsForExport,
         columns: sanitizeColumns(columns),
         filename: defaultFilename()
       });
@@ -318,6 +321,17 @@
       }
     }
     return normalizeText(value);
+  }
+
+  function normalizePhoneColumnsForExport(row, columns) {
+    const source = row && typeof row === "object" ? row : {};
+    const out = { ...source };
+    for (const column of PHONE_COLUMNS) {
+      if (!columns.includes(column)) continue;
+      const normalized = normalizePhoneText(out[column]);
+      out[column] = normalized || normalizeText(out[column]);
+    }
+    return out;
   }
 
   function humanizeStatus(value) {
