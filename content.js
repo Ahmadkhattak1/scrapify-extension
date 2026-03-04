@@ -32,6 +32,7 @@
     sourceQuery: "",
     sourceUrl: "",
     lastProgressPersistAtMs: 0,
+    lastProgressDispatchAtMs: 0,
     persistedRowsCount: 0,
     seenCardKeys: new Set(),
     seenKeys: new Set(),
@@ -121,7 +122,18 @@
       force: true
     });
 
+    let progressHeartbeat = null;
     try {
+      progressHeartbeat = window.setInterval(() => {
+        if (!state.isRunning) return;
+        sendProgress({ force: true });
+      }, 500);
+    } catch (_error) {
+      progressHeartbeat = null;
+    }
+
+    try {
+      sendProgress({ force: true });
       let feed = await ensureResultsFeedReady(findResultsFeed(), 2600, { attemptBack: true });
       if (!feed) {
         throw new Error("Could not find Google Maps results list. Open a search results page first.");
@@ -165,6 +177,8 @@
           } else {
             noNewCardsScrolls += 1;
           }
+
+          sendProgress({ force: true });
 
           if (noNewCardsScrolls >= 10) {
             break;
@@ -284,6 +298,9 @@
       });
       throw error;
     } finally {
+      if (progressHeartbeat) {
+        clearInterval(progressHeartbeat);
+      }
       state.isRunning = false;
     }
   }
@@ -1144,17 +1161,101 @@
     if (!feed) return;
     const cards = getResultCards(feed);
     const lastCard = cards.length > 0 ? cards[cards.length - 1] : null;
-    const before = feed.scrollTop;
+    const targets = collectScrollTargets(feed, lastCard);
+    const beforeSnapshot = targets.map((node) => [node, readScrollTop(node)]);
+
+    const maxViewport = targets.reduce((acc, node) => {
+      const height = Number(node && node.clientHeight ? node.clientHeight : 0);
+      return Math.max(acc, height);
+    }, Math.max(window.innerHeight || 0, feed.clientHeight || 0));
+    const step = Math.max(720, Math.floor(maxViewport * 0.85));
+
     if (lastCard && typeof lastCard.scrollIntoView === "function") {
       lastCard.scrollIntoView({ block: "end", behavior: "auto" });
     }
-    feed.scrollTop = feed.scrollTop + Math.max(600, Math.floor(feed.clientHeight * 0.8));
-    await sleep(120);
-    if (feed.scrollTop === before) {
-      const wheel = new WheelEvent("wheel", { deltaY: 1200, bubbles: true, cancelable: true });
-      feed.dispatchEvent(wheel);
-      document.dispatchEvent(wheel);
+    for (const node of targets) {
+      writeScrollTop(node, readScrollTop(node) + step);
     }
+    await sleep(120);
+    const moved = beforeSnapshot.some(([node, before]) => readScrollTop(node) !== before);
+    if (!moved) {
+      const deltaY = Math.max(1000, step);
+      for (const node of targets.slice(0, 4)) {
+        dispatchScrollWheel(node, deltaY);
+      }
+      window.scrollBy(0, deltaY);
+      await sleep(120);
+    }
+  }
+
+  function collectScrollTargets(feed, lastCard) {
+    const out = [];
+    const seen = new Set();
+
+    const push = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      out.push(node);
+    };
+
+    const addScrollableAncestors = (startNode) => {
+      let current = startNode && startNode.nodeType === 1 ? startNode : null;
+      let depth = 0;
+      while (current && depth < 12) {
+        if (isLikelyScrollableElement(current)) {
+          push(current);
+        }
+        current = current.parentElement;
+        depth += 1;
+      }
+    };
+
+    if (lastCard) addScrollableAncestors(lastCard);
+    if (feed) addScrollableAncestors(feed);
+    push(feed);
+    push(document.scrollingElement);
+    push(document.documentElement);
+    push(document.body);
+    return out.filter(Boolean);
+  }
+
+  function isLikelyScrollableElement(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (node === document.documentElement || node === document.body) return true;
+    const style = window.getComputedStyle(node);
+    const overflowY = normalizeText(style.overflowY || style.overflow || "").toLowerCase();
+    if (!/(auto|scroll|overlay)/.test(overflowY)) return false;
+    return Number(node.scrollHeight || 0) - Number(node.clientHeight || 0) > 24;
+  }
+
+  function readScrollTop(node) {
+    if (!node) return 0;
+    if (node === document.documentElement || node === document.body || node === document.scrollingElement) {
+      return Number(window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0);
+    }
+    return Number(node.scrollTop || 0);
+  }
+
+  function writeScrollTop(node, value) {
+    const next = Number.isFinite(Number(value)) ? Number(value) : 0;
+    if (!node) return;
+    if (node === document.documentElement || node === document.body || node === document.scrollingElement) {
+      window.scrollTo(0, next);
+      return;
+    }
+    node.scrollTop = next;
+  }
+
+  function dispatchScrollWheel(node, deltaY) {
+    if (!node || typeof node.dispatchEvent !== "function") return;
+    const wheel = new WheelEvent("wheel", {
+      deltaY,
+      bubbles: true,
+      cancelable: true,
+      view: window
+    });
+    node.dispatchEvent(wheel);
   }
 
   function safeClick(node) {
@@ -1424,6 +1525,7 @@
     state.sourceQuery = "";
     state.sourceUrl = "";
     state.lastProgressPersistAtMs = 0;
+    state.lastProgressDispatchAtMs = 0;
     state.persistedRowsCount = 0;
     state.seenCardKeys = new Set();
     state.seenKeys = new Set();
@@ -1442,7 +1544,15 @@
     state.errors = 0;
   }
 
-  function sendProgress() {
+  function sendProgress(options) {
+    const opts = options && typeof options === "object" ? options : {};
+    const force = opts.force === true;
+    const now = Date.now();
+    if (!force && now - state.lastProgressDispatchAtMs < 180) {
+      return;
+    }
+    state.lastProgressDispatchAtMs = now;
+
     const perf = getPerformanceStats();
     const payload = {
       type: MSG.SCRAPE_PROGRESS,
