@@ -2966,7 +2966,8 @@ async function scanWebsite(startUrl, options) {
   };
   const normalizedStartUrl = normalizeBusinessWebsiteUrl(startUrl) || normalizeWebsiteUrl(startUrl) || startUrl;
   const baseOrigin = new URL(normalizedStartUrl).origin;
-  const firstUrl = canonicalizeCrawlUrl(normalizedStartUrl, baseOrigin) || stripHash(normalizedStartUrl) || normalizedStartUrl;
+  let firstUrl = canonicalizeCrawlUrl(normalizedStartUrl, baseOrigin) || stripHash(normalizedStartUrl) || normalizedStartUrl;
+  firstUrl = normalizeSeedScanUrl(firstUrl, baseOrigin);
   const startHost = hostnameForUrl(firstUrl) || hostnameForUrl(normalizedStartUrl);
   const socialRootScan = isSocialNetworkHost(startHost);
   const searchRootScan = isSearchEngineHost(startHost);
@@ -3452,27 +3453,108 @@ function buildSocialProbeUrls(url) {
 async function discoverLinksFromSitemap(tabId, baseOrigin, timeoutMs, intent) {
   const sitemapPaths = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"];
   const links = new Set();
+  const parseTimeoutMs = clampInt(timeoutMs, 2000, 7000, 4500);
+  const tabLoadTimeoutMs = clampInt(timeoutMs, 2000, 7000, 4500);
 
   for (const path of sitemapPaths) {
     const sitemapUrl = `${baseOrigin}${path}`;
-    try {
-      await updateTabUrl(tabId, sitemapUrl);
-      await waitForTabComplete(tabId, timeoutMs);
-      await sleep(500);
-      const extracted = await executeSitemapExtraction(tabId);
-      for (const rawLink of extracted) {
-        const normalized = normalizeWebsiteUrl(rawLink);
-        if (!normalized || !normalized.startsWith(baseOrigin)) continue;
-        links.add(normalized);
+    let extracted = await fetchSitemapLinks(sitemapUrl, parseTimeoutMs).catch(() => []);
+
+    // Fallback: if direct fetch fails, try tab-based extraction with strict timeouts.
+    if ((!Array.isArray(extracted) || extracted.length === 0) && Number.isFinite(Number(tabId))) {
+      try {
+        await promiseWithTimeout(updateTabUrl(tabId, sitemapUrl), tabLoadTimeoutMs, "Timed out while opening sitemap URL");
+        await promiseWithTimeout(waitForTabComplete(tabId, tabLoadTimeoutMs), tabLoadTimeoutMs, "Timed out while loading sitemap URL");
+        await sleep(220);
+        extracted = await promiseWithTimeout(
+          executeSitemapExtraction(tabId),
+          parseTimeoutMs,
+          "Timed out while parsing sitemap"
+        ).catch(() => []);
+      } catch (_error) {
+        extracted = [];
       }
-      if (links.size >= 120) break;
-    } catch (_error) {
-      // Try next sitemap path.
+    }
+
+    for (const rawLink of Array.isArray(extracted) ? extracted : []) {
+      const normalized = normalizeWebsiteUrl(rawLink);
+      if (!normalized || !normalized.startsWith(baseOrigin)) continue;
+      links.add(normalized);
+    }
+
+    if (links.size >= 120) {
+      break;
     }
   }
 
   const prioritized = prioritizeCrawlLinkEntries(Array.from(links), intent);
   return prioritized.slice(0, 120).map((entry) => entry.link);
+}
+
+async function fetchSitemapLinks(sitemapUrl, timeoutMs) {
+  const waitMs = clampInt(timeoutMs, 500, 120000, 4500);
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timeoutHandle = setTimeout(() => {
+    if (controller) {
+      controller.abort();
+    }
+  }, waitMs);
+
+  try {
+    const response = await fetch(sitemapUrl, {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      signal: controller ? controller.signal : undefined
+    });
+    if (!response || !response.ok) {
+      return [];
+    }
+
+    const contentType = normalizeText(response.headers && response.headers.get ? response.headers.get("content-type") : "").toLowerCase();
+    const bodyText = await promiseWithTimeout(response.text(), waitMs, "Timed out while reading sitemap body").catch(() => "");
+    return extractSitemapLinksFromText(bodyText, contentType);
+  } catch (_error) {
+    return [];
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+function extractSitemapLinksFromText(input, contentType) {
+  const text = normalizeText(input);
+  if (!text) return [];
+
+  const MAX_TEXT_CHARS = 450000;
+  const MAX_OUT_LINKS = 500;
+  const MAX_REGEX_MATCHES = 800;
+  const body = text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text;
+  const out = new Set();
+  const isLikelyXml = /\bxml\b/i.test(contentType) || /<urlset|<sitemapindex|<loc>/i.test(body);
+
+  if (isLikelyXml) {
+    const locRegex = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
+    let match = locRegex.exec(body);
+    while (match && out.size < MAX_OUT_LINKS) {
+      const value = normalizeText(match[1]).replace(/[),.;]+$/, "");
+      if (value) out.add(value);
+      match = locRegex.exec(body);
+    }
+  }
+
+  if (out.size === 0) {
+    const urlRegex = /https?:\/\/[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s<>"']*)?/gi;
+    let match = urlRegex.exec(body);
+    let guard = 0;
+    while (match && guard < MAX_REGEX_MATCHES && out.size < MAX_OUT_LINKS) {
+      const value = normalizeText(match[0]).replace(/[),.;]+$/, "");
+      if (value) out.add(value);
+      guard += 1;
+      match = urlRegex.exec(body);
+    }
+  }
+
+  return Array.from(out).slice(0, MAX_OUT_LINKS);
 }
 
 function executeSitemapExtraction(tabId) {
@@ -3500,23 +3582,39 @@ function executeSitemapExtraction(tabId) {
 
 function extractSitemapLinksScript() {
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const MAX_XML_LOCS = 500;
+  const MAX_TEXT_CHARS = 350000;
+  const MAX_REGEX_MATCHES = 700;
+  const MAX_OUT_LINKS = 500;
   const out = new Set();
 
-  const xmlNodes = Array.from(document.querySelectorAll("loc"));
+  const xmlNodes = Array.from(document.querySelectorAll("loc")).slice(0, MAX_XML_LOCS);
   for (const node of xmlNodes) {
     const value = normalize(node.textContent || "");
     if (value) out.add(value);
+    if (out.size >= MAX_OUT_LINKS) break;
   }
 
-  const bodyText = normalize((document.body && (document.body.innerText || document.body.textContent)) || "");
+  // XML sitemap pages are often huge; if we already got enough <loc> entries, skip regex fallback.
+  if (out.size > 0) {
+    return Array.from(out).slice(0, MAX_OUT_LINKS);
+  }
+
+  let bodyText = normalize((document.body && (document.body.innerText || document.body.textContent)) || "");
+  if (bodyText.length > MAX_TEXT_CHARS) {
+    bodyText = bodyText.slice(0, MAX_TEXT_CHARS);
+  }
   const regex = /https?:\/\/[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s<>"']*)?/gi;
-  const matches = bodyText.match(regex) || [];
-  for (const match of matches) {
-    const value = normalize(match).replace(/[),.;]+$/, "");
+  let match = regex.exec(bodyText);
+  let guard = 0;
+  while (match && guard < MAX_REGEX_MATCHES && out.size < MAX_OUT_LINKS) {
+    const value = normalize(match[0]).replace(/[),.;]+$/, "");
     if (value) out.add(value);
+    guard += 1;
+    match = regex.exec(bodyText);
   }
 
-  return Array.from(out).slice(0, 300);
+  return Array.from(out).slice(0, MAX_OUT_LINKS);
 }
 
 function pickBestOwner(candidates, emails, contextInput) {
@@ -4287,9 +4385,52 @@ function canonicalizeCrawlUrl(rawUrl, baseOrigin) {
   }
 }
 
+function normalizeSeedScanUrl(rawUrl, baseOrigin) {
+  const normalized = normalizeBusinessWebsiteUrl(rawUrl) || normalizeWebsiteUrl(rawUrl) || normalizeText(rawUrl);
+  const fallbackOrigin = normalizeText(baseOrigin);
+  if (!normalized) {
+    return fallbackOrigin ? `${fallbackOrigin}/` : "";
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    if (fallbackOrigin && parsed.origin !== fallbackOrigin) {
+      return `${fallbackOrigin}/`;
+    }
+
+    if (isSitemapLikePath(parsed.pathname)) {
+      return `${parsed.origin}/`;
+    }
+
+    const stripped = stripHash(parsed.toString());
+    return stripped || `${parsed.origin}/`;
+  } catch (_error) {
+    return fallbackOrigin ? `${fallbackOrigin}/` : normalized;
+  }
+}
+
+function isSitemapLikePath(pathname) {
+  const lowerPath = normalizeText(pathname).toLowerCase();
+  if (!lowerPath) return false;
+
+  if (/(^|\/)(sitemap|sitemap_index|sitemap-index)(\/|$)/i.test(lowerPath)) {
+    return true;
+  }
+
+  if (/\/sitemap[^/]*$/i.test(lowerPath)) {
+    return true;
+  }
+
+  return false;
+}
+
 function shouldSkipCrawlPath(pathname) {
   const lowerPath = normalizeText(pathname).toLowerCase();
   if (!lowerPath) return false;
+
+  if (isSitemapLikePath(lowerPath)) {
+    return true;
+  }
 
   if (/\.(pdf|zip|rar|7z|gz|png|jpg|jpeg|gif|svg|webp|mp4|mp3|avi|mov|ico|css|js|xml|json)$/i.test(lowerPath)) {
     return true;
@@ -4457,6 +4598,32 @@ function waitForTabComplete(tabId, timeoutMs) {
         finish(() => resolve(tab));
       }
     });
+  });
+}
+
+function promiseWithTimeout(promise, timeoutMs, message) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const waitMs = clampInt(timeoutMs, 250, 120000, 5000);
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(message || "Operation timed out"));
+    }, waitMs);
+
+    Promise.resolve(promise)
+      .then((value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        resolve(value);
+      })
+      .catch((error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        reject(error);
+      });
   });
 }
 
