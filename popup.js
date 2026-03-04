@@ -4,7 +4,9 @@
   const SCRAPE_SESSION_KEY = "scrapeSession";
   const ENRICH_SESSION_KEY = "enrichSession";
   const POPUP_UI_SETTINGS_KEY = "popupUiSettings";
+  const CONTROL_PANEL_ANCHOR_WINDOW_KEY = "controlPanelAnchorWindowId";
   const ACTIVE_SCRAPE_FILTERS_KEY = "activeScrapeFilters";
+  const EXTENSION_PAGE_PREFIX = chrome.runtime.getURL("");
   const EMAIL_COLUMNS = ["email", "owner_name", "owner_title", "owner_email", "contact_email"];
   const RAW_EMAIL_COLUMNS = ["owner_name", "owner_title", "owner_email", "contact_email"];
   const PHONE_COLUMNS = ["phone", "listing_phone", "website_phone", "website_phone_source"];
@@ -140,7 +142,6 @@
     columnsNoneBtn: document.getElementById("columnsNoneBtn"),
     startBtn: document.getElementById("startBtn"),
     stopBtn: document.getElementById("stopBtn"),
-    exportBtn: document.getElementById("exportBtn"),
     processed: document.getElementById("processed"),
     matched: document.getElementById("matched"),
     duplicates: document.getElementById("duplicates"),
@@ -223,7 +224,6 @@
   function bindEvents() {
     el.startBtn.addEventListener("click", onStart);
     el.stopBtn.addEventListener("click", onStop);
-    el.exportBtn.addEventListener("click", onExport);
     el.infiniteScroll.addEventListener("change", onInfiniteScrollToggle);
     el.enableEnrichment.addEventListener("change", onEnrichmentToggle);
     el.siteMaxPages.addEventListener("change", onSiteMaxPagesChange);
@@ -376,55 +376,6 @@
     }
   }
 
-  async function onExport() {
-    clearError();
-
-    if (!Array.isArray(lastRows)) {
-      setError("No rows to export.");
-      return;
-    }
-
-    if (!Array.isArray(selectedColumns) || selectedColumns.length === 0) {
-      setError("Select at least one export column.");
-      return;
-    }
-
-    if (!el.enableEnrichment.checked && selectedColumns.some(isEnrichmentColumn) && !rowsAlreadyEnriched(lastRows)) {
-      setError("You selected enrichment columns. Enable 'Enrich websites' to populate them.");
-      return;
-    }
-
-    if (enrichRunning) {
-      setError("Website enrichment is still running. Wait for it to finish, then export.");
-      return;
-    }
-
-    let rowsForExport = lastRows;
-
-    try {
-      if (el.enableEnrichment.checked) {
-        rowsForExport = await enrichRowsBestEffort(rowsForExport, { force: false });
-      }
-      rowsForExport = applyUnifiedOutputToRows(rowsForExport);
-
-      const filename = defaultFilename();
-      const response = await sendRuntimeMessage({
-        type: MSG.EXPORT_CSV,
-        rows: rowsForExport,
-        columns: sanitizeColumns(selectedColumns),
-        filename
-      });
-
-      if (!response || response.type !== MSG.EXPORT_DONE) {
-        throw new Error((response && response.error) || "CSV export failed");
-      }
-
-      setState(`Exported ${rowsForExport.length} row(s)`);
-    } catch (error) {
-      setError(error && error.message ? error.message : "CSV export failed");
-    }
-  }
-
   function onRuntimeMessage(message) {
     if (!message || !message.type) {
       return;
@@ -539,7 +490,6 @@
   function setRunningState(running) {
     el.startBtn.disabled = running;
     el.stopBtn.disabled = !(scrapeRunning || enrichRunning);
-    el.exportBtn.disabled = running || !Array.isArray(lastRows) || selectedColumns.length === 0;
   }
 
   function resetCounters() {
@@ -1060,12 +1010,75 @@
     });
   }
 
-  function getActiveTab() {
+  async function getActiveTab() {
+    const [anchorWindowId, currentWindowId] = await Promise.all([
+      getControlPanelAnchorWindowId(),
+      getCurrentWindowId()
+    ]);
+
+    if (Number.isFinite(anchorWindowId)) {
+      const anchoredTab = await queryActiveTabForWindow(anchorWindowId);
+      if (anchoredTab && !isExtensionTab(anchoredTab)) {
+        return anchoredTab;
+      }
+    }
+
+    const activeTabs = await queryActiveTabs();
+    const preferredTab = activeTabs.find((tab) => {
+      if (!tab || !tab.id || isExtensionTab(tab)) return false;
+      if (!Number.isFinite(currentWindowId)) return true;
+      return Number(tab.windowId) !== Number(currentWindowId);
+    });
+    if (preferredTab) {
+      return preferredTab;
+    }
+
+    const fallbackTab = activeTabs.find((tab) => tab && tab.id && !isExtensionTab(tab));
+    return fallbackTab || null;
+  }
+
+  function queryActiveTabForWindow(windowId) {
     return new Promise((resolve) => {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      chrome.tabs.query({ active: true, windowId }, (tabs) => {
         resolve(tabs && tabs[0] ? tabs[0] : null);
       });
     });
+  }
+
+  function queryActiveTabs() {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true }, (tabs) => {
+        resolve(Array.isArray(tabs) ? tabs : []);
+      });
+    });
+  }
+
+  function getCurrentWindowId() {
+    return new Promise((resolve) => {
+      chrome.windows.getCurrent({}, (windowRef) => {
+        if (chrome.runtime.lastError || !windowRef) {
+          resolve(null);
+          return;
+        }
+        const id = Number(windowRef.id);
+        resolve(Number.isFinite(id) ? id : null);
+      });
+    });
+  }
+
+  async function getControlPanelAnchorWindowId() {
+    try {
+      const data = await storageGet([CONTROL_PANEL_ANCHOR_WINDOW_KEY]);
+      const id = Number(data[CONTROL_PANEL_ANCHOR_WINDOW_KEY]);
+      return Number.isFinite(id) && id >= 0 ? id : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function isExtensionTab(tab) {
+    const url = normalizeText(tab && tab.url);
+    return url.startsWith(EXTENSION_PAGE_PREFIX);
   }
 
   function queryAllTabs() {

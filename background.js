@@ -24,6 +24,10 @@ const ENRICHMENT_SETTINGS_KEYS = [
   "discoveryGoogleEnabled"
 ];
 const RESULTS_PAGE_PATH = "results.html";
+const CONTROL_PANEL_PATH = "popup.html";
+const CONTROL_PANEL_ANCHOR_WINDOW_KEY = "controlPanelAnchorWindowId";
+const CONTROL_PANEL_WINDOW_WIDTH = 420;
+const CONTROL_PANEL_WINDOW_HEIGHT = 760;
 let lastEnrichPersistAtMs = 0;
 let activeEnrichRun = null;
 const autoOpenedResultsRunIds = new Set();
@@ -171,6 +175,74 @@ async function refreshActionBadge() {
   applyActionBadgeState(getBadgeSnapshot(scrapeSession, enrichSession));
 }
 
+function setControlPanelAnchorWindowId(windowId) {
+  const normalized = Number(windowId);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    return;
+  }
+  storageSet({
+    [CONTROL_PANEL_ANCHOR_WINDOW_KEY]: normalized
+  }).catch(() => {});
+}
+
+function openControlPanelWindow(url, anchorWindowId) {
+  const createOptions = {
+    url,
+    type: "popup",
+    focused: true,
+    width: CONTROL_PANEL_WINDOW_WIDTH,
+    height: CONTROL_PANEL_WINDOW_HEIGHT
+  };
+
+  const normalizedAnchorId = Number(anchorWindowId);
+  if (!Number.isFinite(normalizedAnchorId) || normalizedAnchorId < 0) {
+    chrome.windows.create(createOptions, () => {});
+    return;
+  }
+
+  chrome.windows.get(normalizedAnchorId, {}, (anchorWindow) => {
+    if (!chrome.runtime.lastError && anchorWindow && anchorWindow.type === "normal") {
+      const anchorLeft = Number(anchorWindow.left);
+      const anchorTop = Number(anchorWindow.top);
+      const anchorWidth = Number(anchorWindow.width);
+      if (Number.isFinite(anchorLeft) && Number.isFinite(anchorWidth)) {
+        createOptions.left = Math.max(0, anchorLeft + anchorWidth - CONTROL_PANEL_WINDOW_WIDTH - 24);
+      }
+      if (Number.isFinite(anchorTop)) {
+        createOptions.top = Math.max(0, anchorTop + 60);
+      }
+    }
+    chrome.windows.create(createOptions, () => {});
+  });
+}
+
+function openOrFocusControlPanel(anchorWindowId) {
+  const controlPanelUrl = chrome.runtime.getURL(CONTROL_PANEL_PATH);
+  const normalizedAnchorId = Number(anchorWindowId);
+  if (Number.isFinite(normalizedAnchorId) && normalizedAnchorId >= 0) {
+    setControlPanelAnchorWindowId(normalizedAnchorId);
+  }
+
+  chrome.tabs.query({ url: `${controlPanelUrl}*` }, (tabs) => {
+    if (chrome.runtime.lastError) {
+      openControlPanelWindow(controlPanelUrl, normalizedAnchorId);
+      return;
+    }
+
+    const existing = Array.isArray(tabs) ? tabs.find((tab) => tab && tab.id) : null;
+    if (!existing || !existing.id) {
+      openControlPanelWindow(controlPanelUrl, normalizedAnchorId);
+      return;
+    }
+
+    chrome.tabs.update(existing.id, { active: true }, () => {});
+    const existingWindowId = Number(existing.windowId);
+    if (Number.isFinite(existingWindowId) && existingWindowId >= 0) {
+      chrome.windows.update(existingWindowId, { focused: true }, () => {});
+    }
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || !message.type) {
     return false;
@@ -220,6 +292,27 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => {
   void refreshActionBadge();
+});
+
+chrome.action.onClicked.addListener((tab) => {
+  const anchorWindowId = Number(tab && tab.windowId);
+  openOrFocusControlPanel(Number.isFinite(anchorWindowId) ? anchorWindowId : null);
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  const focusedWindowId = Number(windowId);
+  if (!Number.isFinite(focusedWindowId) || focusedWindowId < 0) {
+    return;
+  }
+
+  chrome.windows.get(focusedWindowId, {}, (windowRef) => {
+    if (chrome.runtime.lastError || !windowRef) {
+      return;
+    }
+    if (windowRef.type === "normal") {
+      setControlPanelAnchorWindowId(focusedWindowId);
+    }
+  });
 });
 
 void refreshActionBadge();

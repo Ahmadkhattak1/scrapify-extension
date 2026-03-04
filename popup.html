@@ -1,174 +1,309 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>GBP Maps Scraper</title>
-    <link rel="stylesheet" href="popup.css" />
-  </head>
-  <body>
-    <main class="app">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GBP Maps Scraper</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+
+<body>
+  <main class="app">
+    <header class="app-header">
       <h1>GBP Maps Scraper</h1>
+    </header>
 
-      <section class="panel">
-        <label>
-          Max rows
-          <input id="maxRows" type="number" min="1" step="1" value="200" />
-        </label>
-        <label class="checkbox">
-          <input id="infiniteScroll" type="checkbox" />
-          Infinite scroll (ignore max rows)
-        </label>
-
-        <div class="row">
-          <label>
-            Min rating
-            <input id="minRating" type="number" min="0" max="5" step="0.1" placeholder="e.g. 4.2" />
-          </label>
-          <label>
-            Max rating
-            <input id="maxRating" type="number" min="0" max="5" step="0.1" placeholder="e.g. 4.8" />
-          </label>
+    <div class="scrollable-content">
+      <!-- Dashboard / Status Metrics -->
+      <section class="status-dashboard panel">
+        <div class="status-grid">
+          <div class="metric-card"><span>Processed</span><strong id="processed">0</strong></div>
+          <div class="metric-card"><span>Matched</span><strong id="matched">0</strong></div>
+          <div class="metric-card"><span>Duplicates</span><strong id="duplicates">0</strong></div>
+          <div class="metric-card"><span>Errors</span><strong id="errors" class="error-text">0</strong></div>
         </div>
 
-        <div class="row">
-          <label>
-            Min reviews
-            <input id="minReviews" type="number" min="0" step="1" placeholder="e.g. 50" />
-          </label>
-          <label>
-            Max reviews
-            <input id="maxReviews" type="number" min="0" step="1" placeholder="e.g. 500" />
-          </label>
-        </div>
-
-        <div class="row toggles">
-          <label class="checkbox">
-            <input id="hasWebsite" type="checkbox" />
-            Has website
-          </label>
-          <label class="checkbox">
-            <input id="hasPhone" type="checkbox" />
-            Has phone
-          </label>
-        </div>
-
-        <label class="checkbox">
-          <input id="enableEnrichment" type="checkbox" />
-          Enrich websites
-        </label>
-        <label>
-          Website pages per site (focused crawl)
-          <input id="siteMaxPages" type="number" min="1" max="120" step="1" value="12" />
-        </label>
-        <label>
-          Best email priority
-          <select id="emailPreference">
-            <option value="owner">Owner first (recommended)</option>
-            <option value="primary">Best auto first</option>
-            <option value="contact">Company first</option>
-          </select>
-        </label>
-        <label>
-          <span class="label-with-info">
-            Email columns
-            <span class="info-dot" title="Controls how many email columns are exported."></span>
-          </span>
-          <select id="emailOutputMode">
-            <option value="unified_only">Only best email (recommended)</option>
-            <option value="unified_plus_raw">Best email + owner/company</option>
-            <option value="raw_only">Owner/company only</option>
-          </select>
-        </label>
-        <p id="emailPreferenceHint" class="hint-text"></p>
-        <p id="emailColumnsHint" class="hint-text"></p>
-        <label>
-          Best phone priority
-          <select id="phonePreference">
-            <option value="listing">Listing first (recommended)</option>
-            <option value="website">Website first</option>
-          </select>
-        </label>
-        <label>
-          <span class="label-with-info">
-            Phone columns
-            <span class="info-dot" title="Controls how many phone columns are exported."></span>
-          </span>
-          <select id="phoneOutputMode">
-            <option value="unified_only">Only best phone (recommended)</option>
-            <option value="unified_plus_raw">Best phone + detailed fields</option>
-            <option value="raw_only">Detailed fields only</option>
-          </select>
-        </label>
-        <p id="phonePreferenceHint" class="hint-text"></p>
-        <p id="phoneColumnsHint" class="hint-text"></p>
-        <div class="row toggles">
-          <label class="checkbox">
-            <input id="showEnrichmentTabs" type="checkbox" />
-            Show tabs while enriching
-          </label>
-          <label class="checkbox">
-            <input id="scanSocialLinks" type="checkbox" checked />
-            Hunt email on Facebook links
-          </label>
-        </div>
-        <label class="checkbox">
-          <input id="leadDiscoveryEnabled" type="checkbox" />
-          Enable Google Search lead discovery
-        </label>
-        <label class="checkbox">
-          <input id="discoveryGoogleEnabled" type="checkbox" checked />
-          Google Search (top 3 results)
-        </label>
-
-        <section class="columns-block">
-          <div class="columns-head">
-            <strong id="columnsTitle">Export columns</strong>
-            <div class="columns-actions">
-              <button id="toggleAdvancedBtn" type="button" class="chip-btn">Advanced Off</button>
-              <button id="columnsAllBtn" type="button" class="chip-btn">All</button>
-              <button id="columnsNoneBtn" type="button" class="chip-btn">None</button>
+        <details class="dashboard-details">
+          <summary>View detailed metrics</summary>
+          <div class="metrics-grid">
+            <div class="metric"><span>Speed</span><strong id="speedStat">0.00/s</strong></div>
+            <div class="metric"><span>Seen</span><strong id="seenListingsStat">0</strong></div>
+            <div class="metric"><span>Avg Rating</span><strong id="avgRatingStat">-</strong></div>
+            <div class="metric"><span>Avg Reviews</span><strong id="avgReviewsStat">-</strong></div>
+          </div>
+          <div class="metrics-grid metrics-grid-3">
+            <div class="metric"><span>Site Pages Visited</span><strong id="crawlVisitedStat">0</strong></div>
+            <div class="metric"><span>Site Pages Found</span><strong id="crawlDiscoveredStat">0</strong></div>
+            <div class="metric"><span>Social Pages Scanned</span><strong id="socialScannedStat">0</strong></div>
+          </div>
+          <div class="metrics-grid metrics-grid-kpi">
+            <div class="metric highlight"><span>Emails Found</span><strong id="emailsFoundStat">0</strong></div>
+            <div class="metric highlight"><span>Discovery Emails</span><strong id="discoveryEmailsFoundStat">0</strong>
             </div>
           </div>
-          <div id="columnList" class="column-list"></div>
-        </section>
+        </details>
+
+        <div class="status-messages">
+          <p id="stateText">Ready</p>
+          <p id="leadSignalText" class="lead-signal"></p>
+          <p id="errorText" class="error"></p>
+        </div>
       </section>
 
-      <section class="actions">
-        <button id="startBtn" class="primary">Start Scrape</button>
-        <button id="stopBtn" disabled>Stop</button>
-        <button id="exportBtn" disabled>Export CSV</button>
-      </section>
+      <!-- Configuration Sections -->
+      <section class="config-sections">
+        <!-- 1. Core Filters -->
+        <details class="config-group panel" open>
+          <summary class="config-summary">
+            <div class="summary-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+              </svg>
+              Core Filters
+            </div>
+            <div class="chevron">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </div>
+          </summary>
+          <div class="config-content">
+            <div class="form-row">
+              <label class="input-group">
+                <span>Max rows</span>
+                <input id="maxRows" type="number" min="1" step="1" value="200" />
+              </label>
+              <label class="toggle-group row-toggle">
+                <span class="toggle-label">Infinite (ignore max)</span>
+                <div class="toggle">
+                  <input id="infiniteScroll" type="checkbox" class="toggle-checkbox" />
+                  <div class="toggle-switch"></div>
+                </div>
+              </label>
+            </div>
 
-      <section class="status panel">
-        <div class="status-grid">
-          <div><span>Processed</span><strong id="processed">0</strong></div>
-          <div><span>Matched</span><strong id="matched">0</strong></div>
-          <div><span>Duplicates</span><strong id="duplicates">0</strong></div>
-          <div><span>Errors</span><strong id="errors">0</strong></div>
-        </div>
-        <div class="metrics-grid">
-          <div><span>Speed</span><strong id="speedStat">0.00/s</strong></div>
-          <div><span>Seen</span><strong id="seenListingsStat">0</strong></div>
-          <div><span>Avg Rating</span><strong id="avgRatingStat">-</strong></div>
-          <div><span>Avg Reviews</span><strong id="avgReviewsStat">-</strong></div>
-        </div>
-        <div class="metrics-grid metrics-grid-3">
-          <div><span>Site Pages Visited</span><strong id="crawlVisitedStat">0</strong></div>
-          <div><span>Site Pages Found</span><strong id="crawlDiscoveredStat">0</strong></div>
-          <div><span>Social Pages Scanned</span><strong id="socialScannedStat">0</strong></div>
-        </div>
-        <div class="metrics-grid metrics-grid-kpi">
-          <div><span>Emails Found</span><strong id="emailsFoundStat">0</strong></div>
-          <div><span>Discovery Emails</span><strong id="discoveryEmailsFoundStat">0</strong></div>
-        </div>
-        <p id="stateText">Idle</p>
-        <p id="leadSignalText" class="lead-signal"></p>
-        <p id="errorText" class="error"></p>
-      </section>
-    </main>
+            <div class="form-row">
+              <label class="input-group">
+                <span>Min rating</span>
+                <input id="minRating" type="number" min="0" max="5" step="0.1" placeholder="e.g. 4.2" />
+              </label>
+              <label class="input-group">
+                <span>Max rating</span>
+                <input id="maxRating" type="number" min="0" max="5" step="0.1" placeholder="e.g. 4.8" />
+              </label>
+            </div>
 
-    <script src="shared.js"></script>
-    <script src="popup.js"></script>
-  </body>
+            <div class="form-row">
+              <label class="input-group">
+                <span>Min reviews</span>
+                <input id="minReviews" type="number" min="0" step="1" placeholder="e.g. 50" />
+              </label>
+              <label class="input-group">
+                <span>Max reviews</span>
+                <input id="maxReviews" type="number" min="0" step="1" placeholder="e.g. 500" />
+              </label>
+            </div>
+
+            <div class="form-row toggles-row">
+              <label class="toggle-group">
+                <span class="toggle-label">Has website</span>
+                <div class="toggle">
+                  <input id="hasWebsite" type="checkbox" class="toggle-checkbox" />
+                  <div class="toggle-switch"></div>
+                </div>
+              </label>
+              <label class="toggle-group">
+                <span class="toggle-label">Has phone</span>
+                <div class="toggle">
+                  <input id="hasPhone" type="checkbox" class="toggle-checkbox" />
+                  <div class="toggle-switch"></div>
+                </div>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <!-- 2. Enrichment Engine -->
+        <details class="config-group panel">
+          <summary class="config-summary">
+            <div class="summary-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+              </svg>
+              Enrichment Engine
+            </div>
+            <div class="chevron">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </div>
+          </summary>
+          <div class="config-content">
+            <div class="master-toggle">
+              <label class="toggle-group large">
+                <span class="toggle-label"><strong>Enrich websites</strong> (Deep Crawl)</span>
+                <div class="toggle">
+                  <input id="enableEnrichment" type="checkbox" class="toggle-checkbox" />
+                  <div class="toggle-switch"></div>
+                </div>
+              </label>
+            </div>
+
+            <div class="enrichment-settings">
+              <label class="input-group">
+                <span>Website pages per site (focused crawl)</span>
+                <input id="siteMaxPages" type="number" min="1" max="120" step="1" value="12" />
+              </label>
+
+              <div class="form-row">
+                <label class="input-group">
+                  <span>Best email priority</span>
+                  <select id="emailPreference">
+                    <option value="owner">Owner first (rec.)</option>
+                    <option value="primary">Best auto first</option>
+                    <option value="contact">Company first</option>
+                  </select>
+                </label>
+                <label class="input-group">
+                  <span class="label-with-info">
+                    Email columns
+                    <span class="info-dot" title="Controls how many email columns are exported."></span>
+                  </span>
+                  <select id="emailOutputMode">
+                    <option value="unified_only">Best only (rec.)</option>
+                    <option value="unified_plus_raw">Best + raw</option>
+                    <option value="raw_only">Raw only</option>
+                  </select>
+                </label>
+              </div>
+              <div class="hints">
+                <p id="emailPreferenceHint" class="hint-text"></p>
+                <p id="emailColumnsHint" class="hint-text"></p>
+              </div>
+
+              <div class="form-row">
+                <label class="input-group">
+                  <span>Best phone priority</span>
+                  <select id="phonePreference">
+                    <option value="listing">Listing first (rec.)</option>
+                    <option value="website">Website first</option>
+                  </select>
+                </label>
+                <label class="input-group">
+                  <span class="label-with-info">
+                    Phone columns
+                    <span class="info-dot" title="Controls how many phone columns are exported."></span>
+                  </span>
+                  <select id="phoneOutputMode">
+                    <option value="unified_only">Best only (rec.)</option>
+                    <option value="unified_plus_raw">Best + raw</option>
+                    <option value="raw_only">Raw only</option>
+                  </select>
+                </label>
+              </div>
+              <div class="hints">
+                <p id="phonePreferenceHint" class="hint-text"></p>
+                <p id="phoneColumnsHint" class="hint-text"></p>
+              </div>
+
+              <div class="advanced-toggles">
+                <label class="toggle-group">
+                  <span class="toggle-label">Show tabs while enriching</span>
+                  <div class="toggle">
+                    <input id="showEnrichmentTabs" type="checkbox" class="toggle-checkbox" />
+                    <div class="toggle-switch"></div>
+                  </div>
+                </label>
+                <label class="toggle-group">
+                  <span class="toggle-label">Hunt email on Facebook links</span>
+                  <div class="toggle">
+                    <input id="scanSocialLinks" type="checkbox" class="toggle-checkbox" checked />
+                    <div class="toggle-switch"></div>
+                  </div>
+                </label>
+              </div>
+
+              <div class="discovery-section">
+                <label class="toggle-group large secondary">
+                  <span class="toggle-label">Enable Google Search lead discovery</span>
+                  <div class="toggle">
+                    <input id="leadDiscoveryEnabled" type="checkbox" class="toggle-checkbox" />
+                    <div class="toggle-switch"></div>
+                  </div>
+                </label>
+                <label class="toggle-group sub-toggle">
+                  <span class="toggle-label">Google Search (top 3 results)</span>
+                  <div class="toggle">
+                    <input id="discoveryGoogleEnabled" type="checkbox" class="toggle-checkbox" checked />
+                    <div class="toggle-switch"></div>
+                  </div>
+                </label>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- 3. Export Config -->
+        <details class="config-group panel">
+          <summary class="config-summary">
+            <div class="summary-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              Export Columns
+            </div>
+            <div class="chevron">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </div>
+          </summary>
+          <div class="config-content columns-block">
+            <div class="columns-head">
+              <strong id="columnsTitle">Configure Export</strong>
+              <div class="columns-actions">
+                <button id="toggleAdvancedBtn" type="button" class="chip-btn outline">Basic</button>
+                <button id="columnsAllBtn" type="button" class="chip-btn outline">All</button>
+                <button id="columnsNoneBtn" type="button" class="chip-btn outline">None</button>
+              </div>
+            </div>
+            <div id="columnList" class="column-list"></div>
+          </div>
+        </details>
+      </section>
+    </div>
+
+    <!-- Sticky Footer Actions -->
+    <footer class="app-footer">
+      <div class="action-row flex flex-wrap items-center gap-2 md:flex-row justify-end">
+
+        <button id="stopBtn" class="btn btn-outline btn-size-icon" disabled aria-label="Stop scraping" title="Stop">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          </svg>
+          <span class="sr-only">Stop</span>
+        </button>
+
+        <button id="startBtn" class="btn btn-default btn-size-default" title="Start scraping results">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12h14"></path>
+            <path d="M12 5v14"></path>
+          </svg>
+          <span>Start Scrape</span>
+        </button>
+      </div>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script src="popup.js"></script>
+
 </html>

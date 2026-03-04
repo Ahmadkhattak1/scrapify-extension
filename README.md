@@ -58,7 +58,7 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 
 ## Usage
 1. Open [Google Maps](https://www.google.com/maps) and run a search (example: `dentists in chicago`).
-2. Open the extension popup.
+2. Click the extension icon to open the scraper control panel popup window (it stays open while you switch tabs).
 3. Configure max rows and optional filters.
 4. Optional: enable **Infinite scroll** to ignore max rows.
 5. Choose export columns (All/None or individual checkboxes).
