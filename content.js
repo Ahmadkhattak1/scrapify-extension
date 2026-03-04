@@ -122,7 +122,7 @@
     });
 
     try {
-      const feed = findResultsFeed();
+      let feed = await ensureResultsFeedReady(findResultsFeed(), 2600, { attemptBack: true });
       if (!feed) {
         throw new Error("Could not find Google Maps results list. Open a search results page first.");
       }
@@ -130,6 +130,12 @@
       let noNewCardsScrolls = 0;
 
       while (!state.stopRequested) {
+        const resolvedFeed = await ensureResultsFeedReady(feed, 2600, { attemptBack: true });
+        if (!resolvedFeed) {
+          throw new Error("Could not return to Google Maps results list. Keep the results panel open and try again.");
+        }
+        feed = resolvedFeed;
+
         const cards = getResultCards(feed);
         const unseenCards = [];
 
@@ -143,6 +149,11 @@
         if (unseenCards.length === 0) {
           await scrollResults(feed);
           await sleep(700);
+
+          const scrolledFeed = await ensureResultsFeedReady(feed, 1200, { attemptBack: false });
+          if (scrolledFeed) {
+            feed = scrolledFeed;
+          }
 
           const hasAnyNewCards = getResultCards(feed).some((card) => {
             const cardKey = getCardIdentity(card);
@@ -211,6 +222,10 @@
           }
 
           await sleep(250);
+          const refreshedFeed = await ensureResultsFeedReady(feed, 1400, { attemptBack: true });
+          if (refreshedFeed) {
+            feed = refreshedFeed;
+          }
         }
 
         if (!infiniteScroll && state.rows.length >= maxRows) {
@@ -773,15 +788,47 @@
   function resolveCardLink(card) {
     if (!card) return null;
     if (card.tagName === "A") return card;
-    return card.closest("a[href*='/maps/place/']") || card.querySelector("a[href*='/maps/place/']");
+    const selectors = [
+      "a.hfpxzc[href]",
+      "a[href*='/maps/place/']",
+      "a[href*='/maps/search/']",
+      "a[href*='?cid=']",
+      "a[href]"
+    ];
+    for (const selector of selectors) {
+      const found = card.closest(selector) || card.querySelector(selector);
+      if (found) return found;
+    }
+    return null;
   }
 
   function getCardIdentity(card) {
+    if (!card) return "";
     const link = resolveCardLink(card);
-    if (!link) return "";
-    const href = normalizeMapsUrl(link.href || link.getAttribute("href") || "");
-    const label = normalizeText(link.getAttribute("aria-label") || "");
-    return `${href}::${label}`;
+    const href = normalizeMapsUrl((link && (link.href || link.getAttribute("href"))) || "");
+    const placeId = normalizeText(parsePlaceIdFromUrl(href));
+    const label = normalizeText(
+      (link && link.getAttribute("aria-label")) ||
+      card.getAttribute("aria-label") ||
+      ""
+    );
+    const dataId =
+      normalizeText(card.getAttribute("data-result-id")) ||
+      normalizeText(card.getAttribute("data-cid")) ||
+      normalizeText(card.getAttribute("data-place-id")) ||
+      normalizeText(card.getAttribute("jslog")) ||
+      normalizeText(link && link.getAttribute("data-result-id")) ||
+      normalizeText(link && link.getAttribute("data-cid")) ||
+      normalizeText(link && link.getAttribute("data-place-id")) ||
+      normalizeText(link && link.getAttribute("jslog"));
+    const textSnippet = normalizeText(getCardText(card)).slice(0, 140).toLowerCase();
+
+    if (placeId) return `place:${placeId.toLowerCase()}`;
+    if (href) return `url:${href.toLowerCase()}`;
+    if (dataId) return `data:${dataId.toLowerCase()}`;
+    if (label) return `label:${label.toLowerCase()}`;
+    if (textSnippet) return `text:${textSnippet}`;
+    return "";
   }
 
   function parsePlaceIdFromUrl(url) {
@@ -1020,19 +1067,35 @@
   }
 
   function findResultsFeed() {
-    return (
+    return findResultsFeedWithCards() ||
       document.querySelector("div[role='feed']") ||
-      document.querySelector("div[aria-label*='Results']") ||
-      document.querySelector("div.m6QErb.DxyBCb")
+      document.querySelector("div[aria-label*='Results' i]") ||
+      document.querySelector("div.m6QErb.DxyBCb");
+  }
+
+  function findResultsFeedWithCards() {
+    const feeds = Array.from(
+      document.querySelectorAll("div[role='feed'], div[aria-label*='Results' i], div.m6QErb.DxyBCb")
     );
+    for (const feed of feeds) {
+      if (!feed || !document.contains(feed)) continue;
+      if (getResultCards(feed).length > 0) {
+        return feed;
+      }
+    }
+    return null;
   }
 
   function getResultCards(feed) {
     if (!feed) return [];
     const selectors = [
+      "div[role='article']",
+      "div.Nv2PK",
       "a.hfpxzc",
       "div[role='article'] a[href*='/maps/place/']",
-      "a[href*='/maps/place/']"
+      "a[href*='/maps/place/']",
+      "a[href*='/maps/search/']",
+      "a[href*='?cid=']"
     ];
 
     for (const selector of selectors) {
@@ -1079,10 +1142,18 @@
 
   async function scrollResults(feed) {
     if (!feed) return;
+    const cards = getResultCards(feed);
+    const lastCard = cards.length > 0 ? cards[cards.length - 1] : null;
     const before = feed.scrollTop;
+    if (lastCard && typeof lastCard.scrollIntoView === "function") {
+      lastCard.scrollIntoView({ block: "end", behavior: "auto" });
+    }
     feed.scrollTop = feed.scrollTop + Math.max(600, Math.floor(feed.clientHeight * 0.8));
+    await sleep(120);
     if (feed.scrollTop === before) {
-      feed.dispatchEvent(new WheelEvent("wheel", { deltaY: 1000 }));
+      const wheel = new WheelEvent("wheel", { deltaY: 1200, bubbles: true, cancelable: true });
+      feed.dispatchEvent(wheel);
+      document.dispatchEvent(wheel);
     }
   }
 
@@ -1104,6 +1175,70 @@
       await sleep(120);
     }
     return false;
+  }
+
+  async function ensureResultsFeedReady(feed, timeoutMs, options) {
+    const limitMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : 2200;
+    const opts = options && typeof options === "object" ? options : {};
+    const attemptBack = opts.attemptBack !== false;
+    const deadline = Date.now() + limitMs;
+
+    let resolvedFeed = resolveFeedWithCards(feed);
+    if (resolvedFeed) return resolvedFeed;
+
+    while (Date.now() < deadline) {
+      if (attemptBack && isDetailPanelVisible()) {
+        await attemptReturnToResultsList();
+      }
+
+      resolvedFeed = resolveFeedWithCards(feed);
+      if (resolvedFeed) return resolvedFeed;
+      await sleep(150);
+    }
+
+    return null;
+  }
+
+  function resolveFeedWithCards(preferredFeed) {
+    if (preferredFeed && document.contains(preferredFeed) && getResultCards(preferredFeed).length > 0) {
+      return preferredFeed;
+    }
+    return findResultsFeedWithCards();
+  }
+
+  function isDetailPanelVisible() {
+    return Boolean(
+      document.querySelector("h1.DUwDvf") ||
+      document.querySelector("[role='main'] h1") ||
+      document.querySelector("button[aria-label*='Back' i][jsaction*='back']")
+    );
+  }
+
+  async function attemptReturnToResultsList() {
+    const backSelectors = [
+      "button[aria-label*='Back to results' i]",
+      "button[jsaction*='pane.place.backToList']",
+      "button[jsaction*='back']",
+      "button[aria-label='Back']"
+    ];
+
+    for (const selector of backSelectors) {
+      const candidates = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+      if (candidates.length === 0) continue;
+      safeClick(candidates[0]);
+      await sleep(450);
+      if (findResultsFeedWithCards()) {
+        return true;
+      }
+    }
+
+    try {
+      window.history.back();
+    } catch (_error) {
+      return false;
+    }
+    await sleep(500);
+    return Boolean(findResultsFeedWithCards());
   }
 
   function isDetailPanelMatch(expectedIdentity) {

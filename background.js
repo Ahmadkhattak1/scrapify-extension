@@ -111,6 +111,20 @@ function normalizeSessionStatus(value) {
   return status;
 }
 
+function isCurrentContextIncognito() {
+  try {
+    return chrome.extension && chrome.extension.inIncognitoContext === true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function tabMatchesCurrentContext(tab) {
+  if (!tab || typeof tab !== "object") return false;
+  if (typeof tab.incognito !== "boolean") return true;
+  return tab.incognito === isCurrentContextIncognito();
+}
+
 function isActiveStatus(status) {
   const value = normalizeSessionStatus(status);
   return value === "running" || value === "stopping" || value === "queued";
@@ -191,7 +205,8 @@ function openControlPanelWindow(url, anchorWindowId) {
     type: "popup",
     focused: true,
     width: CONTROL_PANEL_WINDOW_WIDTH,
-    height: CONTROL_PANEL_WINDOW_HEIGHT
+    height: CONTROL_PANEL_WINDOW_HEIGHT,
+    incognito: isCurrentContextIncognito()
   };
 
   const normalizedAnchorId = Number(anchorWindowId);
@@ -202,6 +217,9 @@ function openControlPanelWindow(url, anchorWindowId) {
 
   chrome.windows.get(normalizedAnchorId, {}, (anchorWindow) => {
     if (!chrome.runtime.lastError && anchorWindow && anchorWindow.type === "normal") {
+      if (typeof anchorWindow.incognito === "boolean") {
+        createOptions.incognito = anchorWindow.incognito;
+      }
       const anchorLeft = Number(anchorWindow.left);
       const anchorTop = Number(anchorWindow.top);
       const anchorWidth = Number(anchorWindow.width);
@@ -229,7 +247,9 @@ function openOrFocusControlPanel(anchorWindowId) {
       return;
     }
 
-    const existing = Array.isArray(tabs) ? tabs.find((tab) => tab && tab.id) : null;
+    const existing = Array.isArray(tabs)
+      ? tabs.find((tab) => tab && tab.id && tabMatchesCurrentContext(tab))
+      : null;
     if (!existing || !existing.id) {
       openControlPanelWindow(controlPanelUrl, normalizedAnchorId);
       return;

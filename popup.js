@@ -1011,6 +1011,7 @@
   }
 
   async function getActiveTab() {
+    const inIncognitoContext = isCurrentContextIncognito();
     const [anchorWindowId, currentWindowId] = await Promise.all([
       getControlPanelAnchorWindowId(),
       getCurrentWindowId()
@@ -1018,7 +1019,7 @@
 
     if (Number.isFinite(anchorWindowId)) {
       const anchoredTab = await queryActiveTabForWindow(anchorWindowId);
-      if (anchoredTab && !isExtensionTab(anchoredTab)) {
+      if (anchoredTab && !isExtensionTab(anchoredTab) && tabMatchesContext(anchoredTab, inIncognitoContext)) {
         return anchoredTab;
       }
     }
@@ -1026,11 +1027,17 @@
     const activeTabs = await queryActiveTabs();
     const preferredTab = activeTabs.find((tab) => {
       if (!tab || !tab.id || isExtensionTab(tab)) return false;
+      if (!tabMatchesContext(tab, inIncognitoContext)) return false;
       if (!Number.isFinite(currentWindowId)) return true;
       return Number(tab.windowId) !== Number(currentWindowId);
     });
     if (preferredTab) {
       return preferredTab;
+    }
+
+    const contextFallback = activeTabs.find((tab) => tab && tab.id && !isExtensionTab(tab) && tabMatchesContext(tab, inIncognitoContext));
+    if (contextFallback) {
+      return contextFallback;
     }
 
     const fallbackTab = activeTabs.find((tab) => tab && tab.id && !isExtensionTab(tab));
@@ -1079,6 +1086,20 @@
   function isExtensionTab(tab) {
     const url = normalizeText(tab && tab.url);
     return url.startsWith(EXTENSION_PAGE_PREFIX);
+  }
+
+  function isCurrentContextIncognito() {
+    try {
+      return chrome.extension && chrome.extension.inIncognitoContext === true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function tabMatchesContext(tab, inIncognitoContext) {
+    if (!tab || typeof tab !== "object") return false;
+    if (typeof tab.incognito !== "boolean") return true;
+    return tab.incognito === inIncognitoContext;
   }
 
   function queryAllTabs() {

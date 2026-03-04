@@ -5,6 +5,7 @@
   "description": "Scrape Google Maps GBP listings with filters and export to CSV.",
   "permissions": ["activeTab", "tabs", "storage", "downloads", "scripting"],
   "host_permissions": ["https://www.google.com/maps/*", "https://*/*", "http://*/*"],
+  "incognito": "split",
   "background": {
     "service_worker": "background.js"
   },

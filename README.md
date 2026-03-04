@@ -4,6 +4,7 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 
 ## Features
 - Scrape from active Google Maps search results page
+- Incognito-aware run isolation (`incognito: split`) so incognito runs stay separate from regular browsing session
 - Built-in filters:
   - minimum rating
   - maximum rating
@@ -55,6 +56,7 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 3. Click **Load unpacked**.
 4. Select this folder:
    - `/Users/ahmadkhattak/Downloads/14-days-100-dollars-challenge/scrapify`
+5. Optional (for private runs): in extension details, enable **Allow in Incognito**.
 
 ## Usage
 1. Open [Google Maps](https://www.google.com/maps) and run a search (example: `dentists in chicago`).
@@ -80,6 +82,7 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 - Existing Maps website is preserved when present; alternate discovery domains are stored in discovery metadata fields.
 - Some websites block automation (CAPTCHA/anti-bot); blocked scans are marked and skipped.
 - One active query per run.
+- In incognito windows, extension state/storage is isolated from the regular profile.
 
 ## Compliance
 You are responsible for complying with Google terms, local law, and privacy/data-use obligations.
