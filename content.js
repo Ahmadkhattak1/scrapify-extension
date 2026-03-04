@@ -165,6 +165,7 @@
 
         for (const card of unseenCards) {
           if (state.stopRequested) break;
+          state.processed += 1;
 
           const quickData = buildQuickCardData(card);
           const seenCapture = updateSeenStats(quickData);
@@ -180,7 +181,6 @@
               await processCard(card, sourceQuery, sourceUrl),
               quickData
             );
-            state.processed += 1;
             backfillSeenStatsFromRow(row, seenCapture);
 
             if (row && applyFilters(row, filters)) {
@@ -206,7 +206,6 @@
               break;
             }
           } catch (_cardErr) {
-            state.processed += 1;
             state.errors += 1;
             sendProgress();
           }
