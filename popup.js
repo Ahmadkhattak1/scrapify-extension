@@ -128,6 +128,7 @@
     showEnrichmentTabs: document.getElementById("showEnrichmentTabs"),
     scanSocialLinks: document.getElementById("scanSocialLinks"),
     requireEmailForLeads: document.getElementById("requireEmailForLeads"),
+    aggressiveEmailHunt: document.getElementById("aggressiveEmailHunt"),
     leadDiscoveryEnabled: document.getElementById("leadDiscoveryEnabled"),
     discoveryGoogleEnabled: document.getElementById("discoveryGoogleEnabled"),
     minRating: document.getElementById("minRating"),
@@ -180,6 +181,7 @@
   let showEnrichmentTabsEnabled = false;
   let scanSocialLinksEnabled = true;
   let requireEmailForLeadsEnabled = true;
+  let aggressiveEmailHuntEnabled = false;
   let leadDiscoveryEnabled = false;
   let discoveryGoogleEnabled = true;
   let scrapeRunTabId = null;
@@ -206,6 +208,9 @@
     el.scanSocialLinks.checked = scanSocialLinksEnabled;
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
+    }
+    if (el.aggressiveEmailHunt) {
+      el.aggressiveEmailHunt.checked = aggressiveEmailHuntEnabled;
     }
     el.leadDiscoveryEnabled.checked = leadDiscoveryEnabled;
     el.discoveryGoogleEnabled.checked = discoveryGoogleEnabled;
@@ -240,6 +245,9 @@
     el.scanSocialLinks.addEventListener("change", onScanSocialLinksToggle);
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.addEventListener("change", onRequireEmailForLeadsToggle);
+    }
+    if (el.aggressiveEmailHunt) {
+      el.aggressiveEmailHunt.addEventListener("change", onAggressiveEmailHuntToggle);
     }
     el.leadDiscoveryEnabled.addEventListener("change", onLeadDiscoveryToggle);
     el.discoveryGoogleEnabled.addEventListener("change", onDiscoveryGoogleToggle);
@@ -542,6 +550,7 @@
         "showEnrichmentTabsEnabled",
         "scanSocialLinksEnabled",
         "requireEmailForLeadsEnabled",
+        "aggressiveEmailHuntEnabled",
         "leadDiscoveryEnabled",
         "discoveryGoogleEnabled"
       ]);
@@ -557,6 +566,7 @@
       showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
       scanSocialLinksEnabled = data.scanSocialLinksEnabled !== false;
       requireEmailForLeadsEnabled = data.requireEmailForLeadsEnabled !== false;
+      aggressiveEmailHuntEnabled = data.aggressiveEmailHuntEnabled === true;
       leadDiscoveryEnabled = data.leadDiscoveryEnabled === true;
       discoveryGoogleEnabled = data.discoveryGoogleEnabled !== false;
       applySavedUiSettings(data[POPUP_UI_SETTINGS_KEY]);
@@ -623,6 +633,12 @@
         el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
       }
     }
+    if (changes.aggressiveEmailHuntEnabled) {
+      aggressiveEmailHuntEnabled = changes.aggressiveEmailHuntEnabled.newValue === true;
+      if (el.aggressiveEmailHunt) {
+        el.aggressiveEmailHunt.checked = aggressiveEmailHuntEnabled;
+      }
+    }
     if (changes.discoveryGoogleEnabled) {
       discoveryGoogleEnabled = changes.discoveryGoogleEnabled.newValue !== false;
       if (el.discoveryGoogleEnabled) {
@@ -641,6 +657,9 @@
     phoneOutputModeValue = normalizeOutputMode(saved.phoneOutputMode);
     if (saved.requireEmailForLeads != null) {
       requireEmailForLeadsEnabled = saved.requireEmailForLeads !== false;
+    }
+    if (saved.aggressiveEmailHunt != null) {
+      aggressiveEmailHuntEnabled = saved.aggressiveEmailHunt === true;
     }
     showAdvancedFields = saved.showAdvancedFields === true;
 
@@ -665,6 +684,9 @@
     }
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
+    }
+    if (el.aggressiveEmailHunt) {
+      el.aggressiveEmailHunt.checked = aggressiveEmailHuntEnabled;
     }
     if (!showAdvancedFields && Array.isArray(selectedColumns)) {
       selectedColumns = normalizeSelectedColumns(selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)));
@@ -1179,7 +1201,7 @@
 
   function normalizeEmailPreference(value) {
     const normalized = normalizeText(value).toLowerCase();
-    if (normalized === "primary" || normalized === "contact" || normalized === "owner") {
+    if (normalized === "primary" || normalized === "contact" || normalized === "owner" || normalized === "personal_then_company") {
       return normalized;
     }
     return "owner";
@@ -1203,6 +1225,9 @@
 
   function getEmailPrecedence(preferenceValue) {
     const preference = normalizeEmailPreference(preferenceValue);
+    if (preference === "personal_then_company") {
+      return ["Owner Email", "Company Email", "Best Auto Email"];
+    }
     if (preference === "primary") {
       return ["Best Auto Email", "Owner Email", "Company Email"];
     }
@@ -1290,6 +1315,8 @@
         ? [primaryEmail, ownerEmail, contactEmail]
         : preference === "contact"
           ? [contactEmail, primaryEmail, ownerEmail]
+          : preference === "personal_then_company"
+            ? [ownerEmail, contactEmail, primaryEmail]
           : [ownerEmail, primaryEmail, contactEmail];
 
     return precedence.find((email) => email !== "") || "";
@@ -1343,6 +1370,7 @@
       phonePreference: phonePreferenceValue,
       phoneOutputMode: phoneOutputModeValue,
       requireEmailForLeads: requireEmailForLeadsEnabled,
+      aggressiveEmailHunt: aggressiveEmailHuntEnabled,
       showAdvancedFields: showAdvancedFields === true,
       minRating: sanitizeFormString(el.minRating.value),
       maxRating: sanitizeFormString(el.maxRating.value),
@@ -1449,6 +1477,12 @@
     schedulePersistUiSettings();
   }
 
+  function onAggressiveEmailHuntToggle() {
+    aggressiveEmailHuntEnabled = Boolean(el.aggressiveEmailHunt && el.aggressiveEmailHunt.checked === true);
+    storageSet({ aggressiveEmailHuntEnabled }).catch(() => {});
+    schedulePersistUiSettings();
+  }
+
   function onLeadDiscoveryToggle() {
     leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
     storageSet({ leadDiscoveryEnabled }).catch(() => {});
@@ -1485,6 +1519,7 @@
     showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked === true;
     scanSocialLinksEnabled = el.scanSocialLinks.checked === true;
     requireEmailForLeadsEnabled = !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false;
+    aggressiveEmailHuntEnabled = Boolean(el.aggressiveEmailHunt && el.aggressiveEmailHunt.checked === true);
     leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
     discoveryGoogleEnabled = el.discoveryGoogleEnabled.checked === true;
     el.siteMaxPages.value = String(siteMaxPagesValue);
@@ -1505,6 +1540,7 @@
       showEnrichmentTabsEnabled,
       scanSocialLinksEnabled,
       requireEmailForLeadsEnabled,
+      aggressiveEmailHuntEnabled,
       leadDiscoveryEnabled,
       discoveryGoogleEnabled,
       [ACTIVE_SCRAPE_FILTERS_KEY]: activeScrapeFilters
@@ -1897,6 +1933,7 @@
           visibleTabs: Boolean(el.showEnrichmentTabs.checked),
           scanSocialLinks: Boolean(el.scanSocialLinks.checked),
           requireEmail: !el.requireEmailForLeads || Boolean(el.requireEmailForLeads.checked),
+          aggressiveEmailHunt: Boolean(el.aggressiveEmailHunt && el.aggressiveEmailHunt.checked),
           maxSocialPages: 2,
           leadDiscoveryEnabled: Boolean(el.leadDiscoveryEnabled.checked),
           discoverySources: {

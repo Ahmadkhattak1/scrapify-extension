@@ -163,6 +163,7 @@
                   <span>Best email priority</span>
                   <select id="emailPreference">
                     <option value="owner">Owner first (rec.)</option>
+                    <option value="personal_then_company">Personal, then company</option>
                     <option value="primary">Best auto first</option>
                     <option value="contact">Company first</option>
                   </select>
@@ -228,6 +229,13 @@
                   <span class="toggle-label">Keep only leads with email</span>
                   <div class="toggle">
                     <input id="requireEmailForLeads" type="checkbox" class="toggle-checkbox" checked />
+                    <div class="toggle-switch"></div>
+                  </div>
+                </label>
+                <label class="toggle-group">
+                  <span class="toggle-label">Aggressive email hunt (slower)</span>
+                  <div class="toggle">
+                    <input id="aggressiveEmailHunt" type="checkbox" class="toggle-checkbox" />
                     <div class="toggle-switch"></div>
                   </div>
                 </label>

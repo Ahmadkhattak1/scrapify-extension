@@ -21,6 +21,7 @@ const ENRICHMENT_SETTINGS_KEYS = [
   "showEnrichmentTabsEnabled",
   "scanSocialLinksEnabled",
   "requireEmailForLeadsEnabled",
+  "aggressiveEmailHuntEnabled",
   "leadDiscoveryEnabled",
   "discoveryGoogleEnabled"
 ];
@@ -617,6 +618,7 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
     visibleTabs: false,
     scanSocialLinks: true,
     requireEmailForLeads: true,
+    aggressiveEmailHunt: false,
     leadDiscoveryEnabled: false,
     discoverySources: {
       google: true
@@ -715,6 +717,7 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
       visibleTabs: settings.visibleTabs,
       scanSocialLinks: settings.scanSocialLinks,
       requireEmail: settings.requireEmailForLeads === true,
+      aggressiveEmailHunt: settings.aggressiveEmailHunt === true,
       maxSocialPages: 2,
       leadDiscoveryEnabled: settings.leadDiscoveryEnabled === true,
       discoverySources: settings.discoverySources || { google: true, linkedin: false, yelp: false },
@@ -743,6 +746,7 @@ async function readEnrichmentSettings() {
     visibleTabs: data.showEnrichmentTabsEnabled === true,
     scanSocialLinks: data.scanSocialLinksEnabled !== false,
     requireEmailForLeads: data.requireEmailForLeadsEnabled !== false,
+    aggressiveEmailHunt: data.aggressiveEmailHuntEnabled === true,
     leadDiscoveryEnabled: data.leadDiscoveryEnabled === true,
     discoverySources: {
       google: data.discoveryGoogleEnabled !== false,
@@ -1129,6 +1133,7 @@ async function enrichRows(rows, options) {
   const timeoutMs = clampInt(config.timeoutMs, 5000, 30000, 12000);
   const visibleTabs = config.visibleTabs === true;
   const emailOnlyMode = config.requireEmail === true;
+  const aggressiveEmailHunt = config.aggressiveEmailHunt === true;
   const scanSocialLinks = config.scanSocialLinks !== false;
   const maxSocialPages = clampInt(config.maxSocialPages, 0, 8, 2);
   const maxDiscoveredPages = clampInt(config.maxDiscoveredPages, maxPagesPerSite, 240, Math.max(80, maxPagesPerSite * 5));
@@ -1204,6 +1209,7 @@ async function enrichRows(rows, options) {
         timeoutMs,
         visibleTabs,
         emailOnlyMode,
+        aggressiveEmailHunt,
         scanSocialLinks,
         maxSocialPages,
         skipSitemapLookup: phasePrefix === "discovery" || emailOnlyMode,
@@ -3008,6 +3014,7 @@ async function scanWebsite(startUrl, options) {
   let sitemapAttempted = false;
   let noSignalStreak = 0;
   const emailOnlyMode = options.emailOnlyMode === true;
+  const aggressiveEmailHunt = options.aggressiveEmailHunt === true;
   const baseIntent = normalizeScanIntent(options.intent);
   const intent = emailOnlyMode
     ? { needsEmail: baseIntent.needsEmail, needsOwner: false, needsPhone: false }
@@ -3097,6 +3104,109 @@ async function scanWebsite(startUrl, options) {
     phones.add(normalizedPhone);
     if (!phoneSourceByNumber.has(normalizedPhone)) {
       phoneSourceByNumber.set(normalizedPhone, classifyEmailSource(sourceUrl));
+    }
+  };
+
+  const hasAnyEmailNow = () => {
+    const bestOwnerNow = pickBestOwner(ownerCandidates, Array.from(emails), ownerContext);
+    const ownerEmailNow = chooseOwnerEmail(Array.from(emails), bestOwnerNow ? bestOwnerNow.name : "");
+    const companyEmailNow = chooseContactEmail(Array.from(emails), ownerEmailNow);
+    return Boolean(ownerEmailNow || companyEmailNow);
+  };
+
+  const runAggressiveGoogleFallback = async () => {
+    if (!aggressiveEmailHunt || !intent.needsEmail || hasAnyEmailNow()) return;
+    if (!tab || tab.id == null) return;
+
+    const hostForSearch = normalizeText(startHost).toLowerCase().replace(/^www\./, "");
+    if (!hostForSearch) return;
+
+    const businessName = normalizeText(options.businessName);
+    const searchQueries = [
+      `"@${hostForSearch}"`,
+      "\"contact\" \"email\"",
+      "\"mailto:\"",
+      businessName ? `"${businessName}" email` : ""
+    ].filter(Boolean);
+    const probedPages = new Set();
+    const maxProbePages = 6;
+
+    for (const query of searchQueries) {
+      if (probedPages.size >= maxProbePages || hasAnyEmailNow()) break;
+      assertNotStopped();
+
+      const searchQuery = `site:${hostForSearch} ${query}`;
+      const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&num=10&hl=en`;
+      reportProgress("google_email_search", searchUrl);
+
+      let candidates = [];
+      try {
+        await updateTabUrl(tab.id, searchUrl);
+        await waitForTabComplete(tab.id, options.timeoutMs);
+        assertNotStopped();
+        await sleep(600);
+        candidates = await executeGoogleResultsExtraction(tab.id, 3);
+      } catch (_googleSearchError) {
+        assertNotStopped();
+        reportProgress("google_email_search_error", searchUrl);
+        continue;
+      }
+
+      for (const candidate of Array.isArray(candidates) ? candidates : []) {
+        if (probedPages.size >= maxProbePages || hasAnyEmailNow()) break;
+        const candidateUrl = normalizeBusinessWebsiteUrl(candidate && candidate.url) || normalizeWebsiteUrl(candidate && candidate.url);
+        if (!candidateUrl || probedPages.has(candidateUrl)) continue;
+        const candidateHost = normalizeText(hostnameForUrl(candidateUrl)).toLowerCase().replace(/^www\./, "");
+        if (!candidateHost) continue;
+        if (!candidateHost.includes(hostForSearch) && !hostForSearch.includes(candidateHost)) continue;
+        probedPages.add(candidateUrl);
+
+        const candidateKey = stripHash(candidateUrl) || candidateUrl;
+        if (candidateKey && !discovered.has(candidateKey)) {
+          discovered.add(candidateKey);
+        }
+
+        reportProgress("google_email_page", candidateUrl);
+        let pageData = null;
+        try {
+          assertNotStopped();
+          await updateTabUrl(tab.id, candidateUrl);
+          await waitForTabComplete(tab.id, options.timeoutMs);
+          assertNotStopped();
+          await sleep(700);
+          pageData = await executeExtraction(tab.id);
+        } catch (_googlePageError) {
+          assertNotStopped();
+          reportProgress("google_email_page_error", candidateUrl);
+          continue;
+        }
+
+        pagesVisited += 1;
+        if (!pageData) continue;
+        if (pageData.blocked === true) {
+          blocked = true;
+        }
+        for (const email of pageData.emails || []) {
+          registerEmail(email, candidateUrl);
+        }
+        for (const phoneValue of pageData.phones || []) {
+          registerPhone(phoneValue, candidateUrl);
+        }
+        for (const ownerCandidate of pageData.ownerCandidates || []) {
+          if (!ownerCandidate || !ownerCandidate.name) continue;
+          ownerCandidates.push({
+            name: normalizeText(ownerCandidate.name),
+            title: normalizeText(ownerCandidate.title),
+            score: Number(ownerCandidate.score) || 0,
+            source: normalizeText(ownerCandidate.source || "google_fallback")
+          });
+        }
+
+        if (hasAnyEmailNow()) {
+          reportProgress("google_email_found", candidateUrl);
+          break;
+        }
+      }
     }
   };
 
@@ -3349,6 +3459,17 @@ async function scanWebsite(startUrl, options) {
           }
         }
       }
+    }
+
+    if (
+      aggressiveEmailHunt &&
+      intent.needsEmail &&
+      !hasAnyEmailNow() &&
+      !socialRootScan &&
+      !searchRootScan &&
+      !directoryRootScan
+    ) {
+      await runAggressiveGoogleFallback();
     }
   } finally {
     if (typeof options.onTabChange === "function") {
