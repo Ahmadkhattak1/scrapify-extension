@@ -127,6 +127,7 @@
     phoneColumnsHint: document.getElementById("phoneColumnsHint"),
     showEnrichmentTabs: document.getElementById("showEnrichmentTabs"),
     scanSocialLinks: document.getElementById("scanSocialLinks"),
+    requireEmailForLeads: document.getElementById("requireEmailForLeads"),
     leadDiscoveryEnabled: document.getElementById("leadDiscoveryEnabled"),
     discoveryGoogleEnabled: document.getElementById("discoveryGoogleEnabled"),
     minRating: document.getElementById("minRating"),
@@ -178,6 +179,7 @@
   let phoneOutputModeValue = "unified_only";
   let showEnrichmentTabsEnabled = false;
   let scanSocialLinksEnabled = true;
+  let requireEmailForLeadsEnabled = true;
   let leadDiscoveryEnabled = false;
   let discoveryGoogleEnabled = true;
   let scrapeRunTabId = null;
@@ -202,6 +204,9 @@
     el.phoneOutputMode.value = phoneOutputModeValue;
     el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
     el.scanSocialLinks.checked = scanSocialLinksEnabled;
+    if (el.requireEmailForLeads) {
+      el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
+    }
     el.leadDiscoveryEnabled.checked = leadDiscoveryEnabled;
     el.discoveryGoogleEnabled.checked = discoveryGoogleEnabled;
     syncOutputModesFromSelectedColumns();
@@ -233,6 +238,9 @@
     el.phoneOutputMode.addEventListener("change", onPhoneOutputModeChange);
     el.showEnrichmentTabs.addEventListener("change", onShowEnrichmentTabsToggle);
     el.scanSocialLinks.addEventListener("change", onScanSocialLinksToggle);
+    if (el.requireEmailForLeads) {
+      el.requireEmailForLeads.addEventListener("change", onRequireEmailForLeadsToggle);
+    }
     el.leadDiscoveryEnabled.addEventListener("change", onLeadDiscoveryToggle);
     el.discoveryGoogleEnabled.addEventListener("change", onDiscoveryGoogleToggle);
     el.toggleAdvancedBtn.addEventListener("click", onToggleAdvancedFields);
@@ -533,6 +541,7 @@
         "siteMaxPagesValue",
         "showEnrichmentTabsEnabled",
         "scanSocialLinksEnabled",
+        "requireEmailForLeadsEnabled",
         "leadDiscoveryEnabled",
         "discoveryGoogleEnabled"
       ]);
@@ -547,6 +556,7 @@
       siteMaxPagesValue = clampInt(data.siteMaxPagesValue, 1, 120, 12);
       showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
       scanSocialLinksEnabled = data.scanSocialLinksEnabled !== false;
+      requireEmailForLeadsEnabled = data.requireEmailForLeadsEnabled !== false;
       leadDiscoveryEnabled = data.leadDiscoveryEnabled === true;
       discoveryGoogleEnabled = data.discoveryGoogleEnabled !== false;
       applySavedUiSettings(data[POPUP_UI_SETTINGS_KEY]);
@@ -607,6 +617,12 @@
       }
       syncLeadDiscoveryInputs();
     }
+    if (changes.requireEmailForLeadsEnabled) {
+      requireEmailForLeadsEnabled = changes.requireEmailForLeadsEnabled.newValue !== false;
+      if (el.requireEmailForLeads) {
+        el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
+      }
+    }
     if (changes.discoveryGoogleEnabled) {
       discoveryGoogleEnabled = changes.discoveryGoogleEnabled.newValue !== false;
       if (el.discoveryGoogleEnabled) {
@@ -623,6 +639,9 @@
     emailOutputModeValue = normalizeOutputMode(saved.emailOutputMode);
     phonePreferenceValue = normalizePhonePreference(saved.phonePreference);
     phoneOutputModeValue = normalizeOutputMode(saved.phoneOutputMode);
+    if (saved.requireEmailForLeads != null) {
+      requireEmailForLeadsEnabled = saved.requireEmailForLeads !== false;
+    }
     showAdvancedFields = saved.showAdvancedFields === true;
 
     el.maxRows.value = String(maxRowsValue);
@@ -643,6 +662,9 @@
     }
     if (el.phoneOutputMode) {
       el.phoneOutputMode.value = phoneOutputModeValue;
+    }
+    if (el.requireEmailForLeads) {
+      el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
     }
     if (!showAdvancedFields && Array.isArray(selectedColumns)) {
       selectedColumns = normalizeSelectedColumns(selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)));
@@ -1320,6 +1342,7 @@
       emailOutputMode: emailOutputModeValue,
       phonePreference: phonePreferenceValue,
       phoneOutputMode: phoneOutputModeValue,
+      requireEmailForLeads: requireEmailForLeadsEnabled,
       showAdvancedFields: showAdvancedFields === true,
       minRating: sanitizeFormString(el.minRating.value),
       maxRating: sanitizeFormString(el.maxRating.value),
@@ -1420,6 +1443,12 @@
     schedulePersistUiSettings();
   }
 
+  function onRequireEmailForLeadsToggle() {
+    requireEmailForLeadsEnabled = !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false;
+    storageSet({ requireEmailForLeadsEnabled }).catch(() => {});
+    schedulePersistUiSettings();
+  }
+
   function onLeadDiscoveryToggle() {
     leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
     storageSet({ leadDiscoveryEnabled }).catch(() => {});
@@ -1455,6 +1484,7 @@
     siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 12);
     showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked === true;
     scanSocialLinksEnabled = el.scanSocialLinks.checked === true;
+    requireEmailForLeadsEnabled = !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false;
     leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
     discoveryGoogleEnabled = el.discoveryGoogleEnabled.checked === true;
     el.siteMaxPages.value = String(siteMaxPagesValue);
@@ -1474,6 +1504,7 @@
       siteMaxPagesValue,
       showEnrichmentTabsEnabled,
       scanSocialLinksEnabled,
+      requireEmailForLeadsEnabled,
       leadDiscoveryEnabled,
       discoveryGoogleEnabled,
       [ACTIVE_SCRAPE_FILTERS_KEY]: activeScrapeFilters
@@ -1865,6 +1896,7 @@
           timeoutMs: 10000,
           visibleTabs: Boolean(el.showEnrichmentTabs.checked),
           scanSocialLinks: Boolean(el.scanSocialLinks.checked),
+          requireEmail: !el.requireEmailForLeads || Boolean(el.requireEmailForLeads.checked),
           maxSocialPages: 2,
           leadDiscoveryEnabled: Boolean(el.leadDiscoveryEnabled.checked),
           discoverySources: {

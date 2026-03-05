@@ -20,6 +20,7 @@ const ENRICHMENT_SETTINGS_KEYS = [
   "siteMaxPagesValue",
   "showEnrichmentTabsEnabled",
   "scanSocialLinksEnabled",
+  "requireEmailForLeadsEnabled",
   "leadDiscoveryEnabled",
   "discoveryGoogleEnabled"
 ];
@@ -481,13 +482,27 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
   );
 
   try {
-    const result = await enrichRows(rows, {
+    let result = await enrichRows(rows, {
       ...options,
       shouldStop: () => runControl.stopRequested === true,
       onScanTabChange: (tabId) => {
         runControl.scanTabId = Number.isFinite(Number(tabId)) ? Number(tabId) : null;
       }
     });
+    if (options.requireEmail === true && Array.isArray(result.rows)) {
+      const filteredRows = filterRowsByEmailRequirement(result.rows, true);
+      const filteredOut = Math.max(0, result.rows.length - filteredRows.length);
+      if (filteredOut > 0) {
+        result = {
+          rows: filteredRows,
+          summary: {
+            ...(result.summary || {}),
+            filtered_no_email: filteredOut,
+            output_rows: filteredRows.length
+          }
+        };
+      }
+    }
     const stopped = result && result.summary && result.summary.stopped === true;
 
     await saveEnrichSession(
@@ -601,6 +616,7 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
     maxPagesPerSite: 12,
     visibleTabs: false,
     scanSocialLinks: true,
+    requireEmailForLeads: true,
     leadDiscoveryEnabled: false,
     discoverySources: {
       google: true
@@ -608,7 +624,11 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
   }));
 
   if (!settings.enrichmentEnabled || scrapeStopped) {
-    await storageSet({ lastRows: rows }).catch(() => {});
+    const outputRows = filterRowsByEmailRequirement(rows, settings.requireEmailForLeads === true);
+    if (outputRows.length !== rows.length) {
+      await syncScrapeSessionFiltersAndCounts(runId, filters, outputRows.length).catch(() => {});
+    }
+    await storageSet({ lastRows: outputRows }).catch(() => {});
     maybeAutoOpenResultsForRun(runId, scrapeStopped ? { force: true } : {});
     return;
   }
@@ -694,6 +714,7 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
       timeoutMs: 10000,
       visibleTabs: settings.visibleTabs,
       scanSocialLinks: settings.scanSocialLinks,
+      requireEmail: settings.requireEmailForLeads === true,
       maxSocialPages: 2,
       leadDiscoveryEnabled: settings.leadDiscoveryEnabled === true,
       discoverySources: settings.discoverySources || { google: true, linkedin: false, yelp: false },
@@ -721,6 +742,7 @@ async function readEnrichmentSettings() {
     maxPagesPerSite: clampInt(data.siteMaxPagesValue, 1, 120, 12),
     visibleTabs: data.showEnrichmentTabsEnabled === true,
     scanSocialLinks: data.scanSocialLinksEnabled !== false,
+    requireEmailForLeads: data.requireEmailForLeadsEnabled !== false,
     leadDiscoveryEnabled: data.leadDiscoveryEnabled === true,
     discoverySources: {
       google: data.discoveryGoogleEnabled !== false,
@@ -1106,6 +1128,7 @@ async function enrichRows(rows, options) {
   const maxPagesPerSite = clampInt(config.maxPagesPerSite, 1, 120, 12);
   const timeoutMs = clampInt(config.timeoutMs, 5000, 30000, 12000);
   const visibleTabs = config.visibleTabs === true;
+  const emailOnlyMode = config.requireEmail === true;
   const scanSocialLinks = config.scanSocialLinks !== false;
   const maxSocialPages = clampInt(config.maxSocialPages, 0, 8, 2);
   const maxDiscoveredPages = clampInt(config.maxDiscoveredPages, maxPagesPerSite, 240, Math.max(80, maxPagesPerSite * 5));
@@ -1161,6 +1184,10 @@ async function enrichRows(rows, options) {
     let preDiscoveryRan = false;
 
     const runSiteScan = async (targetUrl, phasePrefix) => {
+      const baseIntent = deriveScanIntent(enrichedRow);
+      const rowIntent = emailOnlyMode
+        ? { needsEmail: baseIntent.needsEmail, needsOwner: false, needsPhone: false }
+        : baseIntent;
       const phaseInit = phasePrefix === "discovery" ? "discovery_site_init" : "site_init";
       emitEnrichProgress(summary, {
         currentName: sourceRow.name,
@@ -1176,10 +1203,11 @@ async function enrichRows(rows, options) {
         maxDiscoveredPages,
         timeoutMs,
         visibleTabs,
+        emailOnlyMode,
         scanSocialLinks,
         maxSocialPages,
-        skipSitemapLookup: phasePrefix === "discovery",
-        intent: deriveScanIntent(enrichedRow),
+        skipSitemapLookup: phasePrefix === "discovery" || emailOnlyMode,
+        intent: rowIntent,
         businessName: sourceRow.name,
         businessCategory: sourceRow.category,
         businessAddress: sourceRow.address || sourceRow.source_query,
@@ -1325,7 +1353,11 @@ async function enrichRows(rows, options) {
         }
       }
 
-      if (!normalizeText(enrichedRow.owner_name) && normalizeText(enrichedRow.website_scan_status).toLowerCase() !== "blocked") {
+      if (
+        !emailOnlyMode &&
+        !normalizeText(enrichedRow.owner_name) &&
+        normalizeText(enrichedRow.website_scan_status).toLowerCase() !== "blocked"
+      ) {
         emitEnrichProgress(summary, {
           currentName: sourceRow.name,
           currentUrl: rowCurrentUrl,
@@ -1779,6 +1811,22 @@ function applyScrapeFilters(rows, filters) {
     return rows;
   }
   return rows.filter((row) => applyFilters(row, normalizedFilters));
+}
+
+function rowHasAnyEmailField(row) {
+  const value = row && typeof row === "object" ? row : {};
+  return Boolean(
+    normalizeEmail(value.primary_email) ||
+      normalizeEmail(value.owner_email) ||
+      normalizeEmail(value.contact_email) ||
+      normalizeEmail(value.email)
+  );
+}
+
+function filterRowsByEmailRequirement(rows, requireEmail) {
+  if (!Array.isArray(rows)) return [];
+  if (requireEmail !== true) return rows;
+  return rows.filter((row) => rowHasAnyEmailField(row));
 }
 
 async function resolveScrapeFilters(runId, candidateFilters) {
@@ -2959,7 +3007,11 @@ async function scanWebsite(startUrl, options) {
   const highIntentDiscovered = new Set();
   let sitemapAttempted = false;
   let noSignalStreak = 0;
-  const intent = normalizeScanIntent(options.intent);
+  const emailOnlyMode = options.emailOnlyMode === true;
+  const baseIntent = normalizeScanIntent(options.intent);
+  const intent = emailOnlyMode
+    ? { needsEmail: baseIntent.needsEmail, needsOwner: false, needsPhone: false }
+    : baseIntent;
   const ownerContext = {
     businessName: normalizeText(options.businessName),
     businessCategory: normalizeText(options.businessCategory)
@@ -3163,6 +3215,7 @@ async function scanWebsite(startUrl, options) {
         intent.needsEmail &&
         companyEmailNow &&
         (
+          emailOnlyMode ||
           !intent.needsOwner ||
           priorityPagesVisited >= 2 ||
           pagesVisited >= Math.min(effectiveMaxPages, 5)
@@ -3309,8 +3362,10 @@ async function scanWebsite(startUrl, options) {
   const emailList = Array.from(emails);
   const bestOwner = pickBestOwner(ownerCandidates, emailList, ownerContext);
   const ownerEmailCandidate = chooseOwnerEmail(emailList, bestOwner ? bestOwner.name : "");
+  const ownerEmailSourceCandidate = ownerEmailCandidate ? sourceForEmail(ownerEmailCandidate, emailSourceByAddress) : "";
+  const skipOwnerVerification = emailOnlyMode || ownerEmailSourceCandidate === "facebook";
   let ownerEmail = "";
-  if (ownerEmailCandidate && isPotentialPersonalEmail(ownerEmailCandidate)) {
+  if (ownerEmailCandidate && isPotentialPersonalEmail(ownerEmailCandidate) && !skipOwnerVerification) {
     reportProgress("owner_email_verify_lookup", ownerEmailCandidate);
     const verification = await verifyPersonalEmailViaGoogle(
       {
@@ -3335,6 +3390,8 @@ async function scanWebsite(startUrl, options) {
     } else {
       reportProgress("owner_email_unverified", ownerEmailCandidate);
     }
+  } else if (ownerEmailCandidate && skipOwnerVerification) {
+    reportProgress("owner_email_social_source", ownerEmailCandidate);
   }
   // Personal email must be verified, otherwise keep only company/contact output.
   let contactEmail = "";
@@ -4066,6 +4123,10 @@ function isPlaceholderEmailParts(localPart, domainPart) {
   const local = normalizeText(localPart).toLowerCase();
   const domain = normalizeText(domainPart).toLowerCase().replace(/^www\./, "");
   if (!local || !domain) return true;
+  const domainLabels = domain.split(".").filter(Boolean);
+  const domainRoot = domainLabels[0] || "";
+  const domainRootFlat = domainRoot.replace(/[^a-z0-9]/g, "");
+  const localFlat = local.replace(/[^a-z0-9]/g, "");
 
   const placeholderDomains = new Set([
     "example.com",
@@ -4082,16 +4143,62 @@ function isPlaceholderEmailParts(localPart, domainPart) {
     "domain.org",
     "yourdomain.com",
     "mydomain.com",
-    "sample.com"
+    "sample.com",
+    "domainname.com",
+    "yourcompany.com",
+    "companyname.com",
+    "placeholder.com",
+    "dummy.com"
   ]);
   if (placeholderDomains.has(domain)) return true;
   if (/(^|\.)(example|invalid|localhost|test)$/.test(domain)) return true;
+  const strongPlaceholderRoots = new Set([
+    "example",
+    "test",
+    "domain",
+    "yourdomain",
+    "mydomain",
+    "sample",
+    "domainname",
+    "placeholder",
+    "dummy",
+    "invalid",
+    "localhost",
+    "yourcompany",
+    "companyname"
+  ]);
+  if (strongPlaceholderRoots.has(domainRootFlat)) return true;
   if (/^(n\/?a|na|null|none|unknown)$/i.test(local)) return true;
 
-  const localLooksGeneric = /^(user(name)?|your-?name|name|email|test|example|sample|demo|mail|contact)$/i.test(local);
-  if (localLooksGeneric && /(example|domain|test|localhost|invalid|sample|demo)/i.test(domain)) {
+  const genericLocalParts = new Set([
+    "user",
+    "username",
+    "your",
+    "yourname",
+    "youremail",
+    "name",
+    "email",
+    "emailaddress",
+    "test",
+    "example",
+    "sample",
+    "demo",
+    "mail",
+    "contact",
+    "firstname",
+    "lastname",
+    "fullname",
+    "firstlast",
+    "firstnamelastname",
+    "namehere"
+  ]);
+  const localLooksGeneric =
+    genericLocalParts.has(localFlat) ||
+    /^(user(name)?|your-?name|your-?email|name|email|test|example|sample|demo|mail|contact|first(name)?|last(name)?|full(name)?)$/i.test(local);
+  if (localLooksGeneric && /(example|domain|test|localhost|invalid|sample|demo|placeholder|dummy|companyname|yourdomain|mydomain|yourcompany)/i.test(domain)) {
     return true;
   }
+  if (localLooksGeneric && strongPlaceholderRoots.has(domainRootFlat)) return true;
 
   return false;
 }
@@ -4668,13 +4775,17 @@ function defaultFilename() {
   return `gbp_export_${stamp}.csv`;
 }
 
-function extractPageDataScript() {
+async function extractPageDataScript() {
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
 
   const isPlaceholderEmailParts = (localPart, domainPart) => {
     const local = normalize(localPart).toLowerCase();
     const domain = normalize(domainPart).toLowerCase().replace(/^www\./, "");
     if (!local || !domain) return true;
+    const domainLabels = domain.split(".").filter(Boolean);
+    const domainRoot = domainLabels[0] || "";
+    const domainRootFlat = domainRoot.replace(/[^a-z0-9]/g, "");
+    const localFlat = local.replace(/[^a-z0-9]/g, "");
 
     const placeholderDomains = new Set([
       "example.com",
@@ -4691,16 +4802,62 @@ function extractPageDataScript() {
       "domain.org",
       "yourdomain.com",
       "mydomain.com",
-      "sample.com"
+      "sample.com",
+      "domainname.com",
+      "yourcompany.com",
+      "companyname.com",
+      "placeholder.com",
+      "dummy.com"
     ]);
     if (placeholderDomains.has(domain)) return true;
     if (/(^|\.)(example|invalid|localhost|test)$/.test(domain)) return true;
+    const strongPlaceholderRoots = new Set([
+      "example",
+      "test",
+      "domain",
+      "yourdomain",
+      "mydomain",
+      "sample",
+      "domainname",
+      "placeholder",
+      "dummy",
+      "invalid",
+      "localhost",
+      "yourcompany",
+      "companyname"
+    ]);
+    if (strongPlaceholderRoots.has(domainRootFlat)) return true;
     if (/^(n\/?a|na|null|none|unknown)$/i.test(local)) return true;
 
-    const localLooksGeneric = /^(user(name)?|your-?name|name|email|test|example|sample|demo|mail|contact)$/i.test(local);
-    if (localLooksGeneric && /(example|domain|test|localhost|invalid|sample|demo)/i.test(domain)) {
+    const genericLocalParts = new Set([
+      "user",
+      "username",
+      "your",
+      "yourname",
+      "youremail",
+      "name",
+      "email",
+      "emailaddress",
+      "test",
+      "example",
+      "sample",
+      "demo",
+      "mail",
+      "contact",
+      "firstname",
+      "lastname",
+      "fullname",
+      "firstlast",
+      "firstnamelastname",
+      "namehere"
+    ]);
+    const localLooksGeneric =
+      genericLocalParts.has(localFlat) ||
+      /^(user(name)?|your-?name|your-?email|name|email|test|example|sample|demo|mail|contact|first(name)?|last(name)?|full(name)?)$/i.test(local);
+    if (localLooksGeneric && /(example|domain|test|localhost|invalid|sample|demo|placeholder|dummy|companyname|yourdomain|mydomain|yourcompany)/i.test(domain)) {
       return true;
     }
+    if (localLooksGeneric && strongPlaceholderRoots.has(domainRootFlat)) return true;
 
     return false;
   };
@@ -4998,13 +5155,150 @@ function extractPageDataScript() {
     return out;
   };
 
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const isElementVisible = (node) => {
+    if (!node || typeof node.getBoundingClientRect !== "function") return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+
+  const clickElement = (node) => {
+    if (!node || typeof node.click !== "function") return false;
+    try {
+      node.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      node.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      node.click();
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  };
+
+  const closeFacebookSigninOverlays = () => {
+    const selectors = [
+      "div[role='dialog'] [aria-label='Close']",
+      "div[role='dialog'] [aria-label*='close' i]",
+      "div[role='dialog'] [aria-label*='not now' i]",
+      "div[role='dialog'] [aria-label*='cancel' i]",
+      "div[aria-modal='true'] [aria-label='Close']",
+      "div[aria-modal='true'] [aria-label*='close' i]",
+      "div[aria-modal='true'] [aria-label*='not now' i]",
+      "[aria-label='Close']"
+    ];
+    let closed = 0;
+    for (const selector of selectors) {
+      const nodes = Array.from(document.querySelectorAll(selector)).slice(0, 6);
+      for (const node of nodes) {
+        if (!isElementVisible(node)) continue;
+        if (clickElement(node)) {
+          closed += 1;
+        }
+      }
+      if (closed > 0) break;
+    }
+
+    if (closed === 0) {
+      const dialogButtons = Array.from(
+        document.querySelectorAll(
+          "div[role='dialog'] button, div[role='dialog'] [role='button'], div[aria-modal='true'] button, div[aria-modal='true'] [role='button']"
+        )
+      ).slice(0, 24);
+      const closeTokens = ["close", "not now", "cancel", "dismiss", "maybe later"];
+      for (const node of dialogButtons) {
+        if (!isElementVisible(node)) continue;
+        const label = normalize(node.getAttribute("aria-label") || node.textContent || "").toLowerCase();
+        if (!label) continue;
+        if (!closeTokens.some((token) => label === token || label.includes(token))) continue;
+        if (clickElement(node)) {
+          closed += 1;
+          break;
+        }
+      }
+    }
+
+    if (closed === 0) {
+      try {
+        const keydown = new KeyboardEvent("keydown", {
+          key: "Escape",
+          code: "Escape",
+          keyCode: 27,
+          which: 27,
+          bubbles: true,
+          cancelable: true
+        });
+        const keyup = new KeyboardEvent("keyup", {
+          key: "Escape",
+          code: "Escape",
+          keyCode: 27,
+          which: 27,
+          bubbles: true,
+          cancelable: true
+        });
+        document.dispatchEvent(keydown);
+        document.dispatchEvent(keyup);
+      } catch (_error) {
+        // Ignore keyboard dispatch failures.
+      }
+    }
+
+    return closed;
+  };
+
+  const expandFacebookSections = () => {
+    const needles = [
+      "see more",
+      "about",
+      "details",
+      "contact and basic info",
+      "contact info",
+      "intro",
+      "page transparency"
+    ];
+    const nodes = Array.from(document.querySelectorAll("a, button, div[role='button'], span[role='button']")).slice(0, 2000);
+    let expanded = 0;
+    for (const node of nodes) {
+      if (expanded >= 10) break;
+      if (!isElementVisible(node)) continue;
+      const label = normalize(
+        node.getAttribute("aria-label") ||
+        node.textContent ||
+        ""
+      ).toLowerCase();
+      if (!label) continue;
+      if (!needles.some((needle) => label === needle || label.includes(needle))) continue;
+      if (clickElement(node)) {
+        expanded += 1;
+      }
+    }
+    return expanded;
+  };
+
+  const prepareFacebookPage = async () => {
+    for (let pass = 0; pass < 3; pass += 1) {
+      closeFacebookSigninOverlays();
+      expandFacebookSections();
+      const nextScroll = Math.max(0, pass * 900);
+      window.scrollTo(0, nextScroll);
+      await wait(180);
+    }
+    closeFacebookSigninOverlays();
+    expandFacebookSections();
+    window.scrollTo(0, 0);
+    await wait(120);
+  };
+
+  const hostname = normalize(window.location.hostname || "").toLowerCase();
+  if (hostname.includes("facebook.com")) {
+    await prepareFacebookPage();
+  }
+
   const rawBodyText = normalize(document.body ? document.body.innerText || "" : "");
   const bodyText = deobfuscateEmailText(rawBodyText);
   const emails = new Set();
   const phones = new Set();
   const ownerCandidates = [];
   const orgNameSet = new Set();
-  const hostname = normalize(window.location.hostname || "").toLowerCase();
   const platform = detectPlatform();
 
   collectEmailsFromText(rawBodyText, emails);
