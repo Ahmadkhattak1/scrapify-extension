@@ -1,8 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "GBP Maps Scraper",
+  "name": "Scrapify",
+  "short_name": "Scrapify",
   "version": "1.0.0",
-  "description": "Scrape Google Maps GBP listings with filters and export to CSV.",
+  "description": "Scrapify scrapes Google Maps listings with filters and CSV export.",
+  "icons": {
+    "16": "assets/brand/icon-16.png",
+    "32": "assets/brand/icon-32.png",
+    "48": "assets/brand/icon-48.png",
+    "128": "assets/brand/icon-128.png"
+  },
   "permissions": ["activeTab", "tabs", "storage", "downloads", "scripting"],
   "host_permissions": ["https://www.google.com/maps/*", "https://*/*", "http://*/*"],
   "incognito": "split",
@@ -10,7 +17,13 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "GBP Maps Scraper"
+    "default_title": "Scrapify",
+    "default_icon": {
+      "16": "assets/brand/icon-16.png",
+      "32": "assets/brand/icon-32.png",
+      "48": "assets/brand/icon-48.png",
+      "128": "assets/brand/icon-128.png"
+    }
   },
   "content_scripts": [
     {

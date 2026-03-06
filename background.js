@@ -17,13 +17,10 @@ const POPUP_UI_SETTINGS_KEY = "popupUiSettings";
 const ACTIVE_SCRAPE_FILTERS_KEY = "activeScrapeFilters";
 const ENRICHMENT_SETTINGS_KEYS = [
   "enrichmentEnabled",
-  "siteMaxPagesValue",
   "showEnrichmentTabsEnabled",
-  "scanSocialLinksEnabled",
-  "requireEmailForLeadsEnabled",
-  "aggressiveEmailHuntEnabled",
   "leadDiscoveryEnabled",
-  "discoveryGoogleEnabled"
+  "contactGoalEmailEnabled",
+  "contactGoalPhoneEnabled"
 ];
 const RESULTS_PAGE_PATH = "results.html";
 const CONTROL_PANEL_PATH = "popup.html";
@@ -34,9 +31,22 @@ let lastEnrichPersistAtMs = 0;
 let activeEnrichRun = null;
 const autoOpenedResultsRunIds = new Set();
 let lastAutoEnrichSourceRunId = "";
-const ACTION_DEFAULT_TITLE = "GBP Maps Scraper";
+const ACTION_DEFAULT_TITLE = "Scrapify";
 const ACTION_RUNNING_COLOR = "#127a3e";
 const ACTION_STOPPING_COLOR = "#b54708";
+const FOCUSED_CRAWL_MAX_PAGES = 8;
+const FOCUSED_CRAWL_MAX_PATHS_PER_TYPE = 2;
+const FOCUSED_CRAWL_SEED_PATHS = [
+  "/contact",
+  "/about",
+  "/team",
+  "/careers",
+  "/contact-us",
+  "/about-us",
+  "/our-team",
+  "/jobs"
+];
+let hiddenScanWindowId = null;
 
 self.addEventListener("unhandledrejection", (event) => {
   const reason = event && event.reason;
@@ -428,6 +438,12 @@ function getEnrichRuntimeState() {
 async function startEnrichRun(rowsInput, optionsInput, metaInput) {
   const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
   const meta = metaInput && typeof metaInput === "object" ? metaInput : {};
+  const optionFilters = options.filters && typeof options.filters === "object" ? options.filters : {};
+  const hasEmailFilter = optionFilters.hasEmail != null ? optionFilters.hasEmail === true : options.requireEmail === true;
+  const outputFilters = normalizeOutputFilters({
+    ...optionFilters,
+    hasEmail: hasEmailFilter
+  });
   const rows = prepareRowsForEnrichment(rowsInput, "queued");
   const runId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const startedAt = new Date().toISOString();
@@ -483,22 +499,35 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
   );
 
   try {
+    const contactGoals = normalizeContactGoals(options.contactGoals);
+    const leadDiscoveryEnabled = options.leadDiscoveryEnabled === true;
+    const discoverySources = {
+      ...(options.discoverySources && typeof options.discoverySources === "object" ? options.discoverySources : {}),
+      google: leadDiscoveryEnabled,
+      linkedin: false,
+      yelp: false
+    };
     let result = await enrichRows(rows, {
       ...options,
+      requireEmail: outputFilters.hasEmail === true,
+      contactGoals,
+      leadDiscoveryEnabled,
+      discoverySources,
       shouldStop: () => runControl.stopRequested === true,
       onScanTabChange: (tabId) => {
         runControl.scanTabId = Number.isFinite(Number(tabId)) ? Number(tabId) : null;
       }
     });
-    if (options.requireEmail === true && Array.isArray(result.rows)) {
-      const filteredRows = filterRowsByEmailRequirement(result.rows, true);
+    if (Array.isArray(result.rows)) {
+      const filteredRows = applyOutputFilters(result.rows, outputFilters);
       const filteredOut = Math.max(0, result.rows.length - filteredRows.length);
-      if (filteredOut > 0) {
+      if (filteredOut > 0 || hasAnyActiveFilter(outputFilters)) {
         result = {
           rows: filteredRows,
           summary: {
             ...(result.summary || {}),
-            filtered_no_email: filteredOut,
+            filtered_no_email: outputFilters.hasEmail === true ? filteredOut : 0,
+            filtered_output: filteredOut,
             output_rows: filteredRows.length
           }
         };
@@ -614,19 +643,17 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
   await syncScrapeSessionFiltersAndCounts(runId, filters, rows.length).catch(() => {});
   const settings = await readEnrichmentSettings().catch(() => ({
     enrichmentEnabled: false,
-    maxPagesPerSite: 12,
+    maxPagesPerSite: FOCUSED_CRAWL_MAX_PAGES,
     visibleTabs: false,
-    scanSocialLinks: true,
-    requireEmailForLeads: true,
-    aggressiveEmailHunt: false,
     leadDiscoveryEnabled: false,
+    contactGoals: { email: true, phone: true },
     discoverySources: {
-      google: true
+      google: false
     }
   }));
 
   if (!settings.enrichmentEnabled || scrapeStopped) {
-    const outputRows = filterRowsByEmailRequirement(rows, settings.requireEmailForLeads === true);
+    const outputRows = applyOutputFilters(rows, filters);
     if (outputRows.length !== rows.length) {
       await syncScrapeSessionFiltersAndCounts(runId, filters, outputRows.length).catch(() => {});
     }
@@ -715,12 +742,12 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
       maxPagesPerSite: settings.maxPagesPerSite,
       timeoutMs: 10000,
       visibleTabs: settings.visibleTabs,
-      scanSocialLinks: settings.scanSocialLinks,
-      requireEmail: settings.requireEmailForLeads === true,
-      aggressiveEmailHunt: settings.aggressiveEmailHunt === true,
-      maxSocialPages: 2,
+      filters,
+      requireEmail: filters.hasEmail === true,
+      contactGoals: settings.contactGoals,
+      maxSocialPages: 4,
       leadDiscoveryEnabled: settings.leadDiscoveryEnabled === true,
-      discoverySources: settings.discoverySources || { google: true, linkedin: false, yelp: false },
+      discoverySources: settings.discoverySources || { google: false, linkedin: false, yelp: false },
       discoveryTrigger: "missing_website_or_missing_email",
       discoveryBudget: {
         googleQueries: 2,
@@ -740,16 +767,21 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
 
 async function readEnrichmentSettings() {
   const data = await storageGet(ENRICHMENT_SETTINGS_KEYS);
+  const leadDiscoveryEnabled = data.leadDiscoveryEnabled === true;
+  const contactGoalEmailEnabled = data.contactGoalEmailEnabled !== false;
+  const contactGoalPhoneEnabled = data.contactGoalPhoneEnabled !== false;
+  const contactGoals = normalizeContactGoals({
+    email: contactGoalEmailEnabled,
+    phone: contactGoalPhoneEnabled
+  });
   return {
     enrichmentEnabled: data.enrichmentEnabled === true,
-    maxPagesPerSite: clampInt(data.siteMaxPagesValue, 1, 120, 12),
+    maxPagesPerSite: FOCUSED_CRAWL_MAX_PAGES,
     visibleTabs: data.showEnrichmentTabsEnabled === true,
-    scanSocialLinks: data.scanSocialLinksEnabled !== false,
-    requireEmailForLeads: data.requireEmailForLeadsEnabled !== false,
-    aggressiveEmailHunt: data.aggressiveEmailHuntEnabled === true,
-    leadDiscoveryEnabled: data.leadDiscoveryEnabled === true,
+    leadDiscoveryEnabled,
+    contactGoals,
     discoverySources: {
-      google: data.discoveryGoogleEnabled !== false,
+      google: leadDiscoveryEnabled,
       linkedin: false,
       yelp: false
     }
@@ -779,22 +811,31 @@ function openOrFocusResultsPage(runId) {
   });
 }
 
-function maybeAutoOpenResultsForRun(runId, options) {
-  const opts = options && typeof options === "object" ? options : {};
-  const force = opts.force === true;
+async function shouldAutoOpenResultsTab() {
+  const data = await storageGet(["showEnrichmentTabsEnabled"]).catch(() => ({}));
+  return data.showEnrichmentTabsEnabled === true;
+}
+
+function maybeAutoOpenResultsForRun(runId, _options) {
   const targetRunId = normalizeText(runId);
 
-  if (!targetRunId) {
-    openOrFocusResultsPage("");
-    return;
-  }
+  void shouldAutoOpenResultsTab().then((allowed) => {
+    if (!allowed) {
+      return;
+    }
 
-  if (!force && autoOpenedResultsRunIds.has(targetRunId)) {
-    return;
-  }
+    if (!targetRunId) {
+      openOrFocusResultsPage("");
+      return;
+    }
 
-  autoOpenedResultsRunIds.add(targetRunId);
-  openOrFocusResultsPage(targetRunId);
+    if (autoOpenedResultsRunIds.has(targetRunId)) {
+      return;
+    }
+
+    autoOpenedResultsRunIds.add(targetRunId);
+    openOrFocusResultsPage(targetRunId);
+  }).catch(() => {});
 }
 
 function prepareRowsForEnrichment(rows, statusForWebsite) {
@@ -814,6 +855,7 @@ function prepareRowsForEnrichment(rows, statusForWebsite) {
     const sitePagesDiscovered = Number(sourceRow.site_pages_discovered || 0);
     const socialPagesScanned = Number(sourceRow.social_pages_scanned || 0);
     const discoveredWebsite = normalizeBusinessWebsiteUrl(sourceRow.discovered_website);
+    const listingFacebook = pickRowFacebookFallback(sourceRow);
     const ownerName = normalizeText(sourceRow.owner_name);
     const ownerContext = {
       businessName: normalizeText(sourceRow.name),
@@ -866,6 +908,7 @@ function prepareRowsForEnrichment(rows, statusForWebsite) {
       website_phone_source: normalizeText(sourceRow.website_phone_source),
       owner_name: safeOwnerName,
       owner_title: safeOwnerTitle,
+      listing_facebook: listingFacebook,
       email,
       owner_email: ownerEmail,
       contact_email: contactEmail,
@@ -908,6 +951,7 @@ function createEnrichedRowFromSource(sourceRow) {
   const safeOwnerName = isLikelyPersonName(ownerName, ownerContext) ? ownerName : "";
   const safeOwnerTitle = safeOwnerName ? normalizeText(base.owner_title) : "";
   const safeOwnerConfidence = safeOwnerName ? normalizeText(base.owner_confidence) : "";
+  const listingFacebook = pickRowFacebookFallback(base);
 
   return {
     ...base,
@@ -917,6 +961,7 @@ function createEnrichedRowFromSource(sourceRow) {
     website_phone_source: normalizeText(base.website_phone_source),
     owner_name: safeOwnerName,
     owner_title: safeOwnerTitle,
+    listing_facebook: listingFacebook,
     email,
     owner_email: ownerEmail,
     contact_email: contactEmail,
@@ -952,6 +997,30 @@ function rowHasAnyEmail(row) {
 function scanHasAnyEmail(scan) {
   const value = scan && typeof scan === "object" ? scan : {};
   return Boolean(normalizeEmail(value.primaryEmail) || normalizeEmail(value.ownerEmail) || normalizeEmail(value.contactEmail));
+}
+
+function normalizeFacebookProfileUrl(url) {
+  const normalized = normalizeBusinessWebsiteUrl(url) || normalizeWebsiteUrl(url);
+  if (!normalized) return "";
+  return shouldScanSocialUrl(normalized) ? normalized : "";
+}
+
+function pickRowFacebookFallback(row) {
+  const source = row && typeof row === "object" ? row : {};
+  const candidates = [
+    source.listing_facebook,
+    source.facebook,
+    source.facebook_url,
+    source.social_facebook,
+    ...parseStoredSocialLinks(source.social_links)
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeFacebookProfileUrl(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
 }
 
 function applyScanResultToRow(row, scan, options) {
@@ -1051,16 +1120,126 @@ function applyScanResultToRow(row, scan, options) {
 }
 
 function sameWebsiteHost(urlA, urlB) {
-  const hostA = hostnameForUrl(urlA);
-  const hostB = hostnameForUrl(urlB);
+  const hostA = normalizeWebsiteHostKey(urlA);
+  const hostB = normalizeWebsiteHostKey(urlB);
   if (!hostA || !hostB) return false;
   return hostA === hostB;
 }
 
-function normalizeWebsiteHostKey(url) {
-  const host = normalizeText(hostnameForUrl(url)).toLowerCase();
+function extractSocialProfileKeyFromUrl(url, hostInput) {
+  const normalized = normalizeBusinessWebsiteUrl(url) || normalizeWebsiteUrl(url);
+  if (!normalized) return "";
+  let parsed = null;
+  try {
+    parsed = new URL(normalized);
+  } catch (_error) {
+    return "";
+  }
+
+  const host = normalizeText(hostInput || parsed.hostname).toLowerCase().replace(/^www\./, "");
   if (!host) return "";
-  return host.replace(/^www\./, "");
+  const segments = normalizeText(parsed.pathname || "")
+    .toLowerCase()
+    .replace(/\/+$/, "")
+    .split("/")
+    .filter(Boolean);
+  if (segments.length === 0) return "";
+
+  if (host.includes("facebook.com")) {
+    const first = segments[0];
+    if (!first) return "";
+    if (first === "profile.php") {
+      const profileId = normalizeText(parsed.searchParams.get("id")).toLowerCase();
+      return profileId ? `id:${profileId}` : "";
+    }
+    if (first === "pg") {
+      return normalizeText(segments[1]).toLowerCase();
+    }
+    if (first === "pages") {
+      const numericId = segments.find((segment) => /^\d{5,}$/.test(segment));
+      return numericId ? `id:${numericId}` : normalizeText(segments[1]).toLowerCase();
+    }
+    const reserved = new Set([
+      "about",
+      "sharer",
+      "share.php",
+      "dialog",
+      "plugins",
+      "privacy",
+      "policies",
+      "terms",
+      "help",
+      "legal",
+      "settings",
+      "login",
+      "recover",
+      "checkpoint",
+      "watch",
+      "reel",
+      "story.php",
+      "groups",
+      "events",
+      "marketplace"
+    ]);
+    if (reserved.has(first)) return "";
+    return first;
+  }
+
+  if (
+    host.includes("instagram.com") ||
+    host.includes("linkedin.com") ||
+    host.includes("x.com") ||
+    host.includes("twitter.com") ||
+    host.includes("youtube.com") ||
+    host.includes("tiktok.com") ||
+    host.includes("threads.net")
+  ) {
+    const first = normalizeText(segments[0]).toLowerCase();
+    const second = normalizeText(segments[1]).toLowerCase();
+    if (!first) return "";
+    if (host.includes("linkedin.com")) {
+      if ((first === "company" || first === "in" || first === "school" || first === "showcase") && second) {
+        return `${first}/${second}`;
+      }
+      if (first === "feed" || first === "jobs" || first === "posts" || first === "events") return "";
+      return first;
+    }
+
+    const reserved = new Set([
+      "p",
+      "reel",
+      "explore",
+      "accounts",
+      "about",
+      "legal",
+      "privacy",
+      "terms",
+      "stories",
+      "i",
+      "share",
+      "home",
+      "watch",
+      "shorts",
+      "channel"
+    ]);
+    if (reserved.has(first)) return "";
+    return first;
+  }
+
+  return "";
+}
+
+function normalizeWebsiteHostKey(url) {
+  const normalized = normalizeBusinessWebsiteUrl(url) || normalizeWebsiteUrl(url);
+  if (!normalized) return "";
+  const host = normalizeText(hostnameForUrl(normalized)).toLowerCase();
+  if (!host) return "";
+  const normalizedHost = host.replace(/^www\./, "");
+  const socialKey = extractSocialProfileKeyFromUrl(normalized, normalizedHost);
+  if (socialKey) {
+    return `${normalizedHost}/${socialKey}`;
+  }
+  return normalizedHost;
 }
 
 function normalizeBusinessNameForWebsiteGuard(name) {
@@ -1071,6 +1250,24 @@ function normalizeBusinessNameForWebsiteGuard(name) {
     .split(/\s+/)
     .filter((token) => token.length >= 2 && !stop.has(token))
     .join(" ");
+}
+
+function isWebsiteLikelyForBusinessNameGuard(url, businessName) {
+  if (isLikelySocialBusinessProfileUrl(url)) {
+    return true;
+  }
+  const host = normalizeWebsiteHostKey(url);
+  if (!host) return false;
+  const hostRoot = host.split(".")[0].replace(/[^a-z0-9]/g, "");
+  if (!hostRoot) return false;
+
+  const tokens = normalizeBusinessNameForWebsiteGuard(businessName)
+    .split(/\s+/)
+    .filter((token) => token.length >= 3);
+  if (tokens.length === 0) {
+    return true;
+  }
+  return tokens.some((token) => hostRoot.includes(token) || token.includes(hostRoot));
 }
 
 function areLikelySameBusinessForWebsite(nameA, nameB) {
@@ -1090,8 +1287,10 @@ function areLikelySameBusinessForWebsite(nameA, nameB) {
   return overlap / union >= 0.75;
 }
 
-function registerOrRejectWebsiteForRow(url, row, registryInput) {
+function registerOrRejectWebsiteForRow(url, row, registryInput, optionsInput) {
   const registry = registryInput instanceof Map ? registryInput : new Map();
+  const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+  const trustedSource = options.trustedSource === true;
   const normalized = normalizeBusinessWebsiteUrl(url);
   if (!normalized) return "";
 
@@ -1102,6 +1301,10 @@ function registerOrRejectWebsiteForRow(url, row, registryInput) {
   const placeId = normalizeText(source.place_id);
   const mapsUrl = normalizeMapsUrl(source.maps_url || "");
   const businessName = normalizeText(source.name);
+  const isSocialProfile = isLikelySocialBusinessProfileUrl(normalized);
+  if (!trustedSource && !isWebsiteLikelyForBusinessNameGuard(normalized, businessName)) {
+    return "";
+  }
   const existing = registry.get(host);
 
   if (!existing) {
@@ -1118,7 +1321,9 @@ function registerOrRejectWebsiteForRow(url, row, registryInput) {
     (mapsUrl && existing.mapsUrls.has(mapsUrl)) ||
     (businessName && existing.primaryName && areLikelySameBusinessForWebsite(businessName, existing.primaryName));
 
-  if (!sameIdentity) {
+  // Permit host reuse for normal business websites (many leads share one domain),
+  // but keep strict identity guard for social profile URLs.
+  if (!sameIdentity && isSocialProfile) {
     return "";
   }
 
@@ -1127,15 +1332,23 @@ function registerOrRejectWebsiteForRow(url, row, registryInput) {
   return normalized;
 }
 
+function parseStoredSocialLinks(value) {
+  const raw = normalizeText(value);
+  if (!raw) return [];
+  const parts = raw
+    .split(/\s*\|\s*|\s*,\s*|\n+/)
+    .map((entry) => normalizeBusinessWebsiteUrl(entry) || normalizeWebsiteUrl(entry))
+    .filter(Boolean);
+  return Array.from(new Set(parts));
+}
+
 async function enrichRows(rows, options) {
   const config = options && typeof options === "object" ? options : {};
-  const maxPagesPerSite = clampInt(config.maxPagesPerSite, 1, 120, 12);
+  const maxPagesPerSite = FOCUSED_CRAWL_MAX_PAGES;
   const timeoutMs = clampInt(config.timeoutMs, 5000, 30000, 12000);
   const visibleTabs = config.visibleTabs === true;
-  const emailOnlyMode = config.requireEmail === true;
-  const aggressiveEmailHunt = config.aggressiveEmailHunt === true;
-  const scanSocialLinks = config.scanSocialLinks !== false;
-  const maxSocialPages = clampInt(config.maxSocialPages, 0, 8, 2);
+  const contactGoals = normalizeContactGoals(config.contactGoals);
+  const maxSocialPages = clampInt(config.maxSocialPages, 0, 8, 4);
   const maxDiscoveredPages = clampInt(config.maxDiscoveredPages, maxPagesPerSite, 240, Math.max(80, maxPagesPerSite * 5));
   const discovery = normalizeDiscoveryOptions(config);
 
@@ -1177,22 +1390,52 @@ async function enrichRows(rows, options) {
 
     const sourceRow = rows[index] || {};
     const enrichedRow = createEnrichedRowFromSource(sourceRow);
-    let website = registerOrRejectWebsiteForRow(sourceRow.website, sourceRow, websiteHostOwners);
+    let website = registerOrRejectWebsiteForRow(sourceRow.website, sourceRow, websiteHostOwners, {
+      trustedSource: true
+    });
+    const listingFacebook = pickRowFacebookFallback(sourceRow);
+    const sourceSocialLinks = Array.from(new Set([listingFacebook, ...parseStoredSocialLinks(sourceRow.social_links)].filter(Boolean)));
     enrichedRow.website = website;
+    enrichedRow.listing_facebook = listingFacebook;
 
     let rowPagesVisited = 0;
     let rowPagesDiscovered = 0;
     let rowSocialScanned = 0;
     let rowBlocked = false;
-    let rowCurrentUrl = website;
+    let rowCurrentUrl = website || listingFacebook;
     let rowDiscoveryEmailRecovered = false;
     let preDiscoveryRan = false;
+    const initialIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
+    const needsAnyGoalData = initialIntent.needsEmail || initialIntent.needsPhone;
+
+    if (!needsAnyGoalData) {
+      const currentStatus = normalizeText(enrichedRow.website_scan_status).toLowerCase();
+      if (
+        currentStatus === "" ||
+        currentStatus === "queued" ||
+        currentStatus === "not_requested" ||
+        currentStatus === "init" ||
+        currentStatus === "running"
+      ) {
+        enrichedRow.website_scan_status = "enriched";
+      }
+      summary.enriched += 1;
+      summary.processed += 1;
+      outputRows.push(enrichedRow);
+      emitEnrichProgress(summary, {
+        currentName: sourceRow.name,
+        currentUrl: rowCurrentUrl,
+        phase: "skip",
+        leadSignalText: "Skipped: selected contact goal already met",
+        leadSignalTone: "info",
+        sitePagesVisited: summary.pages_visited,
+        sitePagesDiscovered: summary.pages_discovered
+      });
+      continue;
+    }
 
     const runSiteScan = async (targetUrl, phasePrefix) => {
-      const baseIntent = deriveScanIntent(enrichedRow);
-      const rowIntent = emailOnlyMode
-        ? { needsEmail: baseIntent.needsEmail, needsOwner: false, needsPhone: false }
-        : baseIntent;
+      const rowIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
       const phaseInit = phasePrefix === "discovery" ? "discovery_site_init" : "site_init";
       emitEnrichProgress(summary, {
         currentName: sourceRow.name,
@@ -1208,11 +1451,9 @@ async function enrichRows(rows, options) {
         maxDiscoveredPages,
         timeoutMs,
         visibleTabs,
-        emailOnlyMode,
-        aggressiveEmailHunt,
-        scanSocialLinks,
+        scanSocialLinks: true,
         maxSocialPages,
-        skipSitemapLookup: phasePrefix === "discovery" || emailOnlyMode,
+        skipSitemapLookup: phasePrefix === "discovery",
         intent: rowIntent,
         businessName: sourceRow.name,
         businessCategory: sourceRow.category,
@@ -1220,6 +1461,7 @@ async function enrichRows(rows, options) {
         sourceQuery: sourceRow.source_query,
         businessWebsite: targetUrl,
         discoveredWebsite: enrichedRow.discovered_website,
+        seedSocialLinks: sourceSocialLinks,
         shouldStop: config.shouldStop,
         onTabChange: config.onScanTabChange,
         onProgress: (scanProgress) => {
@@ -1246,10 +1488,34 @@ async function enrichRows(rows, options) {
     };
 
     try {
-      if (!website && discovery.enabled) {
+      if (!website && sourceSocialLinks.length > 0) {
+        const socialFallbackQueue = prioritizeSocialLinks(sourceSocialLinks)
+          .filter(shouldScanSocialUrl)
+          .slice(0, Math.max(1, maxSocialPages));
+        for (const socialCandidate of socialFallbackQueue) {
+          const recoveredFromSocial = registerOrRejectWebsiteForRow(socialCandidate, enrichedRow, websiteHostOwners, {
+            trustedSource: true
+          });
+          if (!recoveredFromSocial) continue;
+          website = recoveredFromSocial;
+          enrichedRow.website = recoveredFromSocial;
+          rowCurrentUrl = recoveredFromSocial;
+          const discoveryStatus = normalizeText(enrichedRow.discovery_status).toLowerCase();
+          if (discoveryStatus === "" || discoveryStatus === "not_requested") {
+            enrichedRow.discovery_status = "recovered_website";
+            enrichedRow.discovery_source = "gbp_social";
+          }
+          break;
+        }
+      }
+
+      const shouldRecoverMissingWebsite = !website && discovery.enabled === true && discovery.recoverMissingWebsite === true;
+      if (shouldRecoverMissingWebsite) {
         preDiscoveryRan = true;
         const discoveryResult = await runLeadDiscovery(enrichedRow, {
           ...discovery,
+          enabled: true,
+          sources: discovery.sources,
           timeoutMs,
           visibleTabs,
           shouldStop: config.shouldStop,
@@ -1266,7 +1532,9 @@ async function enrichRows(rows, options) {
           const recoveredWebsite = registerOrRejectWebsiteForRow(discoveryResult.discoveredWebsite, enrichedRow, websiteHostOwners);
           website = recoveredWebsite;
           enrichedRow.website = website;
-          if (!recoveredWebsite) {
+          if (recoveredWebsite) {
+            rowCurrentUrl = recoveredWebsite;
+          } else {
             enrichedRow.discovered_website = "";
             if (normalizeText(enrichedRow.discovery_status).toLowerCase() === "recovered_website") {
               enrichedRow.discovery_status = "no_match";
@@ -1276,14 +1544,16 @@ async function enrichRows(rows, options) {
       }
 
       if (!website) {
+        const noWebsiteReason = "no_website";
+        const noWebsiteSignal = "Skipped: no website";
         enrichedRow.website_scan_status = "no_website";
-        enrichedRow.no_email_reason = "no_website";
+        enrichedRow.no_email_reason = noWebsiteReason;
         enrichedRow.email_source_url = "";
         enrichedRow.email_confidence = "";
         enrichedRow.site_pages_visited = 0;
         enrichedRow.site_pages_discovered = 0;
         enrichedRow.social_pages_scanned = 0;
-        enrichedRow.social_links = "";
+        enrichedRow.social_links = sourceSocialLinks.join(" | ");
         enrichedRow.website_phone = "";
         enrichedRow.website_phone_source = "";
         summary.skipped += 1;
@@ -1293,7 +1563,7 @@ async function enrichRows(rows, options) {
           currentName: sourceRow.name,
           currentUrl: rowCurrentUrl,
           phase: "skip",
-          leadSignalText: "Skipped: no website",
+          leadSignalText: noWebsiteSignal,
           leadSignalTone: "warn",
           sitePagesVisited: summary.pages_visited,
           sitePagesDiscovered: summary.pages_discovered
@@ -1315,7 +1585,28 @@ async function enrichRows(rows, options) {
         enrichedRow.discovery_status = "recovered_email";
       }
 
-      if (discovery.enabled && !rowHasAnyEmail(enrichedRow) && !preDiscoveryRan) {
+      if (
+        website &&
+        listingFacebook &&
+        !sameWebsiteHost(listingFacebook, website)
+      ) {
+        const followupIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
+        const needsEmailAfterSite = followupIntent.needsEmail;
+        const needsPhoneAfterSite = followupIntent.needsPhone;
+        if (needsEmailAfterSite || needsPhoneAfterSite) {
+          const socialFallbackScan = await runSiteScan(listingFacebook, "listing_social");
+          const hasEmailFromFallback = scanHasAnyEmail(socialFallbackScan);
+          const hasPhoneFromFallback = Boolean(sanitizePhoneText(socialFallbackScan.primaryPhone));
+          applyScanResultToRow(enrichedRow, socialFallbackScan, {
+            overwrite: hasEmailFromFallback || hasPhoneFromFallback,
+            overwriteWithoutEmail: hasEmailFromFallback || hasPhoneFromFallback
+          });
+        }
+      }
+
+      const postSiteIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
+      const stillMissingAnyGoal = postSiteIntent.needsEmail || postSiteIntent.needsPhone;
+      if (discovery.enabled && stillMissingAnyGoal && !preDiscoveryRan) {
         const discoveryResult = await runLeadDiscovery(enrichedRow, {
           ...discovery,
           timeoutMs,
@@ -1359,11 +1650,8 @@ async function enrichRows(rows, options) {
         }
       }
 
-      if (
-        !emailOnlyMode &&
-        !normalizeText(enrichedRow.owner_name) &&
-        normalizeText(enrichedRow.website_scan_status).toLowerCase() !== "blocked"
-      ) {
+      const shouldLookupOwner = discovery.enabled === true && !normalizeText(enrichedRow.owner_name);
+      if (shouldLookupOwner) {
         emitEnrichProgress(summary, {
           currentName: sourceRow.name,
           currentUrl: rowCurrentUrl,
@@ -1372,31 +1660,28 @@ async function enrichRows(rows, options) {
           sitePagesDiscovered: summary.pages_discovered + rowPagesDiscovered,
           socialScanned: summary.social_scanned + rowSocialScanned
         });
-        const ownerLookup = await recoverOwnerViaGoogle(
-          {
-            ...enrichedRow,
-            name: normalizeText(sourceRow.name) || normalizeText(enrichedRow.name),
-            address: normalizeText(sourceRow.address) || normalizeText(enrichedRow.address),
-            source_query: normalizeText(sourceRow.source_query) || normalizeText(enrichedRow.source_query),
-            category: normalizeText(sourceRow.category) || normalizeText(enrichedRow.category)
-          },
-          {
+        try {
+          const ownerRecovery = await recoverOwnerViaGoogle(enrichedRow, {
             timeoutMs,
             visibleTabs,
             shouldStop: config.shouldStop,
             onScanTabChange: config.onScanTabChange
+          });
+          if (ownerRecovery && ownerRecovery.found) {
+            enrichedRow.owner_name = normalizeText(ownerRecovery.ownerName);
+            enrichedRow.owner_title = normalizeText(ownerRecovery.ownerTitle);
+            enrichedRow.owner_confidence = formatConfidence(ownerRecovery.ownerConfidence);
+            if (!normalizeText(enrichedRow.email_source_url) && normalizeText(ownerRecovery.sourceUrl)) {
+              enrichedRow.email_source_url =
+                normalizeBusinessWebsiteUrl(ownerRecovery.sourceUrl) ||
+                normalizeWebsiteUrl(ownerRecovery.sourceUrl) ||
+                "";
+            }
+            rowCurrentUrl = normalizeBusinessWebsiteUrl(ownerRecovery.sourceUrl) || rowCurrentUrl;
           }
-        );
-        if (ownerLookup && ownerLookup.found) {
-          const lookupName = normalizeText(ownerLookup.ownerName);
-          const ownerContext = {
-            businessName: normalizeText(enrichedRow.name),
-            businessCategory: normalizeText(enrichedRow.category)
-          };
-          if (isLikelyPersonName(lookupName, ownerContext) && Number(ownerLookup.ownerConfidence) >= 0.86) {
-            enrichedRow.owner_name = lookupName;
-            enrichedRow.owner_title = normalizeText(ownerLookup.ownerTitle);
-            enrichedRow.owner_confidence = formatConfidence(ownerLookup.ownerConfidence);
+        } catch (ownerLookupError) {
+          if (isEnrichStopError(ownerLookupError)) {
+            throw ownerLookupError;
           }
         }
       }
@@ -1553,10 +1838,10 @@ function emitEnrichProgress(summary, context) {
 
 function buildLeadSignal(row) {
   const primaryEmail = normalizeText(row && row.primary_email);
+  const primaryPhone = sanitizePhoneText((row && row.phone) || (row && row.website_phone));
   const emailType = normalizeText(row && row.primary_email_type).toLowerCase();
   const emailSource = normalizeText(row && row.primary_email_source);
   const scanStatus = normalizeText(row && row.website_scan_status).toLowerCase();
-  const ownerName = normalizeText(row && row.owner_name);
   const discoveryStatus = normalizeText(row && row.discovery_status).toLowerCase();
   const discoverySource = normalizeText(row && row.discovery_source);
 
@@ -1579,6 +1864,13 @@ function buildLeadSignal(row) {
     };
   }
 
+  if (primaryPhone) {
+    return {
+      text: "Saved phone number",
+      tone: "success"
+    };
+  }
+
   if (scanStatus === "blocked") {
     return { text: "Skipped: blocked by site protections", tone: "warn" };
   }
@@ -1589,15 +1881,11 @@ function buildLeadSignal(row) {
     return { text: "Skipped: no website", tone: "warn" };
   }
 
-  if (scanStatus === "enriched" && ownerName) {
-    return { text: "Saved owner details (no public email)", tone: "info" };
-  }
-
   if (discoveryStatus === "recovered_website") {
     return { text: `Recovered website (${sourceLabel(discoverySource)})`, tone: "info" };
   }
 
-  return { text: "Skipped: no public email found", tone: "warn" };
+  return { text: "Skipped: no public contact details found", tone: "warn" };
 }
 
 function sourceLabel(source) {
@@ -1609,13 +1897,15 @@ function sourceLabel(source) {
 
 function normalizeDiscoveryOptions(options) {
   const raw = options && typeof options === "object" ? options : {};
-  const sourcesRaw = raw.discoverySources && typeof raw.discoverySources === "object" ? raw.discoverySources : {};
   const budgetRaw = raw.discoveryBudget && typeof raw.discoveryBudget === "object" ? raw.discoveryBudget : {};
+  const enabled = raw.leadDiscoveryEnabled === true;
+  const recoverMissingWebsite = enabled && raw.recoverMissingWebsite !== false;
 
   return {
-    enabled: raw.leadDiscoveryEnabled === true,
+    enabled,
+    recoverMissingWebsite,
     sources: {
-      google: sourcesRaw.google !== false,
+      google: enabled,
       linkedin: false,
       yelp: false
     },
@@ -1791,7 +2081,8 @@ function hasAnyActiveFilter(filters) {
     normalizeText(f.categoryInclude) !== "" ||
     normalizeText(f.categoryExclude) !== "" ||
     f.hasWebsite === true ||
-    f.hasPhone === true
+    f.hasPhone === true ||
+    f.hasEmail === true
   );
 }
 
@@ -1806,33 +2097,39 @@ function normalizeScrapeFilters(filtersLike) {
     categoryInclude: source.categoryInclude,
     categoryExclude: source.categoryExclude,
     hasWebsite: source.hasWebsite === true,
-    hasPhone: source.hasPhone === true
+    hasPhone: source.hasPhone === true,
+    hasEmail: source.hasEmail === true || source.requireEmailForLeads === true || source.requireEmail === true
   });
 }
 
 function applyScrapeFilters(rows, filters) {
   if (!Array.isArray(rows)) return [];
-  const normalizedFilters = normalizeScrapeFilters(filters);
-  if (!hasAnyActiveFilter(normalizedFilters)) {
+  const scrapeStageFilters = toScrapeStageFilters(filters);
+  if (!hasAnyActiveFilter(scrapeStageFilters)) {
     return rows;
   }
-  return rows.filter((row) => applyFilters(row, normalizedFilters));
+  return rows.filter((row) => applyFilters(row, scrapeStageFilters));
 }
 
-function rowHasAnyEmailField(row) {
-  const value = row && typeof row === "object" ? row : {};
-  return Boolean(
-    normalizeEmail(value.primary_email) ||
-      normalizeEmail(value.owner_email) ||
-      normalizeEmail(value.contact_email) ||
-      normalizeEmail(value.email)
-  );
-}
-
-function filterRowsByEmailRequirement(rows, requireEmail) {
+function applyOutputFilters(rows, filters) {
   if (!Array.isArray(rows)) return [];
-  if (requireEmail !== true) return rows;
-  return rows.filter((row) => rowHasAnyEmailField(row));
+  const outputFilters = normalizeOutputFilters(filters);
+  if (!hasAnyActiveFilter(outputFilters)) {
+    return rows;
+  }
+  return rows.filter((row) => applyFilters(row, outputFilters));
+}
+
+function toScrapeStageFilters(filtersLike) {
+  const base = normalizeScrapeFilters(filtersLike);
+  return {
+    ...base,
+    hasEmail: false
+  };
+}
+
+function normalizeOutputFilters(filtersLike) {
+  return normalizeScrapeFilters(filtersLike);
 }
 
 async function resolveScrapeFilters(runId, candidateFilters) {
@@ -2731,7 +3028,11 @@ async function openTabAndExtractLinks(url, optionsInput, extractFn) {
       throw createEnrichStopError();
     }
     await sleep(700);
-    const links = await extractFn(tab.id);
+    const links = await promiseWithTimeout(
+      Promise.resolve(extractFn(tab.id, timeoutMs)),
+      timeoutMs,
+      "Timed out while extracting links"
+    );
     return Array.isArray(links) ? links : [];
   } finally {
     if (typeof options.onScanTabChange === "function") {
@@ -2762,7 +3063,11 @@ async function openTabAndExtractData(url, optionsInput, extractFn) {
       throw createEnrichStopError();
     }
     await sleep(700);
-    return await extractFn(tab.id);
+    return await promiseWithTimeout(
+      Promise.resolve(extractFn(tab.id, timeoutMs)),
+      timeoutMs,
+      "Timed out while extracting page data"
+    );
   } finally {
     if (typeof options.onScanTabChange === "function") {
       options.onScanTabChange(null);
@@ -2773,8 +3078,8 @@ async function openTabAndExtractData(url, optionsInput, extractFn) {
   }
 }
 
-function executeGoogleResultsExtraction(tabId, maxResults) {
-  return new Promise((resolve, reject) => {
+function executeGoogleResultsExtraction(tabId, maxResults, timeoutMs) {
+  const task = new Promise((resolve, reject) => {
     chrome.scripting.executeScript(
       {
         target: { tabId },
@@ -2794,10 +3099,18 @@ function executeGoogleResultsExtraction(tabId, maxResults) {
       }
     );
   });
+  if (timeoutMs == null) {
+    return task;
+  }
+  return promiseWithTimeout(
+    task,
+    clampInt(timeoutMs, 1500, 120000, 12000),
+    "Timed out while parsing Google results"
+  );
 }
 
-function executeDirectoryResultsExtraction(tabId) {
-  return new Promise((resolve, reject) => {
+function executeDirectoryResultsExtraction(tabId, timeoutMs) {
+  const task = new Promise((resolve, reject) => {
     chrome.scripting.executeScript(
       {
         target: { tabId },
@@ -2816,6 +3129,14 @@ function executeDirectoryResultsExtraction(tabId) {
       }
     );
   });
+  if (timeoutMs == null) {
+    return task;
+  }
+  return promiseWithTimeout(
+    task,
+    clampInt(timeoutMs, 1500, 120000, 12000),
+    "Timed out while parsing directory links"
+  );
 }
 
 function extractGoogleSearchResultLinksScript(maxResultsInput) {
@@ -2945,6 +3266,26 @@ function deriveScanIntent(row) {
   };
 }
 
+function normalizeContactGoals(input) {
+  const raw = input && typeof input === "object" ? input : {};
+  const wantsEmail = raw.email !== false;
+  const wantsPhone = raw.phone !== false;
+  return {
+    email: wantsEmail,
+    phone: wantsPhone
+  };
+}
+
+function deriveGoalScanIntent(row, goalsInput) {
+  const baseIntent = deriveScanIntent(row);
+  const goals = normalizeContactGoals(goalsInput);
+  return {
+    needsEmail: goals.email === true && baseIntent.needsEmail === true,
+    needsOwner: false,
+    needsPhone: goals.phone === true && baseIntent.needsPhone === true
+  };
+}
+
 function normalizeScanIntent(intent) {
   const raw = intent && typeof intent === "object" ? intent : {};
   const needsEmail = raw.needsEmail !== false;
@@ -2955,14 +3296,49 @@ function normalizeScanIntent(intent) {
   };
 }
 
-function isHighIntentPath(url, intent) {
-  const lower = normalizeText(url).toLowerCase();
-  if (!lower) return false;
-  const inx = normalizeScanIntent(intent);
-  if (inx.needsEmail && /(contact|support|help|email|customer|service|about|faq|legal|privacy)/i.test(lower)) return true;
-  if (inx.needsOwner && /(team|about|leadership|management|staff|founder|owner|who-we-are|our-story)/i.test(lower)) return true;
-  if (inx.needsPhone && /(contact|locations?|office|call)/i.test(lower)) return true;
-  return /(contact|about|team|leadership|staff)/i.test(lower);
+function focusedCrawlPageType(url) {
+  const normalized = normalizeBusinessWebsiteUrl(url) || normalizeWebsiteUrl(url) || normalizeText(url);
+  if (!normalized) return "";
+
+  let lowerPath = "";
+  try {
+    const parsed = new URL(normalized);
+    lowerPath = normalizeText(`${parsed.pathname} ${parsed.search}`).toLowerCase();
+  } catch (_error) {
+    lowerPath = normalizeText(normalized).toLowerCase();
+  }
+  if (!lowerPath) return "";
+
+  if (/(^|[\/\s_-])(contact(?:-?us)?|get-in-touch|reach-us|call-us)([\/\s_-]|$)/i.test(lowerPath)) {
+    return "contact";
+  }
+  if (/(^|[\/\s_-])(team|our-team|ourteam|leadership|management|staff)([\/\s_-]|$)/i.test(lowerPath)) {
+    return "team";
+  }
+  if (/(^|[\/\s_-])(about(?:-?us)?|our-story|who-we-are|company|founder|owner)([\/\s_-]|$)/i.test(lowerPath)) {
+    return "about";
+  }
+  if (/(^|[\/\s_-])(careers?|jobs?|join-us|work-with-us|vacanc(y|ies))([\/\s_-]|$)/i.test(lowerPath)) {
+    return "careers";
+  }
+  return "";
+}
+
+function buildFocusedRouteSeedUrls(baseOrigin) {
+  const origin = normalizeText(baseOrigin);
+  if (!origin) return [];
+
+  const out = [];
+  for (const path of FOCUSED_CRAWL_SEED_PATHS) {
+    const seed = canonicalizeCrawlUrl(`${origin}${path}`, origin);
+    if (!seed) continue;
+    out.push(seed);
+  }
+  return out;
+}
+
+function isHighIntentPath(url, _intent) {
+  return Boolean(focusedCrawlPageType(url));
 }
 
 function prioritizeCrawlLinkEntries(links, intent) {
@@ -2980,20 +3356,12 @@ function prioritizeCrawlLinkEntries(links, intent) {
     .map(([link, score]) => ({ link, score }));
 }
 
-function isFocusedCrawlTarget(url, intent) {
-  if (isHighIntentPath(url, intent)) return true;
-  const lower = normalizeText(url).toLowerCase();
-  if (!lower) return false;
-  return /(contact|about|team|leadership|management|staff|founder|owner|who-we-are|our-story|careers?|jobs?|locations?|office|meet-the)/i.test(lower);
+function isFocusedCrawlTarget(url, _intent) {
+  return Boolean(focusedCrawlPageType(url));
 }
 
-function shouldQueueFocusedCrawlLink(url, score, intent, visitedCount, queueCount) {
-  const numericScore = Number(score) || 0;
-  if (isFocusedCrawlTarget(url, intent)) return true;
-  // Allow very small exploration from homepage before narrowing to high-intent pages.
-  if (visitedCount === 0 && queueCount < 3 && numericScore >= 4) return true;
-  if (visitedCount <= 1 && queueCount < 2 && numericScore >= 5) return true;
-  return false;
+function shouldQueueFocusedCrawlLink(url, _score, _intent, _visitedCount, _queueCount) {
+  return Boolean(focusedCrawlPageType(url));
 }
 
 async function scanWebsite(startUrl, options) {
@@ -3013,51 +3381,76 @@ async function scanWebsite(startUrl, options) {
   const highIntentDiscovered = new Set();
   let sitemapAttempted = false;
   let noSignalStreak = 0;
-  const emailOnlyMode = options.emailOnlyMode === true;
-  const aggressiveEmailHunt = options.aggressiveEmailHunt === true;
-  const baseIntent = normalizeScanIntent(options.intent);
-  const intent = emailOnlyMode
-    ? { needsEmail: baseIntent.needsEmail, needsOwner: false, needsPhone: false }
-    : baseIntent;
-  const ownerContext = {
-    businessName: normalizeText(options.businessName),
-    businessCategory: normalizeText(options.businessCategory)
-  };
+  const intent = normalizeScanIntent(options.intent);
   const normalizedStartUrl = normalizeBusinessWebsiteUrl(startUrl) || normalizeWebsiteUrl(startUrl) || startUrl;
   const baseOrigin = new URL(normalizedStartUrl).origin;
   let firstUrl = canonicalizeCrawlUrl(normalizedStartUrl, baseOrigin) || stripHash(normalizedStartUrl) || normalizedStartUrl;
   firstUrl = normalizeSeedScanUrl(firstUrl, baseOrigin);
   const startHost = hostnameForUrl(firstUrl) || hostnameForUrl(normalizedStartUrl);
+  const preferredEmailHosts = Array.from(new Set([
+    normalizeHostForMatch(startHost),
+    normalizeHostForMatch(hostnameForUrl(normalizedStartUrl)),
+    normalizeHostForMatch(hostnameForUrl(options.businessWebsite)),
+    normalizeHostForMatch(hostnameForUrl(options.discoveredWebsite))
+  ].filter(Boolean)));
   const socialRootScan = isSocialNetworkHost(startHost);
   const searchRootScan = isSearchEngineHost(startHost);
   const directoryRootScan = isDirectoryHost(startHost);
   const focusedSinglePageScan = options.focusedSinglePage === true || searchRootScan || directoryRootScan;
-  const skipSitemapLookup = socialRootScan || options.skipSitemapLookup === true || focusedSinglePageScan;
-  const maxPagesCap = socialRootScan ? 4 : focusedSinglePageScan ? 1 : 12;
-  const effectiveMaxPages = Math.min(clampInt(options.maxPagesPerSite, 1, 120, maxPagesCap), maxPagesCap);
+  const strictFocusedPageFlow = !socialRootScan && !focusedSinglePageScan;
+  if (strictFocusedPageFlow) {
+    firstUrl = `${baseOrigin}/`;
+  }
+  const skipSitemapLookup = socialRootScan || options.skipSitemapLookup === true || focusedSinglePageScan || strictFocusedPageFlow;
+  const maxPagesCap = socialRootScan ? 4 : focusedSinglePageScan ? 1 : FOCUSED_CRAWL_MAX_PAGES;
+  const effectiveMaxPages = maxPagesCap;
   const sitemapQueueBudget = Math.max(6, effectiveMaxPages * 2);
   const perPageLinkBudget = Math.max(24, effectiveMaxPages * 4);
   const noSignalExitThreshold = socialRootScan ? 2 : focusedSinglePageScan ? 1 : 4;
 
-  const seedUrls = socialRootScan ? buildSocialProbeUrls(firstUrl) : [firstUrl];
+  const seedUrls = socialRootScan
+    ? buildSocialProbeUrls(firstUrl)
+    : strictFocusedPageFlow
+      ? [firstUrl, ...buildFocusedRouteSeedUrls(baseOrigin)]
+      : [firstUrl];
   const queue = [];
   const visited = new Set();
   const queued = new Set();
   const discovered = new Set();
+  const focusedPageTypeQueueCounts = new Map();
+
+  const focusedPageTypeQueueCount = (type) => Number(focusedPageTypeQueueCounts.get(type) || 0);
+  const canQueueFocusedPageType = (type) => !type || focusedPageTypeQueueCount(type) < FOCUSED_CRAWL_MAX_PATHS_PER_TYPE;
+
+  const markFocusedPageTypeQueued = (url) => {
+    const type = focusedCrawlPageType(url);
+    if (type) {
+      focusedPageTypeQueueCounts.set(type, focusedPageTypeQueueCount(type) + 1);
+    }
+    return type;
+  };
 
   for (const seedUrl of seedUrls) {
     const normalizedSeed = canonicalizeCrawlUrl(seedUrl, baseOrigin) || stripHash(seedUrl) || "";
     const seedKey = stripHash(normalizedSeed);
     if (!normalizedSeed || !seedKey || queued.has(seedKey)) continue;
+    if (strictFocusedPageFlow) {
+      const seedType = focusedCrawlPageType(normalizedSeed);
+      if (seedType && !canQueueFocusedPageType(seedType)) {
+        continue;
+      }
+    }
     queued.add(seedKey);
     discovered.add(seedKey);
     queue.push(normalizedSeed);
+    markFocusedPageTypeQueued(normalizedSeed);
   }
   if (queue.length === 0) {
     const firstKey = stripHash(firstUrl) || firstUrl;
     queue.push(firstUrl);
     queued.add(firstKey);
     discovered.add(firstKey);
+    markFocusedPageTypeQueued(firstUrl);
   }
 
   const reportProgress = (phase, currentUrl) => {
@@ -3107,107 +3500,208 @@ async function scanWebsite(startUrl, options) {
     }
   };
 
-  const hasAnyEmailNow = () => {
-    const bestOwnerNow = pickBestOwner(ownerCandidates, Array.from(emails), ownerContext);
-    const ownerEmailNow = chooseOwnerEmail(Array.from(emails), bestOwnerNow ? bestOwnerNow.name : "");
-    const companyEmailNow = chooseContactEmail(Array.from(emails), ownerEmailNow);
-    return Boolean(ownerEmailNow || companyEmailNow);
+  const contactSelectionOptions = {
+    preferredHosts: preferredEmailHosts,
+    sourceMap: emailSourceByAddress
   };
 
-  const runAggressiveGoogleFallback = async () => {
-    if (!aggressiveEmailHunt || !intent.needsEmail || hasAnyEmailNow()) return;
-    if (!tab || tab.id == null) return;
+  const seededSocialLinks = Array.isArray(options.seedSocialLinks) ? options.seedSocialLinks : [];
+  for (const seededSocial of seededSocialLinks) {
+    registerSocialCandidate(seededSocial);
+  }
 
-    const hostForSearch = normalizeText(startHost).toLowerCase().replace(/^www\./, "");
-    if (!hostForSearch) return;
+  const isTrustedCollectedEmail = (email) => {
+    const normalized = normalizeEmail(email);
+    if (!normalized) return false;
+    const source = sourceForEmail(normalized, emailSourceByAddress).toLowerCase();
+    if (source === "facebook") {
+      return true;
+    }
+    if (!isEmailAlignedWithBusiness(normalized, preferredEmailHosts)) {
+      return false;
+    }
+    return true;
+  };
 
-    const businessName = normalizeText(options.businessName);
-    const searchQueries = [
-      `"@${hostForSearch}"`,
-      "\"contact\" \"email\"",
-      "\"mailto:\"",
-      businessName ? `"${businessName}" email` : ""
-    ].filter(Boolean);
-    const probedPages = new Set();
-    const maxProbePages = 6;
+  const scannedSocialTargets = new Set();
+  let homepageSocialAttempted = false;
 
-    for (const query of searchQueries) {
-      if (probedPages.size >= maxProbePages || hasAnyEmailNow()) break;
-      assertNotStopped();
+  const scanQueuedSocialCandidates = async (optionsInput) => {
+    const scanOptions = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const prioritizeEmailGoal = scanOptions.prioritizeEmailGoal === true && intent.needsEmail;
+    let companyEmailNow = chooseContactEmail(Array.from(emails), "", contactSelectionOptions);
+    let trustedCompanyEmailNow = Boolean(companyEmailNow && isTrustedCollectedEmail(companyEmailNow));
+    let primaryPhoneNow = choosePrimaryPhone(Array.from(phones));
+    let needsEmailNow = intent.needsEmail && !trustedCompanyEmailNow;
+    let needsPhoneNow = intent.needsPhone && !primaryPhoneNow;
 
-      const searchQuery = `site:${hostForSearch} ${query}`;
-      const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&num=10&hl=en`;
-      reportProgress("google_email_search", searchUrl);
+    const facebookQueue = prioritizeSocialLinks(Array.from(socialCandidates))
+      .filter(shouldScanSocialUrl)
+      .slice(0, options.maxSocialPages || 0);
+    const shouldTrySocial =
+      facebookQueue.length > 0 &&
+      Number(options.maxSocialPages || 0) > 0 &&
+      (needsEmailNow || needsPhoneNow || prioritizeEmailGoal);
 
-      let candidates = [];
-      try {
-        await updateTabUrl(tab.id, searchUrl);
-        await waitForTabComplete(tab.id, options.timeoutMs);
+    if (!shouldTrySocial || !tab || tab.id == null) {
+      return {
+        attempted: false,
+        emailFound: trustedCompanyEmailNow,
+        phoneFound: Boolean(primaryPhoneNow),
+        goalsMet: !needsEmailNow && !needsPhoneNow
+      };
+    }
+
+    let attempted = false;
+    let socialBudget = Number(options.maxSocialPages || 0);
+
+    for (const baseSocialUrl of facebookQueue) {
+      if (socialBudget <= 0) break;
+      const probes = buildSocialProbeUrls(baseSocialUrl);
+      for (const socialUrl of probes) {
+        if (socialBudget <= 0) break;
+        const normalizedTarget = normalizeBusinessWebsiteUrl(socialUrl) || normalizeWebsiteUrl(socialUrl);
+        if (!normalizedTarget || scannedSocialTargets.has(normalizedTarget)) continue;
+
+        attempted = true;
+        scannedSocialTargets.add(normalizedTarget);
+        socialBudget -= 1;
+
         assertNotStopped();
-        await sleep(600);
-        candidates = await executeGoogleResultsExtraction(tab.id, 3);
-      } catch (_googleSearchError) {
-        assertNotStopped();
-        reportProgress("google_email_search_error", searchUrl);
-        continue;
-      }
-
-      for (const candidate of Array.isArray(candidates) ? candidates : []) {
-        if (probedPages.size >= maxProbePages || hasAnyEmailNow()) break;
-        const candidateUrl = normalizeBusinessWebsiteUrl(candidate && candidate.url) || normalizeWebsiteUrl(candidate && candidate.url);
-        if (!candidateUrl || probedPages.has(candidateUrl)) continue;
-        const candidateHost = normalizeText(hostnameForUrl(candidateUrl)).toLowerCase().replace(/^www\./, "");
-        if (!candidateHost) continue;
-        if (!candidateHost.includes(hostForSearch) && !hostForSearch.includes(candidateHost)) continue;
-        probedPages.add(candidateUrl);
-
-        const candidateKey = stripHash(candidateUrl) || candidateUrl;
-        if (candidateKey && !discovered.has(candidateKey)) {
-          discovered.add(candidateKey);
-        }
-
-        reportProgress("google_email_page", candidateUrl);
-        let pageData = null;
+        reportProgress("social_page", normalizedTarget);
+        let socialData = null;
         try {
+          const socialHost = hostnameForUrl(normalizedTarget);
+          const isFacebookTarget = socialHost.includes("facebook.com");
           assertNotStopped();
-          await updateTabUrl(tab.id, candidateUrl);
+          await updateTabUrl(tab.id, normalizedTarget);
           await waitForTabComplete(tab.id, options.timeoutMs);
           assertNotStopped();
-          await sleep(700);
-          pageData = await executeExtraction(tab.id);
-        } catch (_googlePageError) {
+          await sleep(isFacebookTarget ? 1100 : 700);
+
+          const aggregateEmails = new Set();
+          const aggregatePhones = new Set();
+          const aggregateOwnerCandidates = [];
+          let aggregateBlocked = false;
+          let hasExtractionPayload = false;
+          let lastExtractionError = null;
+          const maxExtractAttempts = isFacebookTarget
+            ? options.visibleTabs === true ? 1 : 2
+            : 1;
+
+          for (let attempt = 0; attempt < maxExtractAttempts; attempt += 1) {
+            assertNotStopped();
+            let extracted = null;
+            try {
+              extracted = await executeExtraction(tab.id, options.timeoutMs);
+              lastExtractionError = null;
+            } catch (extractionError) {
+              lastExtractionError = extractionError;
+            }
+
+            if (extracted && typeof extracted === "object") {
+              hasExtractionPayload = true;
+              if (extracted.blocked === true) {
+                aggregateBlocked = true;
+              }
+
+              for (const email of extracted.emails || []) {
+                const normalizedEmail = normalizeEmail(email);
+                if (normalizedEmail) {
+                  aggregateEmails.add(normalizedEmail);
+                }
+              }
+
+              for (const phoneValue of extracted.phones || []) {
+                const normalizedPhone = sanitizePhoneText(phoneValue);
+                if (normalizedPhone) {
+                  aggregatePhones.add(normalizedPhone);
+                }
+              }
+
+              for (const candidate of extracted.ownerCandidates || []) {
+                if (!candidate || !candidate.name) continue;
+                aggregateOwnerCandidates.push(candidate);
+              }
+
+              if (aggregateEmails.size > 0 || aggregatePhones.size > 0) {
+                break;
+              }
+            }
+
+            if (attempt < maxExtractAttempts - 1) {
+              reportProgress("social_retry", normalizedTarget);
+              await sleep(650 + attempt * 250);
+            }
+          }
+
+          if (!hasExtractionPayload && lastExtractionError) {
+            throw lastExtractionError;
+          }
+
+          if (hasExtractionPayload) {
+            socialData = {
+              emails: Array.from(aggregateEmails),
+              phones: Array.from(aggregatePhones),
+              ownerCandidates: aggregateOwnerCandidates,
+              blocked: aggregateBlocked
+            };
+          }
+        } catch (_socialPageError) {
           assertNotStopped();
-          reportProgress("google_email_page_error", candidateUrl);
+          socialScanned += 1;
+          reportProgress("social_error", normalizedTarget);
           continue;
         }
 
-        pagesVisited += 1;
-        if (!pageData) continue;
-        if (pageData.blocked === true) {
+        socialScanned += 1;
+        reportProgress("social_done", normalizedTarget);
+        if (!socialData) continue;
+
+        if (socialData.blocked === true) {
           blocked = true;
         }
-        for (const email of pageData.emails || []) {
-          registerEmail(email, candidateUrl);
+
+        for (const email of socialData.emails || []) {
+          registerEmail(email, normalizedTarget);
         }
-        for (const phoneValue of pageData.phones || []) {
-          registerPhone(phoneValue, candidateUrl);
+        for (const phoneValue of socialData.phones || []) {
+          registerPhone(phoneValue, normalizedTarget);
         }
-        for (const ownerCandidate of pageData.ownerCandidates || []) {
-          if (!ownerCandidate || !ownerCandidate.name) continue;
+
+        for (const candidate of socialData.ownerCandidates || []) {
+          if (!candidate || !candidate.name) continue;
           ownerCandidates.push({
-            name: normalizeText(ownerCandidate.name),
-            title: normalizeText(ownerCandidate.title),
-            score: Number(ownerCandidate.score) || 0,
-            source: normalizeText(ownerCandidate.source || "google_fallback")
+            name: normalizeText(candidate.name),
+            title: normalizeText(candidate.title),
+            score: Number(candidate.score) || 0,
+            source: normalizeText(candidate.source || "social")
           });
         }
 
-        if (hasAnyEmailNow()) {
-          reportProgress("google_email_found", candidateUrl);
+        companyEmailNow = chooseContactEmail(Array.from(emails), "", contactSelectionOptions);
+        trustedCompanyEmailNow = Boolean(companyEmailNow && isTrustedCollectedEmail(companyEmailNow));
+        primaryPhoneNow = choosePrimaryPhone(Array.from(phones));
+        needsEmailNow = intent.needsEmail && !trustedCompanyEmailNow;
+        needsPhoneNow = intent.needsPhone && !primaryPhoneNow;
+        if (!needsEmailNow && !needsPhoneNow) {
+          if (trustedCompanyEmailNow) {
+            reportProgress("social_email_found", normalizedTarget);
+          } else if (primaryPhoneNow) {
+            reportProgress("social_phone_found", normalizedTarget);
+          }
+          socialBudget = 0;
           break;
         }
       }
     }
+
+    return {
+      attempted,
+      emailFound: trustedCompanyEmailNow,
+      phoneFound: Boolean(primaryPhoneNow),
+      goalsMet: !needsEmailNow && !needsPhoneNow
+    };
   };
 
   try {
@@ -3236,6 +3730,8 @@ async function scanWebsite(startUrl, options) {
           const normalizedLink = canonicalizeCrawlUrl(entry.link, baseOrigin);
           if (!normalizedLink) continue;
           if (!shouldQueueFocusedCrawlLink(normalizedLink, entry.score, intent, visited.size, queue.length)) continue;
+          const pageType = focusedCrawlPageType(normalizedLink);
+          if (strictFocusedPageFlow && !canQueueFocusedPageType(pageType)) continue;
           const linkKey = stripHash(normalizedLink);
           if (!linkKey) continue;
           if (visited.has(linkKey) || queued.has(linkKey)) continue;
@@ -3244,6 +3740,7 @@ async function scanWebsite(startUrl, options) {
           discovered.add(linkKey);
           queued.add(linkKey);
           queue.push(normalizedLink);
+          markFocusedPageTypeQueued(normalizedLink);
           if (queue.length >= sitemapQueueBudget) break;
           if (entry.score >= 6) {
             highIntentDiscovered.add(linkKey);
@@ -3260,6 +3757,9 @@ async function scanWebsite(startUrl, options) {
       const nextUrl = queue.shift();
       const nextKey = stripHash(nextUrl);
       if (!nextKey || visited.has(nextKey)) continue;
+      if (strictFocusedPageFlow && visited.size > 0 && !focusedCrawlPageType(nextUrl)) {
+        continue;
+      }
 
       visited.add(nextKey);
       pagesVisited = visited.size;
@@ -3275,7 +3775,7 @@ async function scanWebsite(startUrl, options) {
         await waitForTabComplete(tab.id, options.timeoutMs);
         assertNotStopped();
         await sleep(800);
-        pageData = await executeExtraction(tab.id);
+        pageData = await executeExtraction(tab.id, options.timeoutMs);
       } catch (_sitePageError) {
         assertNotStopped();
         reportProgress("site_page_error", nextUrl);
@@ -3306,6 +3806,9 @@ async function scanWebsite(startUrl, options) {
           source: normalizeText(candidate.source)
         });
       }
+      for (const social of pageData.socialLinks || []) {
+        registerSocialCandidate(social);
+      }
 
       const hasSignalOnPage =
         (Array.isArray(pageData.emails) && pageData.emails.length > 0) ||
@@ -3314,24 +3817,24 @@ async function scanWebsite(startUrl, options) {
         pageData.hasContactSignals === true;
       noSignalStreak = hasSignalOnPage ? 0 : noSignalStreak + 1;
 
-      const bestOwnerNow = pickBestOwner(ownerCandidates, Array.from(emails), ownerContext);
-      const personalEmailNow = chooseOwnerEmail(Array.from(emails), bestOwnerNow ? bestOwnerNow.name : "");
-      const companyEmailNow = chooseContactEmail(Array.from(emails), personalEmailNow);
-      if (personalEmailNow) {
-        reportProgress("site_personal_email_found", nextUrl);
-        break;
-      }
+      const companyEmailNow = chooseContactEmail(Array.from(emails), "", contactSelectionOptions);
+      const trustedCompanyEmailNow = companyEmailNow && isTrustedCollectedEmail(companyEmailNow);
+      const primaryPhoneNow = choosePrimaryPhone(Array.from(phones));
+      const needsPhoneStill = intent.needsPhone && !primaryPhoneNow;
+      const shouldTryHomepageSocialFirst =
+        !socialRootScan &&
+        !focusedSinglePageScan &&
+        pagesVisited === 1 &&
+        homepageSocialAttempted !== true &&
+        socialCandidates.size > 0 &&
+        intent.needsEmail;
       if (
         intent.needsEmail &&
-        companyEmailNow &&
-        (
-          emailOnlyMode ||
-          !intent.needsOwner ||
-          priorityPagesVisited >= 2 ||
-          pagesVisited >= Math.min(effectiveMaxPages, 5)
-        )
+        trustedCompanyEmailNow &&
+        !needsPhoneStill &&
+        !shouldTryHomepageSocialFirst
       ) {
-        reportProgress("site_company_email_found", nextUrl);
+        reportProgress("site_email_found", nextUrl);
         break;
       }
 
@@ -3340,46 +3843,46 @@ async function scanWebsite(startUrl, options) {
           ...(Array.isArray(pageData.relatedLinks) ? pageData.relatedLinks : []),
           ...(Array.isArray(pageData.internalLinks) ? pageData.internalLinks : [])
         ], intent).slice(0, perPageLinkBudget);
-        const hasHighIntentCandidate = prioritizedLinks.some((entry) => entry.score >= 6);
 
         for (const entry of prioritizedLinks) {
-          if (
-            entry.score <= -3 &&
-            hasHighIntentCandidate &&
-            queue.length >= Math.min(8, effectiveMaxPages)
-          ) {
-            continue;
-          }
-
           const normalizedLink = canonicalizeCrawlUrl(entry.link, baseOrigin);
           if (!normalizedLink) continue;
           if (!shouldQueueFocusedCrawlLink(normalizedLink, entry.score, intent, visited.size, queue.length)) continue;
+          const pageType = focusedCrawlPageType(normalizedLink);
+          if (!pageType) continue;
+          if (!canQueueFocusedPageType(pageType)) continue;
 
           const linkKey = stripHash(normalizedLink);
           if (!linkKey) continue;
           if (visited.has(linkKey) || queued.has(linkKey)) continue;
           if (discovered.size >= options.maxDiscoveredPages) continue;
-          if (queue.length >= effectiveMaxPages * 2 && entry.score < 6) continue;
 
           discovered.add(linkKey);
           queued.add(linkKey);
           queue.push(normalizedLink);
+          markFocusedPageTypeQueued(normalizedLink);
           if (entry.score >= 6) {
             highIntentDiscovered.add(linkKey);
           }
         }
       }
 
-      for (const social of pageData.socialLinks || []) {
-        registerSocialCandidate(social);
-      }
       reportProgress("site_page_done", nextUrl);
+
+      if (shouldTryHomepageSocialFirst) {
+        homepageSocialAttempted = true;
+        const homepageSocialResult = await scanQueuedSocialCandidates({
+          prioritizeEmailGoal: true
+        });
+        if (homepageSocialResult.goalsMet) {
+          break;
+        }
+      }
 
       const queueHasFocusedTarget = queue.some((queuedUrl) => isFocusedCrawlTarget(queuedUrl, intent));
       if (
         noSignalStreak >= noSignalExitThreshold &&
         emails.size === 0 &&
-        ownerCandidates.length === 0 &&
         (priorityPagesVisited >= 1 || !queueHasFocusedTarget)
       ) {
         reportProgress("site_focus_exit", nextUrl);
@@ -3387,90 +3890,10 @@ async function scanWebsite(startUrl, options) {
       }
     }
 
-    const bestOwnerBeforeSocial = pickBestOwner(ownerCandidates, Array.from(emails), ownerContext);
-    const ownerEmailBeforeSocial = chooseOwnerEmail(Array.from(emails), bestOwnerBeforeSocial ? bestOwnerBeforeSocial.name : "");
-    const companyEmailBeforeSocial = chooseContactEmail(Array.from(emails), ownerEmailBeforeSocial);
-    const emailBeforeSocial = ownerEmailBeforeSocial || companyEmailBeforeSocial;
-    if (options.scanSocialLinks === true && !emailBeforeSocial && socialCandidates.size > 0) {
-      const socialQueue = prioritizeSocialLinks(Array.from(socialCandidates))
-        .filter(shouldScanSocialUrl)
-        .slice(0, options.maxSocialPages || 0);
-      const scannedTargets = new Set();
-      let socialBudget = Number(options.maxSocialPages || 0);
+    await scanQueuedSocialCandidates({
+      prioritizeEmailGoal: false
+    });
 
-      for (const baseSocialUrl of socialQueue) {
-        if (socialBudget <= 0) break;
-        const probes = buildSocialProbeUrls(baseSocialUrl);
-        for (const socialUrl of probes) {
-          if (socialBudget <= 0) break;
-          const normalizedTarget = normalizeBusinessWebsiteUrl(socialUrl) || normalizeWebsiteUrl(socialUrl);
-          if (!normalizedTarget || scannedTargets.has(normalizedTarget)) continue;
-          scannedTargets.add(normalizedTarget);
-          socialBudget -= 1;
-
-          assertNotStopped();
-          reportProgress("social_page", normalizedTarget);
-          let socialData = null;
-          try {
-            assertNotStopped();
-            await updateTabUrl(tab.id, normalizedTarget);
-            await waitForTabComplete(tab.id, options.timeoutMs);
-            assertNotStopped();
-            await sleep(700);
-            socialData = await executeExtraction(tab.id);
-          } catch (_socialPageError) {
-            assertNotStopped();
-            socialScanned += 1;
-            reportProgress("social_error", normalizedTarget);
-            continue;
-          }
-
-          socialScanned += 1;
-          reportProgress("social_done", normalizedTarget);
-          if (!socialData) continue;
-
-          if (socialData.blocked === true) {
-            blocked = true;
-          }
-
-          for (const email of socialData.emails || []) {
-            registerEmail(email, normalizedTarget);
-          }
-          for (const phoneValue of socialData.phones || []) {
-            registerPhone(phoneValue, normalizedTarget);
-          }
-
-          for (const candidate of socialData.ownerCandidates || []) {
-            if (!candidate || !candidate.name) continue;
-            ownerCandidates.push({
-              name: normalizeText(candidate.name),
-              title: normalizeText(candidate.title),
-              score: Number(candidate.score) || 0,
-              source: normalizeText(candidate.source || "social")
-            });
-          }
-          const bestOwnerNow = pickBestOwner(ownerCandidates, Array.from(emails), ownerContext);
-          const ownerEmailNow = chooseOwnerEmail(Array.from(emails), bestOwnerNow ? bestOwnerNow.name : "");
-          const companyEmailNow = chooseContactEmail(Array.from(emails), ownerEmailNow);
-          if (ownerEmailNow || companyEmailNow) {
-            reportProgress(ownerEmailNow ? "social_personal_email_found" : "social_email_found", normalizedTarget);
-            socialBudget = 0;
-            break;
-          }
-        }
-      }
-    }
-
-    if (
-      aggressiveEmailHunt &&
-      intent.needsEmail &&
-      !hasAnyEmailNow() &&
-      !socialRootScan &&
-      !searchRootScan &&
-      !directoryRootScan
-    ) {
-      await runAggressiveGoogleFallback();
-    }
   } finally {
     if (typeof options.onTabChange === "function") {
       options.onTabChange(null);
@@ -3481,51 +3904,20 @@ async function scanWebsite(startUrl, options) {
   }
 
   const emailList = Array.from(emails);
-  const bestOwner = pickBestOwner(ownerCandidates, emailList, ownerContext);
-  const ownerEmailCandidate = chooseOwnerEmail(emailList, bestOwner ? bestOwner.name : "");
-  const ownerEmailSourceCandidate = ownerEmailCandidate ? sourceForEmail(ownerEmailCandidate, emailSourceByAddress) : "";
-  const skipOwnerVerification = emailOnlyMode || ownerEmailSourceCandidate === "facebook";
-  let ownerEmail = "";
-  if (ownerEmailCandidate && isPotentialPersonalEmail(ownerEmailCandidate) && !skipOwnerVerification) {
-    reportProgress("owner_email_verify_lookup", ownerEmailCandidate);
-    const verification = await verifyPersonalEmailViaGoogle(
-      {
-        candidateEmail: ownerEmailCandidate,
-        ownerName: bestOwner ? bestOwner.name : "",
-        businessName: normalizeText(options.businessName),
-        businessCategory: normalizeText(options.businessCategory),
-        businessAddress: normalizeText(options.businessAddress || options.sourceQuery),
-        businessWebsite: normalizeText(options.businessWebsite || startUrl),
-        discoveredWebsite: normalizeText(options.discoveredWebsite)
-      },
-      {
-        timeoutMs: options.timeoutMs,
-        visibleTabs: options.visibleTabs === true,
-        shouldStop: options.shouldStop,
-        onScanTabChange: options.onTabChange
-      }
-    ).catch(() => ({ verified: false, matchedUrl: "" }));
-    if (verification.verified === true) {
-      ownerEmail = ownerEmailCandidate;
-      reportProgress("owner_email_verified", normalizeText(verification.matchedUrl));
-    } else {
-      reportProgress("owner_email_unverified", ownerEmailCandidate);
-    }
-  } else if (ownerEmailCandidate && skipOwnerVerification) {
-    reportProgress("owner_email_social_source", ownerEmailCandidate);
-  }
-  // Personal email must be verified, otherwise keep only company/contact output.
-  let contactEmail = "";
-  if (ownerEmail) {
+  const bestOwner = pickBestOwner(ownerCandidates, emailList, {
+    businessName: normalizeText(options.businessName),
+    businessCategory: normalizeText(options.businessCategory)
+  });
+  const ownerName = bestOwner ? normalizeText(bestOwner.name) : "";
+  const ownerTitle = bestOwner ? normalizeText(bestOwner.title) : "";
+  const ownerConfidence = bestOwner ? formatConfidence(bestOwner.confidence) : "";
+  const ownerEmail = ownerName ? chooseOwnerEmail(emailList, ownerName) : "";
+  let contactEmail = chooseContactEmail(emailList, ownerEmail, contactSelectionOptions);
+  if (contactEmail && !isTrustedCollectedEmail(contactEmail)) {
     contactEmail = "";
-  } else {
-    contactEmail = chooseContactEmail(emailList, "");
-    if (!contactEmail && ownerEmailCandidate) {
-      contactEmail = ownerEmailCandidate;
-    }
   }
-  const primaryEmail = ownerEmail || contactEmail || "";
-  const primaryEmailType = ownerEmail ? "personal" : contactEmail ? "company" : "";
+  const primaryEmail = contactEmail || "";
+  const primaryEmailType = primaryEmail ? (isPotentialPersonalEmail(primaryEmail) ? "personal" : "company") : "";
   const primaryEmailSource = primaryEmail ? sourceForEmail(primaryEmail, emailSourceByAddress) : "";
   const emailSourceUrl = primaryEmail ? sourceUrlForEmail(primaryEmail, emailSourceUrlByAddress) : "";
   const emailConfidence = primaryEmail
@@ -3535,17 +3927,16 @@ async function scanWebsite(startUrl, options) {
         primaryEmailType,
         primaryEmailSource,
         ownerEmail,
-        ownerName: bestOwner ? bestOwner.name : "",
+        ownerName,
         emailSourceUrl
       })
     )
     : "";
   const primaryPhone = choosePrimaryPhone(Array.from(phones));
   const primaryPhoneSource = primaryPhone ? sourceForPhone(primaryPhone, phoneSourceByNumber) : "";
-  const ownerConfidence = bestOwner ? formatConfidence(bestOwner.confidence) : "";
 
   let status = "no_public_data";
-  if (bestOwner || primaryEmail || primaryPhone) {
+  if (primaryEmail || primaryPhone) {
     status = "enriched";
   } else if (blocked) {
     status = "blocked";
@@ -3562,8 +3953,8 @@ async function scanWebsite(startUrl, options) {
   }
 
   return {
-    ownerName: bestOwner ? bestOwner.name : "",
-    ownerTitle: bestOwner ? bestOwner.title : "",
+    ownerName,
+    ownerTitle,
     ownerConfidence,
     ownerEmail,
     contactEmail,
@@ -3596,36 +3987,28 @@ function buildSocialProbeUrls(url) {
 
   try {
     const parsed = new URL(normalized);
-    const rootPath = parsed.pathname.replace(/\/+$/, "");
-    const roots = [rootPath];
-    if (/\/about(\/|$)/i.test(rootPath)) {
-      roots.push(rootPath.replace(/\/about(\/.*)?$/i, ""));
+    let rootPath = parsed.pathname.replace(/\/+$/, "");
+    // Facebook email is usually visible on the main profile/page route.
+    // If we were given an About/Details route, normalize back to the root profile URL.
+    rootPath = rootPath.replace(/\/(?:about(?:_contact_and_basic_info)?|info_contact|details)(?:\/.*)?$/i, "");
+    rootPath = rootPath.replace(/^\/pg\/([^/]+)(?:\/.*)?$/i, "/$1");
+    if (!rootPath) {
+      rootPath = "/";
     }
-    if (/\/info(\/|$)/i.test(rootPath)) {
-      roots.push(rootPath.replace(/\/info(\/.*)?$/i, ""));
+    parsed.pathname = rootPath;
+    parsed.hash = "";
+    parsed.search = "";
+    parsed.searchParams.delete("sk");
+    const baseOnly = normalizeWebsiteUrl(parsed.toString());
+    if (!baseOnly || !shouldScanSocialUrl(baseOnly)) {
+      return out.filter(shouldScanSocialUrl);
     }
-
-    for (const root of roots.filter(Boolean)) {
-      const base = root.replace(/\/+$/, "");
-      const candidates = [
-        `${parsed.origin}${base}`,
-        `${parsed.origin}${base}/about`,
-        `${parsed.origin}${base}/about_contact_and_basic_info`,
-        `${parsed.origin}${base}/info_contact`,
-        `${parsed.origin}${base}/details`
-      ];
-      for (const candidate of candidates) {
-        const normalizedCandidate = normalizeWebsiteUrl(candidate);
-        if (normalizedCandidate && !out.includes(normalizedCandidate)) {
-          out.push(normalizedCandidate);
-        }
-      }
-    }
+    return [baseOnly];
   } catch (_error) {
-    return out;
+    return out.filter(shouldScanSocialUrl);
   }
 
-  return out;
+  return out.filter(shouldScanSocialUrl);
 }
 
 async function discoverLinksFromSitemap(tabId, baseOrigin, timeoutMs, intent) {
@@ -3931,7 +4314,12 @@ function chooseOwnerEmail(emails, ownerName) {
   return "";
 }
 
-function chooseContactEmail(emails, ownerEmail) {
+function chooseContactEmail(emails, ownerEmail, optionsInput) {
+  const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+  const sourceMap = options.sourceMap instanceof Map ? options.sourceMap : null;
+  const preferredHosts = Array.isArray(options.preferredHosts)
+    ? options.preferredHosts.map((host) => normalizeHostForMatch(host)).filter(Boolean)
+    : [];
   const list = sanitizeEmailList(emails).filter((email) => email !== ownerEmail);
   if (list.length === 0) return "";
 
@@ -3970,12 +4358,65 @@ function chooseContactEmail(emails, ownerEmail) {
     "wecare"
   ];
 
-  for (const prefix of priorityPrefixes) {
-    const hit = list.find((email) => hasMailboxPrefix(localPartForEmail(email), prefix));
-    if (hit) return hit;
+  const prefixScore = (email) => {
+    const local = localPartForEmail(email);
+    if (!local) return 0;
+    for (let i = 0; i < priorityPrefixes.length; i += 1) {
+      if (hasMailboxPrefix(local, priorityPrefixes[i])) {
+        return Math.max(1, priorityPrefixes.length - i);
+      }
+    }
+    return 0;
+  };
+
+  const hasSelectionContext = preferredHosts.length > 0 || sourceMap instanceof Map;
+  if (!hasSelectionContext) {
+    for (const prefix of priorityPrefixes) {
+      const hit = list.find((email) => hasMailboxPrefix(localPartForEmail(email), prefix));
+      if (hit) return hit;
+    }
+    return list[0] || "";
   }
 
-  return list[0] || "";
+  let best = "";
+  let bestScore = Number.NEGATIVE_INFINITY;
+  let bestPrefixScore = 0;
+
+  for (const email of list) {
+    const domain = domainForEmail(email);
+    const aligned = isEmailAlignedWithBusiness(email, preferredHosts);
+    const freeMailbox = isFreeMailboxDomain(domain);
+    const suspiciousDomain = isSuspiciousThirdPartyEmailDomain(domain);
+    const source = sourceMap ? normalizeText(sourceMap.get(email)).toLowerCase() : "";
+    const hitPrefixScore = prefixScore(email);
+
+    let score = 0;
+    score += hitPrefixScore * 1.5;
+    if (aligned) score += 26;
+    if (freeMailbox) score += 10;
+    if (source === "website") score += 18;
+    if (source === "facebook") score += 6;
+
+    if (preferredHosts.length > 0 && source === "website" && !aligned && !freeMailbox) {
+      score -= 32;
+    }
+    if (suspiciousDomain) {
+      score -= 24;
+    }
+
+    if (
+      !best ||
+      score > bestScore ||
+      (score === bestScore && hitPrefixScore > bestPrefixScore) ||
+      (score === bestScore && hitPrefixScore === bestPrefixScore && email.length < best.length)
+    ) {
+      best = email;
+      bestScore = score;
+      bestPrefixScore = hitPrefixScore;
+    }
+  }
+
+  return best || "";
 }
 
 function isGenericMailboxLocalPart(localPart) {
@@ -4092,6 +4533,76 @@ function localPartForEmail(email) {
   return value.slice(0, at);
 }
 
+function domainForEmail(email) {
+  const value = normalizeText(email).toLowerCase();
+  const at = value.indexOf("@");
+  if (at <= 0 || at >= value.length - 1) return "";
+  return value.slice(at + 1).replace(/^www\./, "");
+}
+
+function normalizeHostForMatch(hostname) {
+  return normalizeText(hostname).toLowerCase().replace(/^www\./, "");
+}
+
+function domainMatchesHost(emailDomain, host) {
+  const domain = normalizeHostForMatch(emailDomain);
+  const normalizedHost = normalizeHostForMatch(host);
+  if (!domain || !normalizedHost) return false;
+  return (
+    domain === normalizedHost ||
+    domain.endsWith(`.${normalizedHost}`) ||
+    normalizedHost.endsWith(`.${domain}`)
+  );
+}
+
+function isFreeMailboxDomain(domainInput) {
+  const domain = normalizeHostForMatch(domainInput);
+  if (!domain) return false;
+  return (
+    domain === "gmail.com" ||
+    domain === "outlook.com" ||
+    domain === "hotmail.com" ||
+    domain === "live.com" ||
+    domain === "yahoo.com" ||
+    domain === "ymail.com" ||
+    domain === "icloud.com" ||
+    domain === "me.com" ||
+    domain === "aol.com" ||
+    domain === "proton.me" ||
+    domain === "protonmail.com"
+  );
+}
+
+function isSuspiciousThirdPartyEmailDomain(domainInput) {
+  const domain = normalizeHostForMatch(domainInput);
+  if (!domain) return false;
+  return (
+    domain.includes("waze.com") ||
+    domain.includes("google.com") ||
+    domain.includes("googleusercontent.com") ||
+    domain.includes("gstatic.com") ||
+    domain.includes("facebookmail.com") ||
+    domain.includes("meta.com") ||
+    domain.includes("instagram.com") ||
+    domain.includes("twitter.com") ||
+    domain.includes("x.com")
+  );
+}
+
+function isEmailAlignedWithBusiness(email, preferredHostsInput) {
+  const domain = domainForEmail(email);
+  if (!domain) return false;
+  if (isFreeMailboxDomain(domain)) return true;
+
+  const preferredHosts = Array.isArray(preferredHostsInput)
+    ? preferredHostsInput
+      .map((host) => normalizeHostForMatch(host))
+      .filter(Boolean)
+    : [];
+  if (preferredHosts.length === 0) return true;
+  return preferredHosts.some((host) => domainMatchesHost(domain, host));
+}
+
 function hasMailboxPrefix(localPart, prefix) {
   const local = normalizeText(localPart).toLowerCase();
   const token = normalizeText(prefix).toLowerCase();
@@ -4187,7 +4698,7 @@ function isSocialNetworkHost(hostnameOrUrl) {
 function socialPriorityScore(url) {
   const host = hostnameForUrl(url);
   if (!host) return 0;
-  if (host.includes("facebook.com")) return 8;
+  if (host.includes("facebook.com")) return isLikelyFacebookBusinessPageUrl(url) ? 10 : -8;
   if (host.includes("instagram.com")) return 3;
   if (host.includes("linkedin.com")) return 2;
   if (host.includes("x.com") || host.includes("twitter.com")) return -3;
@@ -4195,10 +4706,93 @@ function socialPriorityScore(url) {
   return 1;
 }
 
-function shouldScanSocialUrl(url) {
+function isLikelySocialBusinessProfileUrl(url) {
   const host = hostnameForUrl(url);
-  if (!host) return false;
-  return host.includes("facebook.com");
+  if (!host || !isSocialNetworkHost(host)) return false;
+  if (host.includes("facebook.com")) {
+    return isLikelyFacebookBusinessPageUrl(url);
+  }
+  return extractSocialProfileKeyFromUrl(url, host.replace(/^www\./, "")) !== "";
+}
+
+function shouldScanSocialUrl(url) {
+  if (!isLikelySocialBusinessProfileUrl(url)) return false;
+  const host = hostnameForUrl(url);
+  return Boolean(host && host.includes("facebook.com"));
+}
+
+function isLikelyFacebookBusinessPageUrl(url) {
+  const normalized = normalizeBusinessWebsiteUrl(url) || normalizeWebsiteUrl(url);
+  if (!normalized) return false;
+  let parsed = null;
+  try {
+    parsed = new URL(normalized);
+  } catch (_error) {
+    return false;
+  }
+
+  const host = normalizeText(parsed.hostname).toLowerCase();
+  if (!host.includes("facebook.com")) return false;
+
+  const path = normalizeText(parsed.pathname || "").toLowerCase().replace(/\/+$/, "");
+  if (!path || path === "/") return false;
+  if (path.startsWith("/sharer") || path.startsWith("/share.php")) return false;
+  if (path.startsWith("/l.php")) return false;
+  if (path.startsWith("/dialog/") || path.startsWith("/plugins/")) return false;
+  if (path.startsWith("/privacy") || path.startsWith("/policies") || path.startsWith("/terms")) return false;
+  if (path.startsWith("/help") || path.startsWith("/legal") || path.startsWith("/settings")) return false;
+  if (path.startsWith("/login") || path.startsWith("/recover") || path.startsWith("/checkpoint")) return false;
+  if (path.startsWith("/watch") || path.startsWith("/reel") || path.startsWith("/story.php")) return false;
+  if (path.startsWith("/groups") || path.startsWith("/events") || path.startsWith("/marketplace")) return false;
+
+  const firstSegment = path.split("/").filter(Boolean)[0] || "";
+  if (!firstSegment) return false;
+  if (firstSegment === "profile.php") {
+    const profileId = normalizeText(parsed.searchParams.get("id"));
+    return profileId !== "";
+  }
+  if (firstSegment === "pg") {
+    const secondSegment = path.split("/").filter(Boolean)[1] || "";
+    return secondSegment !== "";
+  }
+  if (firstSegment === "pages") {
+    const segments = path.split("/").filter(Boolean);
+    const secondSegment = segments[1] || "";
+    const numericId = segments.find((segment) => /^\d{5,}$/.test(segment)) || "";
+    return Boolean(secondSegment || numericId);
+  }
+
+  const reservedTopLevel = new Set([
+    "about",
+    "ads",
+    "business",
+    "dialog",
+    "events",
+    "gaming",
+    "groups",
+    "hashtag",
+    "help",
+    "legal",
+    "login",
+    "marketplace",
+    "messages",
+    "notifications",
+    "pages",
+    "people",
+    "plugins",
+    "policies",
+    "privacy",
+    "recover",
+    "search",
+    "settings",
+    "share.php",
+    "sharer",
+    "terms",
+    "watch"
+  ]);
+  if (reservedTopLevel.has(firstSegment)) return false;
+
+  return /^[a-z0-9._-]{3,}$/i.test(firstSegment);
 }
 
 function classifyEmailSource(url) {
@@ -4538,22 +5132,28 @@ function crawlPriorityScore(url, intent) {
   const lower = normalizeText(url).toLowerCase();
   if (!lower) return 0;
   const inx = normalizeScanIntent(intent);
+  const pageType = focusedCrawlPageType(url);
 
   let score = 0;
-  if (/(contact|about|team|leadership|management|staff|company|our-story|who-we-are|founder|owner|meet-the|people|about-us)/i.test(lower)) {
-    score += 6;
+  if (pageType === "contact") {
+    score += 14;
+  } else if (pageType === "about") {
+    score += 12;
+  } else if (pageType === "team") {
+    score += 11;
+  } else if (pageType === "careers") {
+    score += 10;
+  } else {
+    score -= 9;
   }
-  if (/(email|support|help|faq|location|locations|office)/i.test(lower)) {
+  if (inx.needsEmail && pageType === "contact") {
     score += 4;
   }
-  if (inx.needsEmail && /(contact|support|help|customer|service|email|privacy|terms|legal)/i.test(lower)) {
-    score += 5;
+  if (inx.needsOwner && (pageType === "about" || pageType === "team" || pageType === "careers")) {
+    score += 2;
   }
-  if (inx.needsOwner && /(team|about|leadership|management|staff|founder|owner|who-we-are|our-story)/i.test(lower)) {
-    score += 6;
-  }
-  if (inx.needsPhone && /(contact|location|locations|office|call)/i.test(lower)) {
-    score += 4;
+  if (inx.needsPhone && pageType === "contact") {
+    score += 1;
   }
   if (/\/blog(\/|$)|\/news(\/|$)|\/article(s)?(\/|$)|\/press(\/|$)/i.test(lower)) {
     score -= 7;
@@ -4707,33 +5307,34 @@ function createScanTab(url, visible) {
 
 function createHiddenScanTab(url) {
   return new Promise((resolve, reject) => {
-    const openMinimizedPopup = () => {
-      chrome.windows.create(
-        {
-          url,
-          focused: false,
-          state: "minimized",
-          type: "popup"
-        },
-        (windowRef) => {
-          if (chrome.runtime.lastError) {
-            openBackgroundWindow();
+    const targetUrl = normalizeBusinessWebsiteUrl(url) || normalizeWebsiteUrl(url) || normalizeText(url);
+    if (!targetUrl) {
+      reject(new Error("Failed to open hidden website tab"));
+      return;
+    }
+
+    const createInWindow = (windowId, allowRecreate) => {
+      chrome.tabs.create({ windowId, url: targetUrl, active: false }, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          if (allowRecreate) {
+            hiddenScanWindowId = null;
+            createHiddenWindow();
             return;
           }
-          const tab = windowRef && Array.isArray(windowRef.tabs) ? windowRef.tabs[0] : null;
-          if (!tab) {
-            reject(new Error("Failed to open hidden website tab"));
-            return;
-          }
-          resolve(tab);
+          reject(new Error(chrome.runtime.lastError && chrome.runtime.lastError.message
+            ? chrome.runtime.lastError.message
+            : "Failed to open hidden website tab"));
+          return;
         }
-      );
+        chrome.windows.update(windowId, { state: "minimized", focused: false }, () => {});
+        resolve(tab);
+      });
     };
 
-    const openBackgroundWindow = () => {
+    const createHiddenWindow = () => {
       chrome.windows.create(
         {
-          url,
+          url: "about:blank",
           focused: false,
           state: "minimized",
           type: "normal"
@@ -4744,22 +5345,48 @@ function createHiddenScanTab(url) {
             return;
           }
 
-          const tab = windowRef && Array.isArray(windowRef.tabs) ? windowRef.tabs[0] : null;
           const windowId = Number(windowRef && windowRef.id);
-          if (Number.isFinite(windowId)) {
-            chrome.windows.update(windowId, { state: "minimized", focused: false }, () => {});
-          }
-
-          if (!tab) {
+          if (!Number.isFinite(windowId)) {
             reject(new Error("Failed to open hidden website tab"));
             return;
           }
-          resolve(tab);
+          hiddenScanWindowId = windowId;
+
+          const bootstrapTab = windowRef && Array.isArray(windowRef.tabs) ? windowRef.tabs[0] : null;
+          const bootstrapTabId = Number(bootstrapTab && bootstrapTab.id);
+
+          chrome.tabs.create({ windowId, url: targetUrl, active: false }, (tab) => {
+            if (chrome.runtime.lastError || !tab) {
+              reject(new Error(chrome.runtime.lastError && chrome.runtime.lastError.message
+                ? chrome.runtime.lastError.message
+                : "Failed to open hidden website tab"));
+              return;
+            }
+
+            if (Number.isFinite(bootstrapTabId) && Number(tab.id) !== bootstrapTabId) {
+              chrome.tabs.remove(bootstrapTabId, () => {});
+            }
+            chrome.windows.update(windowId, { state: "minimized", focused: false }, () => {});
+            resolve(tab);
+          });
         }
       );
     };
 
-    openMinimizedPopup();
+    if (Number.isFinite(Number(hiddenScanWindowId))) {
+      const existingWindowId = Number(hiddenScanWindowId);
+      chrome.windows.get(existingWindowId, { populate: false }, (windowRef) => {
+        if (chrome.runtime.lastError || !windowRef || !Number.isFinite(Number(windowRef.id))) {
+          hiddenScanWindowId = null;
+          createHiddenWindow();
+          return;
+        }
+        createInWindow(Number(windowRef.id), true);
+      });
+      return;
+    }
+
+    createHiddenWindow();
   });
 }
 
@@ -4855,8 +5482,8 @@ function promiseWithTimeout(promise, timeoutMs, message) {
   });
 }
 
-function executeExtraction(tabId) {
-  return new Promise((resolve, reject) => {
+function executeExtraction(tabId, timeoutMs) {
+  const task = new Promise((resolve, reject) => {
     chrome.scripting.executeScript(
       {
         target: { tabId },
@@ -4877,6 +5504,14 @@ function executeExtraction(tabId) {
       }
     );
   });
+  if (timeoutMs == null) {
+    return task;
+  }
+  return promiseWithTimeout(
+    task,
+    clampInt(timeoutMs, 1500, 120000, 12000),
+    "Timed out while scanning website page"
+  );
 }
 
 function clampInt(value, min, max, fallback) {
@@ -5296,81 +5931,269 @@ async function extractPageDataScript() {
     }
   };
 
-  const closeFacebookSigninOverlays = () => {
-    const selectors = [
-      "div[role='dialog'] [aria-label='Close']",
-      "div[role='dialog'] [aria-label*='close' i]",
-      "div[role='dialog'] [aria-label*='not now' i]",
-      "div[role='dialog'] [aria-label*='cancel' i]",
-      "div[aria-modal='true'] [aria-label='Close']",
-      "div[aria-modal='true'] [aria-label*='close' i]",
-      "div[aria-modal='true'] [aria-label*='not now' i]",
-      "[aria-label='Close']"
-    ];
-    let closed = 0;
-    for (const selector of selectors) {
-      const nodes = Array.from(document.querySelectorAll(selector)).slice(0, 6);
-      for (const node of nodes) {
-        if (!isElementVisible(node)) continue;
-        if (clickElement(node)) {
-          closed += 1;
-        }
-      }
-      if (closed > 0) break;
-    }
-
-    if (closed === 0) {
-      const dialogButtons = Array.from(
-        document.querySelectorAll(
-          "div[role='dialog'] button, div[role='dialog'] [role='button'], div[aria-modal='true'] button, div[aria-modal='true'] [role='button']"
-        )
-      ).slice(0, 24);
-      const closeTokens = ["close", "not now", "cancel", "dismiss", "maybe later"];
-      for (const node of dialogButtons) {
-        if (!isElementVisible(node)) continue;
-        const label = normalize(node.getAttribute("aria-label") || node.textContent || "").toLowerCase();
-        if (!label) continue;
-        if (!closeTokens.some((token) => label === token || label.includes(token))) continue;
-        if (clickElement(node)) {
-          closed += 1;
-          break;
-        }
-      }
-    }
-
-    if (closed === 0) {
+  const dispatchEscape = () => {
+    const down = new KeyboardEvent("keydown", {
+      key: "Escape",
+      code: "Escape",
+      keyCode: 27,
+      which: 27,
+      bubbles: true,
+      cancelable: true
+    });
+    const up = new KeyboardEvent("keyup", {
+      key: "Escape",
+      code: "Escape",
+      keyCode: 27,
+      which: 27,
+      bubbles: true,
+      cancelable: true
+    });
+    const targets = [document.activeElement, document.body, document, window];
+    let sent = 0;
+    for (const target of targets) {
+      if (!target || typeof target.dispatchEvent !== "function") continue;
       try {
-        const keydown = new KeyboardEvent("keydown", {
-          key: "Escape",
-          code: "Escape",
-          keyCode: 27,
-          which: 27,
-          bubbles: true,
-          cancelable: true
-        });
-        const keyup = new KeyboardEvent("keyup", {
-          key: "Escape",
-          code: "Escape",
-          keyCode: 27,
-          which: 27,
-          bubbles: true,
-          cancelable: true
-        });
-        document.dispatchEvent(keydown);
-        document.dispatchEvent(keyup);
+        target.dispatchEvent(down);
+        target.dispatchEvent(up);
+        sent += 1;
       } catch (_error) {
-        // Ignore keyboard dispatch failures.
+        // Ignore.
+      }
+    }
+    return sent;
+  };
+
+  const looksLikeFacebookLoginWall = (node) => {
+    if (!node) return false;
+    const text = normalize((node.innerText || node.textContent || "")).toLowerCase();
+    if (!text) return false;
+    if (text.includes("see more on facebook")) return true;
+    const hasLogin = text.includes("log in") || text.includes("login");
+    const hasCreate = text.includes("create new account") || text.includes("sign up");
+    const hasForgot = text.includes("forgotten password") || text.includes("forgot password");
+    return hasLogin && (hasCreate || hasForgot);
+  };
+
+  const hideNodeHard = (node) => {
+    if (!node || !node.style) return false;
+    try {
+      node.style.setProperty("display", "none", "important");
+      node.style.setProperty("visibility", "hidden", "important");
+      node.style.setProperty("opacity", "0", "important");
+      node.style.setProperty("pointer-events", "none", "important");
+      node.setAttribute("aria-hidden", "true");
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  };
+
+  const stripFacebookScrollLocks = () => {
+    for (const root of [document.documentElement, document.body]) {
+      if (!root || !root.style) continue;
+      try {
+        root.style.setProperty("overflow", "auto", "important");
+        root.style.setProperty("position", "static", "important");
+      } catch (_error) {
+        // Ignore style write failures.
+      }
+    }
+  };
+
+  const collectVisibleFacebookLoginWalls = () => {
+    const selectors = [
+      "div[role='dialog']",
+      "div[aria-modal='true']",
+      "div[role='complementary']",
+      "aside",
+      "footer"
+    ];
+    const walls = [];
+    const seen = new Set();
+    for (const selector of selectors) {
+      const nodes = Array.from(document.querySelectorAll(selector)).slice(0, 60);
+      for (const node of nodes) {
+        if (!node || seen.has(node)) continue;
+        seen.add(node);
+        if (!isElementVisible(node)) continue;
+        if (!looksLikeFacebookLoginWall(node)) continue;
+        walls.push(node);
+      }
+    }
+    return walls;
+  };
+
+  const hasVisibleFacebookLoginWall = () => collectVisibleFacebookLoginWalls().length > 0;
+
+  const hideFacebookLoginPrompts = () => {
+    const nodes = collectVisibleFacebookLoginWalls();
+    let removed = 0;
+    for (const node of nodes) {
+      if (hideNodeHard(node)) {
+        removed += 1;
+      }
+      let current = node.parentElement;
+      for (let depth = 0; depth < 4 && current; depth += 1) {
+        const rect = typeof current.getBoundingClientRect === "function" ? current.getBoundingClientRect() : null;
+        if (rect && rect.width >= window.innerWidth * 0.75 && rect.height >= window.innerHeight * 0.6) {
+          if (hideNodeHard(current)) {
+            removed += 1;
+          }
+        }
+        current = current.parentElement;
       }
     }
 
-    return closed;
+    if (removed > 0) {
+      stripFacebookScrollLocks();
+    }
+    return removed;
+  };
+
+  const clickOutsideDialog = (dialog) => {
+    if (!dialog || typeof dialog.contains !== "function") return 0;
+    const points = [
+      [10, 10],
+      [Math.max(10, window.innerWidth - 10), 10],
+      [10, Math.max(10, window.innerHeight - 10)],
+      [Math.max(10, window.innerWidth - 10), Math.max(10, window.innerHeight - 10)]
+    ];
+    let clicked = 0;
+    for (const [x, y] of points) {
+      const target = document.elementFromPoint(x, y);
+      if (!target || dialog.contains(target)) continue;
+      if (clickElement(target)) clicked += 1;
+    }
+    return clicked;
+  };
+
+  const hardDismissFacebookLoginDialogs = () => {
+    const walls = collectVisibleFacebookLoginWalls().slice(0, 12);
+    if (walls.length === 0) {
+      return 0;
+    }
+
+    let removed = 0;
+    dispatchEscape();
+    for (const wall of walls) {
+      clickOutsideDialog(wall);
+
+      let current = wall;
+      for (let depth = 0; depth < 8 && current; depth += 1) {
+        const rect = typeof current.getBoundingClientRect === "function" ? current.getBoundingClientRect() : null;
+        const style = window.getComputedStyle(current);
+        const coversMostViewport =
+          rect &&
+          rect.width >= window.innerWidth * 0.7 &&
+          rect.height >= window.innerHeight * 0.6;
+        const isOverlayLike =
+          style.position === "fixed" ||
+          style.position === "sticky" ||
+          style.position === "absolute";
+        if (coversMostViewport || isOverlayLike || current === wall) {
+          if (hideNodeHard(current)) removed += 1;
+        }
+        current = current.parentElement;
+      }
+    }
+
+    removed += hideFacebookLoginPrompts();
+    if (removed > 0) {
+      stripFacebookScrollLocks();
+    }
+    return removed;
+  };
+
+  const closeFacebookSigninOverlays = () => {
+    const walls = collectVisibleFacebookLoginWalls();
+    if (walls.length === 0) {
+      return 0;
+    }
+
+    const closeSelectors = [
+      "[aria-label='Close']",
+      "[aria-label*='close' i]",
+      "[aria-label*='not now' i]",
+      "[aria-label*='cancel' i]",
+      "[aria-label*='dismiss' i]"
+    ];
+    let actions = 0;
+
+    for (const wall of walls.slice(0, 6)) {
+      for (const selector of closeSelectors) {
+        const nodes = Array.from(wall.querySelectorAll(selector)).slice(0, 8);
+        for (const node of nodes) {
+          if (!isElementVisible(node)) continue;
+          if (clickElement(node)) {
+            actions += 1;
+          }
+        }
+      }
+      if (actions > 0) break;
+    }
+
+    if (actions === 0) {
+      const closeTokens = ["close", "not now", "cancel", "dismiss", "maybe later", "skip", "continue without"];
+      for (const wall of walls.slice(0, 6)) {
+        const dialogButtons = Array.from(wall.querySelectorAll("button, [role='button']")).slice(0, 24);
+        for (const node of dialogButtons) {
+          if (!isElementVisible(node)) continue;
+          const label = normalize(node.getAttribute("aria-label") || node.textContent || "").toLowerCase();
+          if (!label) continue;
+          if (!closeTokens.some((token) => label === token || label.includes(token))) continue;
+          if (clickElement(node)) {
+            actions += 1;
+            break;
+          }
+        }
+        if (actions > 0) break;
+      }
+    }
+
+    if (actions === 0) {
+      dispatchEscape();
+      actions += 1;
+    }
+
+    stripFacebookScrollLocks();
+    return actions;
+  };
+
+  const dismissFacebookLoginWallsStably = async () => {
+    let clearRounds = 0;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (!hasVisibleFacebookLoginWall()) {
+        clearRounds += 1;
+        if (clearRounds >= 1) {
+          return true;
+        }
+        await wait(80);
+        continue;
+      }
+
+      clearRounds = 0;
+      closeFacebookSigninOverlays();
+      await wait(120);
+
+      if (hasVisibleFacebookLoginWall()) {
+        hardDismissFacebookLoginDialogs();
+      } else {
+        stripFacebookScrollLocks();
+      }
+
+      await wait(100);
+    }
+
+    if (hasVisibleFacebookLoginWall()) {
+      hardDismissFacebookLoginDialogs();
+      await wait(100);
+    }
+    return !hasVisibleFacebookLoginWall();
   };
 
   const expandFacebookSections = () => {
     const needles = [
       "see more",
-      "about",
-      "details",
       "contact and basic info",
       "contact info",
       "intro",
@@ -5396,17 +6219,12 @@ async function extractPageDataScript() {
   };
 
   const prepareFacebookPage = async () => {
-    for (let pass = 0; pass < 3; pass += 1) {
-      closeFacebookSigninOverlays();
-      expandFacebookSections();
-      const nextScroll = Math.max(0, pass * 900);
-      window.scrollTo(0, nextScroll);
-      await wait(180);
-    }
-    closeFacebookSigninOverlays();
+    await dismissFacebookLoginWallsStably();
     expandFacebookSections();
     window.scrollTo(0, 0);
-    await wait(120);
+    await wait(220);
+    await dismissFacebookLoginWallsStably();
+    expandFacebookSections();
   };
 
   const hostname = normalize(window.location.hostname || "").toLowerCase();
@@ -5421,6 +6239,71 @@ async function extractPageDataScript() {
   const ownerCandidates = [];
   const orgNameSet = new Set();
   const platform = detectPlatform();
+  const structuredSocialCandidates = new Set();
+
+  const isKnownSocialHost = (hostValue) => {
+    const host = normalize(hostValue).toLowerCase();
+    if (!host) return false;
+    return (
+      host.includes("facebook.com") ||
+      host.includes("instagram.com") ||
+      host.includes("linkedin.com") ||
+      host.includes("twitter.com") ||
+      host.includes("x.com") ||
+      host.includes("youtube.com") ||
+      host.includes("tiktok.com") ||
+      host.includes("threads.net")
+    );
+  };
+
+  const normalizeSocialUrl = (value) => {
+    const decoded = decodeEscapedText(decodeHtmlEntities(value));
+    let candidate = normalize(decoded)
+      .replace(/^[('"\\\s]+|[)'"\\\s]+$/g, "")
+      .replace(/[),.;]+$/, "");
+    if (!candidate) return "";
+
+    if (/^\/\//.test(candidate)) {
+      candidate = `https:${candidate}`;
+    } else if (
+      /^(?:www\.|m\.)?(?:facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)\//i.test(candidate)
+    ) {
+      candidate = `https://${candidate.replace(/^https?:\/\//i, "")}`;
+    }
+
+    if (!/^https?:\/\//i.test(candidate)) {
+      return "";
+    }
+
+    try {
+      const parsed = new URL(candidate);
+      if (!isKnownSocialHost(parsed.hostname)) return "";
+      parsed.hash = "";
+      const cleaned = normalize(parsed.toString()).replace(/[),.;]+$/, "");
+      return cleaned;
+    } catch (_error) {
+      return "";
+    }
+  };
+
+  const collectSocialUrlsFromText = (text, target) => {
+    const sourceText = decodeEscapedText(decodeHtmlEntities(text));
+    if (!sourceText) return;
+    const patterns = [
+      /https?:\/\/(?:www\.|m\.)?(?:facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)\/[^\s"'<>]+/gi,
+      /(?:^|[\s(,;])(?:www\.|m\.)?(?:facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)\/[^\s"'<>]+/gi
+    ];
+    for (const pattern of patterns) {
+      let match = pattern.exec(sourceText);
+      while (match) {
+        const candidate = normalizeSocialUrl(match[0]);
+        if (candidate) {
+          target.add(candidate);
+        }
+        match = pattern.exec(sourceText);
+      }
+    }
+  };
 
   collectEmailsFromText(rawBodyText, emails);
   collectEmailsFromText(bodyText, emails);
@@ -5514,6 +6397,13 @@ async function extractPageDataScript() {
     if (alternateName && !isLikelyPersonName(alternateName)) {
       orgNameSet.add(alternateName);
     }
+    const sameAs = Array.isArray(obj.sameAs) ? obj.sameAs : [obj.sameAs, obj.url];
+    for (const value of sameAs) {
+      const normalizedSocial = normalizeSocialUrl(value);
+      if (normalizedSocial) {
+        structuredSocialCandidates.add(normalizedSocial);
+      }
+    }
 
     if (nameValue && isLikelyPersonName(nameValue) && /person/.test(typeValue)) {
       if (jobTitleValue && ownerTitlePattern.test(jobTitleValue)) {
@@ -5573,13 +6463,26 @@ async function extractPageDataScript() {
     }
   }
 
-  const anchors = Array.from(document.querySelectorAll("a[href]"));
   const relatedLinkSet = new Set();
   const internalLinkSet = new Set();
   const socialLinkSet = new Set();
   const relatedKeywords = /(about|contact|team|leadership|management|staff|company|our-story|who-we-are|founder|owner)/i;
-  const socialHostPattern = /(facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)/i;
   const pageOrigin = window.location.origin;
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+
+  const collectSocialFromWrappedUrl = (urlValue) => {
+    try {
+      const parsed = new URL(urlValue);
+      const paramsToCheck = ["u", "url", "target", "href", "dest", "redirect", "to", "link"];
+      for (const key of paramsToCheck) {
+        const candidate = parsed.searchParams.get(key);
+        if (!candidate) continue;
+        collectSocialUrlsFromText(candidate, socialLinkSet);
+      }
+    } catch (_error) {
+      // Ignore malformed wrapper URLs.
+    }
+  };
 
   const isCrawlableInternal = (absoluteUrl) => {
     try {
@@ -5599,6 +6502,8 @@ async function extractPageDataScript() {
   for (const anchor of anchors) {
     const href = anchor.getAttribute("href") || "";
     const text = normalize(anchor.textContent || "");
+    const aria = normalize(anchor.getAttribute("aria-label") || "");
+    collectSocialUrlsFromText(`${href} ${text} ${aria}`, socialLinkSet);
 
     if (href.toLowerCase().startsWith("mailto:")) {
       const extracted = href.replace(/^mailto:/i, "").split("?")[0].trim().toLowerCase();
@@ -5615,17 +6520,29 @@ async function extractPageDataScript() {
 
     let absolute = "";
     try {
-      absolute = new URL(href, window.location.href).toString();
+      let hrefCandidate = href;
+      if (
+        /^(?:www\.|m\.)?(?:facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)\//i.test(hrefCandidate)
+      ) {
+        hrefCandidate = `https://${hrefCandidate}`;
+      } else if (
+        /^\/\/(?:www\.|m\.)?(?:facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)\//i.test(hrefCandidate)
+      ) {
+        hrefCandidate = `https:${hrefCandidate}`;
+      }
+      absolute = new URL(hrefCandidate, window.location.href).toString();
     } catch (_e) {
       absolute = "";
     }
 
     if (!absolute) continue;
 
-    if (socialHostPattern.test(absolute)) {
-      socialLinkSet.add(absolute);
+    const absoluteSocial = normalizeSocialUrl(absolute);
+    if (absoluteSocial) {
+      socialLinkSet.add(absoluteSocial);
       continue;
     }
+    collectSocialFromWrappedUrl(absolute);
 
     if (isCrawlableInternal(absolute)) {
       internalLinkSet.add(absolute);
@@ -5639,14 +6556,18 @@ async function extractPageDataScript() {
     }
   }
 
-  // Some sites expose socials as raw text/scripts instead of direct anchor tags.
-  const socialTextMatches = bodyText.match(/https?:\/\/(?:www\.|m\.)?(?:facebook\.com|instagram\.com|linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|threads\.net)\/[^\s"'<>]+/gi) || [];
-  for (const rawSocial of socialTextMatches) {
-    const candidate = normalize(rawSocial).replace(/[),.;]+$/, "");
-    if (candidate) {
-      socialLinkSet.add(candidate);
-    }
+  for (const candidate of structuredSocialCandidates) {
+    socialLinkSet.add(candidate);
   }
+  collectSocialUrlsFromText(rawBodyText, socialLinkSet);
+  collectSocialUrlsFromText(bodyText, socialLinkSet);
+
+  const socialScriptBlob = scriptBlob
+    .replace(/\\\//g, "/")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#x2F;/gi, "/");
+  collectSocialUrlsFromText(scriptBlob, socialLinkSet);
+  collectSocialUrlsFromText(socialScriptBlob, socialLinkSet);
 
   const ownerKeyword = /(owner(?:\s*\/\s*operator)?|co-owner|founder|co-founder|president|ceo|chief executive|managing director|principal|proprietor|managing member)/i;
   const nodes = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,p,li,strong,b,span,div")).slice(0, 2500);

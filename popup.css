@@ -7,9 +7,9 @@
   --text-secondary: #64748b;
   --border: #e2e8f0;
 
-  --primary-color: #4f46e5;
-  --primary-hover: #4338ca;
-  --primary-light: #e0e7ff;
+  --primary-color: #1f6fff;
+  --primary-hover: #1157d0;
+  --primary-light: #e6f0ff;
 
   --danger-color: #ef4444;
   --danger-hover: #dc2626;
@@ -67,13 +67,14 @@ body {
   z-index: 10;
   display: flex;
   align-items: center;
+  justify-content: flex-start;
 }
 
-.app-header h1 {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin: 0;
+.brand-logo {
+  display: block;
+  width: 188px;
+  max-width: 100%;
+  height: auto;
 }
 
 /* Scrollable Main Area */
@@ -395,6 +396,10 @@ input[disabled] {
   padding: 4px 0;
 }
 
+.toggle-group.is-hidden {
+  display: none;
+}
+
 .toggle-group.row-toggle {
   flex: 1;
   padding-top: 22px;
@@ -472,6 +477,17 @@ input[disabled] {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.contact-goals-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.contact-goal-toggle {
+  flex: 1;
 }
 
 .advanced-toggles {

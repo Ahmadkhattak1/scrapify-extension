@@ -7,10 +7,23 @@
   const CONTROL_PANEL_ANCHOR_WINDOW_KEY = "controlPanelAnchorWindowId";
   const ACTIVE_SCRAPE_FILTERS_KEY = "activeScrapeFilters";
   const EXTENSION_PAGE_PREFIX = chrome.runtime.getURL("");
+  const FOCUSED_CRAWL_MAX_PAGES = 4;
   const EMAIL_COLUMNS = ["email", "owner_name", "owner_title", "owner_email", "contact_email"];
   const RAW_EMAIL_COLUMNS = ["owner_name", "owner_title", "owner_email", "contact_email"];
   const PHONE_COLUMNS = ["phone", "listing_phone", "website_phone", "website_phone_source"];
   const RAW_PHONE_COLUMNS = ["listing_phone", "website_phone", "website_phone_source"];
+  const CORE_COLUMNS = ["name", "rating", "review_count", "category", "address", "website", "maps_url"];
+  const EMAIL_META_COLUMNS = [
+    "primary_email",
+    "primary_email_type",
+    "primary_email_source",
+    "owner_confidence",
+    "email_confidence",
+    "email_source_url",
+    "no_email_reason"
+  ];
+  const EMAIL_GOAL_COLUMNS = new Set([...EMAIL_COLUMNS, ...EMAIL_META_COLUMNS]);
+  const PHONE_GOAL_COLUMNS = new Set(PHONE_COLUMNS);
   const ADVANCED_COLUMNS = new Set([
     "place_id",
     "hours",
@@ -34,30 +47,13 @@
     "discovery_query",
     "discovered_website"
   ]);
-  const DEFAULT_SELECTED_COLUMNS = [
-    "name",
-    "rating",
-    "review_count",
-    "category",
-    "address",
-    "website",
-    "maps_url",
-    "phone",
-    "listing_phone",
-    "website_phone",
-    "website_phone_source",
-    "email",
-    "owner_name",
-    "owner_title",
-    "owner_email",
-    "contact_email"
-  ];
+  const DEFAULT_SELECTED_COLUMNS = [...CORE_COLUMNS, ...PHONE_COLUMNS, ...EMAIL_COLUMNS];
   const COLUMN_GROUPS = [
     {
       id: "core",
       title: "Core Listing Data",
       description: "Main listing fields",
-      columns: ["name", "rating", "review_count", "category", "address", "website", "maps_url"]
+      columns: CORE_COLUMNS
     },
     {
       id: "phone",
@@ -68,7 +64,7 @@
     {
       id: "email",
       title: "Email Output",
-      description: "Best email + owner/company fields",
+      description: "Best email + detail fields",
       columns: ["email", "owner_name", "owner_title", "owner_email", "contact_email"]
     },
     {
@@ -116,21 +112,18 @@
     maxRows: document.getElementById("maxRows"),
     infiniteScroll: document.getElementById("infiniteScroll"),
     enableEnrichment: document.getElementById("enableEnrichment"),
-    siteMaxPages: document.getElementById("siteMaxPages"),
-    emailPreference: document.getElementById("emailPreference"),
+    contactGoalEmail: document.getElementById("contactGoalEmail"),
+    contactGoalPhone: document.getElementById("contactGoalPhone"),
+    contactGoalsHint: document.getElementById("contactGoalsHint"),
+    emailOutputGroup: document.getElementById("emailOutputGroup"),
     emailOutputMode: document.getElementById("emailOutputMode"),
-    emailPreferenceHint: document.getElementById("emailPreferenceHint"),
     emailColumnsHint: document.getElementById("emailColumnsHint"),
-    phonePreference: document.getElementById("phonePreference"),
+    phoneOutputGroup: document.getElementById("phoneOutputGroup"),
     phoneOutputMode: document.getElementById("phoneOutputMode"),
-    phonePreferenceHint: document.getElementById("phonePreferenceHint"),
     phoneColumnsHint: document.getElementById("phoneColumnsHint"),
+    showEnrichmentTabsRow: document.getElementById("showEnrichmentTabsRow"),
     showEnrichmentTabs: document.getElementById("showEnrichmentTabs"),
-    scanSocialLinks: document.getElementById("scanSocialLinks"),
     requireEmailForLeads: document.getElementById("requireEmailForLeads"),
-    aggressiveEmailHunt: document.getElementById("aggressiveEmailHunt"),
-    leadDiscoveryEnabled: document.getElementById("leadDiscoveryEnabled"),
-    discoveryGoogleEnabled: document.getElementById("discoveryGoogleEnabled"),
     minRating: document.getElementById("minRating"),
     maxRating: document.getElementById("maxRating"),
     minReviews: document.getElementById("minReviews"),
@@ -173,17 +166,12 @@
   let runInfiniteCurrent = false;
   let maxRowsValue = DEFAULT_MAX_ROWS;
   let enrichmentEnabled = false;
-  let siteMaxPagesValue = 12;
-  let emailPreferenceValue = "owner";
+  let contactGoalEmailEnabled = true;
+  let contactGoalPhoneEnabled = true;
   let emailOutputModeValue = "unified_only";
-  let phonePreferenceValue = "listing";
   let phoneOutputModeValue = "unified_only";
   let showEnrichmentTabsEnabled = false;
-  let scanSocialLinksEnabled = true;
   let requireEmailForLeadsEnabled = true;
-  let aggressiveEmailHuntEnabled = false;
-  let leadDiscoveryEnabled = false;
-  let discoveryGoogleEnabled = true;
   let scrapeRunTabId = null;
   let uiSettingsSaveTimer = null;
 
@@ -199,32 +187,21 @@
     el.maxRows.value = String(maxRowsValue);
     el.infiniteScroll.checked = infiniteScrollEnabled;
     el.enableEnrichment.checked = enrichmentEnabled;
-    el.siteMaxPages.value = String(siteMaxPagesValue);
-    el.emailPreference.value = emailPreferenceValue;
+    el.contactGoalEmail.checked = contactGoalEmailEnabled;
+    el.contactGoalPhone.checked = contactGoalPhoneEnabled;
     el.emailOutputMode.value = emailOutputModeValue;
-    el.phonePreference.value = phonePreferenceValue;
     el.phoneOutputMode.value = phoneOutputModeValue;
     el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
-    el.scanSocialLinks.checked = scanSocialLinksEnabled;
+    syncEnrichmentModeUi({ persist: false });
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
     }
-    if (el.aggressiveEmailHunt) {
-      el.aggressiveEmailHunt.checked = aggressiveEmailHuntEnabled;
-    }
-    el.leadDiscoveryEnabled.checked = leadDiscoveryEnabled;
-    el.discoveryGoogleEnabled.checked = discoveryGoogleEnabled;
     syncOutputModesFromSelectedColumns();
-    syncLeadDiscoveryInputs();
     updateAdvancedToggleLabel();
 
     syncInfiniteScrollInput();
-    updateEmailPreferenceHint();
-    updatePhonePreferenceHint();
-    renderColumnSelector();
-    updateColumnsTitle();
-    updateEmailColumnsHint();
-    updatePhoneColumnsHint();
+    syncContactGoalDependentUi({ persistColumns: false });
+    ensureColumnSelectorRendered();
     setRunningState(isBusy());
 
     chrome.runtime.onMessage.addListener(onRuntimeMessage);
@@ -236,21 +213,14 @@
     el.stopBtn.addEventListener("click", onStop);
     el.infiniteScroll.addEventListener("change", onInfiniteScrollToggle);
     el.enableEnrichment.addEventListener("change", onEnrichmentToggle);
-    el.siteMaxPages.addEventListener("change", onSiteMaxPagesChange);
-    el.emailPreference.addEventListener("change", onEmailPreferenceChange);
+    el.contactGoalEmail.addEventListener("change", onContactGoalsChange);
+    el.contactGoalPhone.addEventListener("change", onContactGoalsChange);
     el.emailOutputMode.addEventListener("change", onEmailOutputModeChange);
-    el.phonePreference.addEventListener("change", onPhonePreferenceChange);
     el.phoneOutputMode.addEventListener("change", onPhoneOutputModeChange);
     el.showEnrichmentTabs.addEventListener("change", onShowEnrichmentTabsToggle);
-    el.scanSocialLinks.addEventListener("change", onScanSocialLinksToggle);
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.addEventListener("change", onRequireEmailForLeadsToggle);
     }
-    if (el.aggressiveEmailHunt) {
-      el.aggressiveEmailHunt.addEventListener("change", onAggressiveEmailHuntToggle);
-    }
-    el.leadDiscoveryEnabled.addEventListener("change", onLeadDiscoveryToggle);
-    el.discoveryGoogleEnabled.addEventListener("change", onDiscoveryGoogleToggle);
     el.toggleAdvancedBtn.addEventListener("click", onToggleAdvancedFields);
     el.columnsAllBtn.addEventListener("click", onSelectAllColumns);
     el.columnsNoneBtn.addEventListener("click", onClearColumns);
@@ -493,7 +463,8 @@
       minReviews: el.minReviews.value,
       maxReviews: el.maxReviews.value,
       hasWebsite: el.hasWebsite.checked,
-      hasPhone: el.hasPhone.checked
+      hasPhone: el.hasPhone.checked,
+      hasEmail: !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false
     };
 
     return {
@@ -504,8 +475,12 @@
   }
 
   function setRunningState(running) {
-    el.startBtn.disabled = running;
-    el.stopBtn.disabled = !(scrapeRunning || enrichRunning);
+    if (el.startBtn) {
+      el.startBtn.disabled = running;
+    }
+    if (el.stopBtn) {
+      el.stopBtn.disabled = !(scrapeRunning || enrichRunning);
+    }
   }
 
   function resetCounters() {
@@ -546,13 +521,10 @@
         "selectedColumns",
         "infiniteScrollEnabled",
         "enrichmentEnabled",
-        "siteMaxPagesValue",
         "showEnrichmentTabsEnabled",
-        "scanSocialLinksEnabled",
         "requireEmailForLeadsEnabled",
-        "aggressiveEmailHuntEnabled",
-        "leadDiscoveryEnabled",
-        "discoveryGoogleEnabled"
+        "contactGoalEmailEnabled",
+        "contactGoalPhoneEnabled"
       ]);
       if (Array.isArray(data.lastRows)) {
         lastRows = applyUnifiedOutputToRows(data.lastRows);
@@ -562,21 +534,22 @@
       }
       infiniteScrollEnabled = data.infiniteScrollEnabled === true;
       enrichmentEnabled = data.enrichmentEnabled === true;
-      siteMaxPagesValue = clampInt(data.siteMaxPagesValue, 1, 120, 12);
       showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
-      scanSocialLinksEnabled = data.scanSocialLinksEnabled !== false;
       requireEmailForLeadsEnabled = data.requireEmailForLeadsEnabled !== false;
-      aggressiveEmailHuntEnabled = data.aggressiveEmailHuntEnabled === true;
-      leadDiscoveryEnabled = data.leadDiscoveryEnabled === true;
-      discoveryGoogleEnabled = data.discoveryGoogleEnabled !== false;
+      contactGoalEmailEnabled = data.contactGoalEmailEnabled !== false;
+      contactGoalPhoneEnabled = data.contactGoalPhoneEnabled !== false;
+      selectedColumns = normalizeSelectedColumnsForContactGoals(selectedColumns);
       applySavedUiSettings(data[POPUP_UI_SETTINGS_KEY]);
       applyScrapeSession(data[SCRAPE_SESSION_KEY]);
       applyEnrichSession(data[ENRICH_SESSION_KEY]);
       syncOutputModesFromSelectedColumns();
-      syncLeadDiscoveryInputs();
-      el.exportBtn.disabled = isBusy() || !Array.isArray(lastRows) || selectedColumns.length === 0;
+      if (el.exportBtn) {
+        el.exportBtn.disabled = isBusy() || !Array.isArray(lastRows) || selectedColumns.length === 0;
+      }
     } catch (_error) {
-      el.exportBtn.disabled = true;
+      if (el.exportBtn) {
+        el.exportBtn.disabled = true;
+      }
     }
   }
 
@@ -612,20 +585,36 @@
 
     if (changes[POPUP_UI_SETTINGS_KEY]) {
       applySavedUiSettings(changes[POPUP_UI_SETTINGS_KEY].newValue);
-      updateEmailPreferenceHint();
-      updateEmailColumnsHint();
-      updatePhonePreferenceHint();
-      updatePhoneColumnsHint();
-      renderColumnSelector();
-      updateColumnsTitle();
+      syncContactGoalDependentUi({ persistColumns: false });
     }
 
-    if (changes.leadDiscoveryEnabled) {
-      leadDiscoveryEnabled = changes.leadDiscoveryEnabled.newValue === true;
-      if (el.leadDiscoveryEnabled) {
-        el.leadDiscoveryEnabled.checked = leadDiscoveryEnabled;
+    if (changes.enrichmentEnabled) {
+      enrichmentEnabled = changes.enrichmentEnabled.newValue === true;
+      if (el.enableEnrichment) {
+        el.enableEnrichment.checked = enrichmentEnabled;
       }
-      syncLeadDiscoveryInputs();
+      syncEnrichmentModeUi({ persist: false });
+    }
+    if (changes.contactGoalEmailEnabled || changes.contactGoalPhoneEnabled) {
+      if (changes.contactGoalEmailEnabled) {
+        contactGoalEmailEnabled = changes.contactGoalEmailEnabled.newValue !== false;
+      }
+      if (changes.contactGoalPhoneEnabled) {
+        contactGoalPhoneEnabled = changes.contactGoalPhoneEnabled.newValue !== false;
+      }
+      if (el.contactGoalEmail) {
+        el.contactGoalEmail.checked = contactGoalEmailEnabled;
+      }
+      if (el.contactGoalPhone) {
+        el.contactGoalPhone.checked = contactGoalPhoneEnabled;
+      }
+      syncContactGoalDependentUi({ persistColumns: false });
+    }
+    if (changes.showEnrichmentTabsEnabled) {
+      showEnrichmentTabsEnabled = changes.showEnrichmentTabsEnabled.newValue === true;
+      if (el.showEnrichmentTabs && el.enableEnrichment && el.enableEnrichment.checked) {
+        el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
+      }
     }
     if (changes.requireEmailForLeadsEnabled) {
       requireEmailForLeadsEnabled = changes.requireEmailForLeadsEnabled.newValue !== false;
@@ -633,33 +622,19 @@
         el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
       }
     }
-    if (changes.aggressiveEmailHuntEnabled) {
-      aggressiveEmailHuntEnabled = changes.aggressiveEmailHuntEnabled.newValue === true;
-      if (el.aggressiveEmailHunt) {
-        el.aggressiveEmailHunt.checked = aggressiveEmailHuntEnabled;
-      }
-    }
-    if (changes.discoveryGoogleEnabled) {
-      discoveryGoogleEnabled = changes.discoveryGoogleEnabled.newValue !== false;
-      if (el.discoveryGoogleEnabled) {
-        el.discoveryGoogleEnabled.checked = discoveryGoogleEnabled;
-      }
-      syncLeadDiscoveryInputs();
-    }
   }
 
   function applySavedUiSettings(settings) {
     const saved = settings && typeof settings === "object" ? settings : {};
     maxRowsValue = clampInt(saved.maxRowsValue, 1, 50000, DEFAULT_MAX_ROWS);
-    emailPreferenceValue = normalizeEmailPreference(saved.emailPreference);
+    contactGoalEmailEnabled = saved.contactGoalEmailEnabled != null ? saved.contactGoalEmailEnabled !== false : contactGoalEmailEnabled;
+    contactGoalPhoneEnabled = saved.contactGoalPhoneEnabled != null ? saved.contactGoalPhoneEnabled !== false : contactGoalPhoneEnabled;
     emailOutputModeValue = normalizeOutputMode(saved.emailOutputMode);
-    phonePreferenceValue = normalizePhonePreference(saved.phonePreference);
     phoneOutputModeValue = normalizeOutputMode(saved.phoneOutputMode);
-    if (saved.requireEmailForLeads != null) {
+    if (saved.hasEmail != null) {
+      requireEmailForLeadsEnabled = saved.hasEmail === true;
+    } else if (saved.requireEmailForLeads != null) {
       requireEmailForLeadsEnabled = saved.requireEmailForLeads !== false;
-    }
-    if (saved.aggressiveEmailHunt != null) {
-      aggressiveEmailHuntEnabled = saved.aggressiveEmailHunt === true;
     }
     showAdvancedFields = saved.showAdvancedFields === true;
 
@@ -670,14 +645,14 @@
     el.maxReviews.value = sanitizeFormString(saved.maxReviews);
     el.hasWebsite.checked = saved.hasWebsite === true;
     el.hasPhone.checked = saved.hasPhone === true;
-    if (el.emailPreference) {
-      el.emailPreference.value = emailPreferenceValue;
+    if (el.contactGoalEmail) {
+      el.contactGoalEmail.checked = contactGoalEmailEnabled;
+    }
+    if (el.contactGoalPhone) {
+      el.contactGoalPhone.checked = contactGoalPhoneEnabled;
     }
     if (el.emailOutputMode) {
       el.emailOutputMode.value = emailOutputModeValue;
-    }
-    if (el.phonePreference) {
-      el.phonePreference.value = phonePreferenceValue;
     }
     if (el.phoneOutputMode) {
       el.phoneOutputMode.value = phoneOutputModeValue;
@@ -685,15 +660,17 @@
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
     }
-    if (el.aggressiveEmailHunt) {
-      el.aggressiveEmailHunt.checked = aggressiveEmailHuntEnabled;
-    }
     if (!showAdvancedFields && Array.isArray(selectedColumns)) {
-      selectedColumns = normalizeSelectedColumns(selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)));
+      selectedColumns = normalizeSelectedColumnsForContactGoals(selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)));
     }
+    selectedColumns = normalizeSelectedColumnsForContactGoals(selectedColumns);
     updateAdvancedToggleLabel();
     if (Array.isArray(lastRows) && lastRows.length > 0) {
       lastRows = applyUnifiedOutputToRows(lastRows);
+    }
+    if (el.columnList && el.columnList.childElementCount === 0) {
+      renderColumnSelector();
+      updateColumnsTitle();
     }
   }
 
@@ -780,7 +757,7 @@
       setState(`Enrichment: ${enriched} enriched, ${skipped} skipped, ${blocked} blocked, pages ${siteVisited}/${siteDiscovered}`);
       if (personal > 0 || company > 0) {
         setLeadSignal(
-          `Saved emails: personal ${personal}, company fallback ${company}, discovery ${Math.max(0, discoveryEmails)}`,
+          `Saved emails: ${Math.max(0, personal + company)}, discovery ${Math.max(0, discoveryEmails)}`,
           "success"
         );
       } else {
@@ -976,10 +953,12 @@
       minReviews: el.minReviews.value,
       maxReviews: el.maxReviews.value,
       hasWebsite: el.hasWebsite.checked,
-      hasPhone: el.hasPhone.checked
+      hasPhone: el.hasPhone.checked,
+      hasEmail: !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false
     });
-    const rows = hasAnyActiveFilter(activeFilters)
-      ? incomingRows.filter((row) => applyFilters(row, activeFilters))
+    const scrapeStageFilters = toScrapeStageFilters(activeFilters);
+    const rows = hasAnyActiveFilter(scrapeStageFilters)
+      ? incomingRows.filter((row) => applyFilters(row, scrapeStageFilters))
       : incomingRows;
 
     persistRows(rows);
@@ -1195,24 +1174,17 @@
       normalizeText(f.categoryInclude) !== "" ||
       normalizeText(f.categoryExclude) !== "" ||
       f.hasWebsite === true ||
-      f.hasPhone === true
+      f.hasPhone === true ||
+      f.hasEmail === true
     );
   }
 
-  function normalizeEmailPreference(value) {
-    const normalized = normalizeText(value).toLowerCase();
-    if (normalized === "primary" || normalized === "contact" || normalized === "owner" || normalized === "personal_then_company") {
-      return normalized;
-    }
-    return "owner";
-  }
-
-  function normalizePhonePreference(value) {
-    const normalized = normalizeText(value).toLowerCase();
-    if (normalized === "listing" || normalized === "website") {
-      return normalized;
-    }
-    return "listing";
+  function toScrapeStageFilters(filters) {
+    const source = filters && typeof filters === "object" ? filters : {};
+    return {
+      ...source,
+      hasEmail: false
+    };
   }
 
   function normalizeOutputMode(value) {
@@ -1223,38 +1195,103 @@
     return "unified_only";
   }
 
-  function getEmailPrecedence(preferenceValue) {
-    const preference = normalizeEmailPreference(preferenceValue);
-    if (preference === "personal_then_company") {
-      return ["Owner Email", "Company Email", "Best Auto Email"];
+  function getDisabledGoalColumnsSet() {
+    const blocked = new Set();
+    if (!contactGoalEmailEnabled) {
+      for (const column of EMAIL_GOAL_COLUMNS) {
+        blocked.add(column);
+      }
     }
-    if (preference === "primary") {
-      return ["Best Auto Email", "Owner Email", "Company Email"];
+    if (!contactGoalPhoneEnabled) {
+      for (const column of PHONE_GOAL_COLUMNS) {
+        blocked.add(column);
+      }
     }
-    if (preference === "contact") {
-      return ["Company Email", "Best Auto Email", "Owner Email"];
-    }
-    return ["Owner Email", "Best Auto Email", "Company Email"];
+    return blocked;
   }
 
-  function getPhonePrecedence(preferenceValue) {
-    const preference = normalizePhonePreference(preferenceValue);
-    if (preference === "website") {
-      return ["Website Phone", "Listing Phone"];
+  function filterColumnsByContactGoals(columnsInput) {
+    if (!Array.isArray(columnsInput)) return [];
+    const blocked = getDisabledGoalColumnsSet();
+    if (blocked.size === 0) return [...columnsInput];
+    return columnsInput.filter((column) => !blocked.has(column));
+  }
+
+  function selectedColumnsFallbackForGoals() {
+    const filteredDefaults = filterColumnsByContactGoals(DEFAULT_SELECTED_COLUMNS);
+    if (filteredDefaults.length > 0) {
+      return filteredDefaults;
     }
-    return ["Listing Phone", "Website Phone"];
+    return [...CORE_COLUMNS];
   }
 
-  function updateEmailPreferenceHint() {
-    if (!el.emailPreferenceHint) return;
-    const order = getEmailPrecedence(emailPreferenceValue);
-    el.emailPreferenceHint.textContent = `Priority: ${order.join(" -> ")}`;
+  function normalizeSelectedColumnsForContactGoals(columnsInput) {
+    const normalized = normalizeSelectedColumns(columnsInput, {
+      fallbackColumns: selectedColumnsFallbackForGoals()
+    });
+    const filtered = filterColumnsByContactGoals(normalized);
+    if (filtered.length > 0) {
+      return filtered;
+    }
+    return selectedColumnsFallbackForGoals();
   }
 
-  function updatePhonePreferenceHint() {
-    if (!el.phonePreferenceHint) return;
-    const order = getPhonePrecedence(phonePreferenceValue);
-    el.phonePreferenceHint.textContent = `Priority: ${order.join(" -> ")}`;
+  function syncContactGoalDependentUi(optionsInput) {
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const persistColumns = options.persistColumns === true;
+
+    if (el.emailOutputGroup) {
+      el.emailOutputGroup.hidden = !contactGoalEmailEnabled;
+    }
+    if (el.emailOutputMode) {
+      el.emailOutputMode.disabled = !contactGoalEmailEnabled;
+    }
+    if (el.emailColumnsHint) {
+      el.emailColumnsHint.hidden = !contactGoalEmailEnabled;
+    }
+
+    if (el.phoneOutputGroup) {
+      el.phoneOutputGroup.hidden = !contactGoalPhoneEnabled;
+    }
+    if (el.phoneOutputMode) {
+      el.phoneOutputMode.disabled = !contactGoalPhoneEnabled;
+    }
+    if (el.phoneColumnsHint) {
+      el.phoneColumnsHint.hidden = !contactGoalPhoneEnabled;
+    }
+
+    const before = selectedColumns.join("|");
+    selectedColumns = normalizeSelectedColumnsForContactGoals(selectedColumns);
+    syncOutputModesFromSelectedColumns();
+
+    renderColumnSelector();
+    updateColumnsTitle();
+    updateContactGoalsHint();
+    updateEmailColumnsHint();
+    updatePhoneColumnsHint();
+
+    if (persistColumns && before !== selectedColumns.join("|")) {
+      persistSelectedColumns();
+    }
+  }
+
+  function updateContactGoalsHint() {
+    if (!el.contactGoalsHint) return;
+    const wantsEmail = contactGoalEmailEnabled === true;
+    const wantsPhone = contactGoalPhoneEnabled === true;
+    if (wantsEmail && wantsPhone) {
+      el.contactGoalsHint.textContent = "Goals: collect emails and phone numbers.";
+      return;
+    }
+    if (wantsEmail) {
+      el.contactGoalsHint.textContent = "Goal: collect emails only.";
+      return;
+    }
+    if (wantsPhone) {
+      el.contactGoalsHint.textContent = "Goal: collect phone numbers only.";
+      return;
+    }
+    el.contactGoalsHint.textContent = "Goals: none. Contact enrichment will skip email and phone collection.";
   }
 
   function applyUnifiedOutputToRows(rows) {
@@ -1308,17 +1345,7 @@
     const ownerEmail = normalizeText(value.owner_email);
     const primaryEmail = normalizeText(value.primary_email);
     const contactEmail = normalizeText(value.contact_email);
-
-    const preference = normalizeEmailPreference(emailPreferenceValue);
-    const precedence =
-      preference === "primary"
-        ? [primaryEmail, ownerEmail, contactEmail]
-        : preference === "contact"
-          ? [contactEmail, primaryEmail, ownerEmail]
-          : preference === "personal_then_company"
-            ? [ownerEmail, contactEmail, primaryEmail]
-          : [ownerEmail, primaryEmail, contactEmail];
-
+    const precedence = [primaryEmail, contactEmail, ownerEmail];
     return precedence.find((email) => email !== "") || "";
   }
 
@@ -1326,10 +1353,7 @@
     const value = row || {};
     const listingPhone = sanitizePhoneText(normalizeText(value.listing_phone || value.phone));
     const websitePhone = sanitizePhoneText(normalizeText(value.website_phone));
-    const preference = normalizePhonePreference(phonePreferenceValue);
-    const precedence = preference === "website"
-      ? [websitePhone, listingPhone]
-      : [listingPhone, websitePhone];
+    const precedence = [listingPhone, websitePhone];
     return precedence.find((phone) => phone !== "") || "";
   }
 
@@ -1359,18 +1383,18 @@
 
   function persistUiSettings() {
     maxRowsValue = clampInt(el.maxRows.value, 1, 50000, DEFAULT_MAX_ROWS);
-    emailPreferenceValue = normalizeEmailPreference(el.emailPreference && el.emailPreference.value);
+    contactGoalEmailEnabled = el.contactGoalEmail ? el.contactGoalEmail.checked === true : true;
+    contactGoalPhoneEnabled = el.contactGoalPhone ? el.contactGoalPhone.checked === true : true;
     emailOutputModeValue = normalizeOutputMode(el.emailOutputMode && el.emailOutputMode.value);
-    phonePreferenceValue = normalizePhonePreference(el.phonePreference && el.phonePreference.value);
     phoneOutputModeValue = normalizeOutputMode(el.phoneOutputMode && el.phoneOutputMode.value);
     const uiSettings = {
       maxRowsValue,
-      emailPreference: emailPreferenceValue,
+      contactGoalEmailEnabled,
+      contactGoalPhoneEnabled,
       emailOutputMode: emailOutputModeValue,
-      phonePreference: phonePreferenceValue,
       phoneOutputMode: phoneOutputModeValue,
+      hasEmail: requireEmailForLeadsEnabled === true,
       requireEmailForLeads: requireEmailForLeadsEnabled,
-      aggressiveEmailHunt: aggressiveEmailHuntEnabled,
       showAdvancedFields: showAdvancedFields === true,
       minRating: sanitizeFormString(el.minRating.value),
       maxRating: sanitizeFormString(el.maxRating.value),
@@ -1395,26 +1419,27 @@
   function onEnrichmentToggle() {
     enrichmentEnabled = el.enableEnrichment.checked;
     storageSet({ enrichmentEnabled }).catch(() => {});
+    syncEnrichmentModeUi({ persist: true });
     schedulePersistUiSettings();
   }
 
-  function onSiteMaxPagesChange() {
-    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 12);
-    el.siteMaxPages.value = String(siteMaxPagesValue);
-    storageSet({ siteMaxPagesValue }).catch(() => {});
-    schedulePersistUiSettings();
-  }
-
-  function onEmailPreferenceChange() {
-    emailPreferenceValue = normalizeEmailPreference(el.emailPreference.value);
-    el.emailPreference.value = emailPreferenceValue;
-    updateEmailPreferenceHint();
-    updateEmailColumnsHint();
-    schedulePersistUiSettings();
-
-    if (Array.isArray(lastRows) && lastRows.length > 0) {
-      persistRows(lastRows);
+  function onContactGoalsChange() {
+    const wasEmailEnabled = contactGoalEmailEnabled === true;
+    const wasPhoneEnabled = contactGoalPhoneEnabled === true;
+    contactGoalEmailEnabled = el.contactGoalEmail && el.contactGoalEmail.checked === true;
+    contactGoalPhoneEnabled = el.contactGoalPhone && el.contactGoalPhone.checked === true;
+    if (!wasEmailEnabled && contactGoalEmailEnabled) {
+      applyEmailModeToSelection();
     }
+    if (!wasPhoneEnabled && contactGoalPhoneEnabled) {
+      applyPhoneModeToSelection();
+    }
+    syncContactGoalDependentUi({ persistColumns: true });
+    storageSet({
+      contactGoalEmailEnabled,
+      contactGoalPhoneEnabled
+    }).catch(() => {});
+    schedulePersistUiSettings();
   }
 
   function onEmailOutputModeChange() {
@@ -1427,18 +1452,6 @@
     persistSelectedColumns();
     schedulePersistUiSettings();
     setRunningState(isBusy());
-    if (Array.isArray(lastRows) && lastRows.length > 0) {
-      persistRows(lastRows);
-    }
-  }
-
-  function onPhonePreferenceChange() {
-    phonePreferenceValue = normalizePhonePreference(el.phonePreference.value);
-    el.phonePreference.value = phonePreferenceValue;
-    updatePhonePreferenceHint();
-    updatePhoneColumnsHint();
-    schedulePersistUiSettings();
-
     if (Array.isArray(lastRows) && lastRows.length > 0) {
       persistRows(lastRows);
     }
@@ -1460,14 +1473,15 @@
   }
 
   function onShowEnrichmentTabsToggle() {
+    if (!el.enableEnrichment.checked) {
+      showEnrichmentTabsEnabled = false;
+      el.showEnrichmentTabs.checked = false;
+      storageSet({ showEnrichmentTabsEnabled: false }).catch(() => {});
+      schedulePersistUiSettings();
+      return;
+    }
     showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked;
     storageSet({ showEnrichmentTabsEnabled }).catch(() => {});
-    schedulePersistUiSettings();
-  }
-
-  function onScanSocialLinksToggle() {
-    scanSocialLinksEnabled = el.scanSocialLinks.checked;
-    storageSet({ scanSocialLinksEnabled }).catch(() => {});
     schedulePersistUiSettings();
   }
 
@@ -1477,31 +1491,11 @@
     schedulePersistUiSettings();
   }
 
-  function onAggressiveEmailHuntToggle() {
-    aggressiveEmailHuntEnabled = Boolean(el.aggressiveEmailHunt && el.aggressiveEmailHunt.checked === true);
-    storageSet({ aggressiveEmailHuntEnabled }).catch(() => {});
-    schedulePersistUiSettings();
-  }
-
-  function onLeadDiscoveryToggle() {
-    leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
-    storageSet({ leadDiscoveryEnabled }).catch(() => {});
-    syncLeadDiscoveryInputs();
-    schedulePersistUiSettings();
-  }
-
-  function onDiscoveryGoogleToggle() {
-    discoveryGoogleEnabled = el.discoveryGoogleEnabled.checked === true;
-    storageSet({ discoveryGoogleEnabled }).catch(() => {});
-    syncLeadDiscoveryInputs();
-    schedulePersistUiSettings();
-  }
-
   function onToggleAdvancedFields() {
     showAdvancedFields = !showAdvancedFields;
     if (!showAdvancedFields) {
       const filtered = selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column));
-      selectedColumns = normalizeSelectedColumns(filtered);
+      selectedColumns = normalizeSelectedColumnsForContactGoals(filtered);
       syncOutputModesFromSelectedColumns();
       updateEmailColumnsHint();
       updatePhoneColumnsHint();
@@ -1513,17 +1507,18 @@
     schedulePersistUiSettings();
   }
 
+  function shouldEnableLeadDiscoveryForSelection() {
+    const selected = new Set(selectedColumns);
+    return selected.has("owner_name") || selected.has("owner_title") || selected.has("owner_email");
+  }
+
   async function persistRunSettingsForBackground() {
     enrichmentEnabled = el.enableEnrichment.checked === true;
-    siteMaxPagesValue = clampInt(el.siteMaxPages.value, 1, 120, 12);
-    showEnrichmentTabsEnabled = el.showEnrichmentTabs.checked === true;
-    scanSocialLinksEnabled = el.scanSocialLinks.checked === true;
+    showEnrichmentTabsEnabled = enrichmentEnabled && el.showEnrichmentTabs.checked === true;
     requireEmailForLeadsEnabled = !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false;
-    aggressiveEmailHuntEnabled = Boolean(el.aggressiveEmailHunt && el.aggressiveEmailHunt.checked === true);
-    leadDiscoveryEnabled = el.leadDiscoveryEnabled.checked === true;
-    discoveryGoogleEnabled = el.discoveryGoogleEnabled.checked === true;
-    el.siteMaxPages.value = String(siteMaxPagesValue);
-    syncLeadDiscoveryInputs();
+    const leadDiscoveryEnabled = shouldEnableLeadDiscoveryForSelection();
+    contactGoalEmailEnabled = el.contactGoalEmail && el.contactGoalEmail.checked === true;
+    contactGoalPhoneEnabled = el.contactGoalPhone && el.contactGoalPhone.checked === true;
 
     const activeScrapeFilters = readFilterConfig({
       minRating: el.minRating.value,
@@ -1531,23 +1526,51 @@
       minReviews: el.minReviews.value,
       maxReviews: el.maxReviews.value,
       hasWebsite: el.hasWebsite.checked,
-      hasPhone: el.hasPhone.checked
+      hasPhone: el.hasPhone.checked,
+      hasEmail: requireEmailForLeadsEnabled
     });
 
     await storageSet({
       enrichmentEnabled,
-      siteMaxPagesValue,
       showEnrichmentTabsEnabled,
-      scanSocialLinksEnabled,
       requireEmailForLeadsEnabled,
-      aggressiveEmailHuntEnabled,
       leadDiscoveryEnabled,
-      discoveryGoogleEnabled,
+      contactGoalEmailEnabled,
+      contactGoalPhoneEnabled,
       [ACTIVE_SCRAPE_FILTERS_KEY]: activeScrapeFilters
     }).catch(() => {});
   }
 
+  function syncEnrichmentModeUi(optionsInput) {
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const persist = options.persist === true;
+    const enabled = el.enableEnrichment.checked === true;
+
+    if (el.showEnrichmentTabsRow) {
+      el.showEnrichmentTabsRow.classList.toggle("is-hidden", !enabled);
+    }
+    if (el.showEnrichmentTabs) {
+      el.showEnrichmentTabs.disabled = !enabled;
+    }
+
+    if (!enabled) {
+      showEnrichmentTabsEnabled = false;
+      if (el.showEnrichmentTabs) {
+        el.showEnrichmentTabs.checked = false;
+      }
+      if (persist) {
+        storageSet({ showEnrichmentTabsEnabled: false }).catch(() => {});
+      }
+      return;
+    }
+
+    if (el.showEnrichmentTabs) {
+      el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled === true;
+    }
+  }
+
   function syncInfiniteScrollInput() {
+    if (!el.maxRows) return;
     const enabled = el.infiniteScroll.checked;
     el.maxRows.disabled = enabled;
     if (enabled) {
@@ -1557,9 +1580,14 @@
     }
   }
 
-  function syncLeadDiscoveryInputs() {
-    if (!el.leadDiscoveryEnabled) return;
-    if (el.discoveryGoogleEnabled) el.discoveryGoogleEnabled.disabled = false;
+  function ensureColumnSelectorRendered() {
+    if (!el.columnList) return;
+    if (el.columnList.childElementCount > 0) return;
+    setTimeout(() => {
+      if (!el.columnList || el.columnList.childElementCount > 0) return;
+      renderColumnSelector();
+      updateColumnsTitle();
+    }, 0);
   }
 
   function updateAdvancedToggleLabel() {
@@ -1574,8 +1602,15 @@
     el.columnList.textContent = "";
     const selectedSet = new Set(selectedColumns);
     const groupedColumns = new Set();
+    const disabledGoalColumns = getDisabledGoalColumnsSet();
 
     for (const group of COLUMN_GROUPS) {
+      if ((group.id === "email" && !contactGoalEmailEnabled) || (group.id === "phone" && !contactGoalPhoneEnabled)) {
+        for (const column of group.columns) {
+          groupedColumns.add(column);
+        }
+        continue;
+      }
       if (group.advanced === true && !showAdvancedFields) {
         for (const column of group.columns) {
           groupedColumns.add(column);
@@ -1602,6 +1637,7 @@
       for (const column of group.columns) {
         groupedColumns.add(column);
         if (!CSV_COLUMNS.includes(column)) continue;
+        if (disabledGoalColumns.has(column)) continue;
         if (!showAdvancedFields && ADVANCED_COLUMNS.has(column)) continue;
         grid.appendChild(buildColumnCheckbox(column, selectedSet));
       }
@@ -1612,6 +1648,7 @@
 
     const extras = CSV_COLUMNS.filter((column) => {
       if (groupedColumns.has(column)) return false;
+      if (disabledGoalColumns.has(column)) return false;
       if (!showAdvancedFields && ADVANCED_COLUMNS.has(column)) return false;
       return true;
     });
@@ -1670,6 +1707,13 @@
 
   function applyEmailModeToSelection() {
     const selected = new Set(selectedColumns);
+    if (!contactGoalEmailEnabled) {
+      for (const column of EMAIL_GOAL_COLUMNS) {
+        selected.delete(column);
+      }
+      selectedColumns = normalizeSelectedColumnsForContactGoals(Array.from(selected));
+      return;
+    }
     const mode = normalizeOutputMode(emailOutputModeValue);
     if (mode === "unified_only") {
       selected.add("email");
@@ -1686,11 +1730,18 @@
         selected.add(column);
       }
     }
-    selectedColumns = normalizeSelectedColumns(Array.from(selected));
+    selectedColumns = normalizeSelectedColumnsForContactGoals(Array.from(selected));
   }
 
   function applyPhoneModeToSelection() {
     const selected = new Set(selectedColumns);
+    if (!contactGoalPhoneEnabled) {
+      for (const column of PHONE_GOAL_COLUMNS) {
+        selected.delete(column);
+      }
+      selectedColumns = normalizeSelectedColumnsForContactGoals(Array.from(selected));
+      return;
+    }
     const mode = normalizeOutputMode(phoneOutputModeValue);
     if (mode === "unified_only") {
       selected.add("phone");
@@ -1707,7 +1758,7 @@
         selected.add(column);
       }
     }
-    selectedColumns = normalizeSelectedColumns(Array.from(selected));
+    selectedColumns = normalizeSelectedColumnsForContactGoals(Array.from(selected));
   }
 
   function inferOutputModeFromColumns(selectedSet, unifiedColumn, rawColumns) {
@@ -1733,10 +1784,14 @@
 
   function updateEmailColumnsHint() {
     if (!el.emailColumnsHint) return;
+    if (!contactGoalEmailEnabled) {
+      el.emailColumnsHint.className = "hint-text";
+      el.emailColumnsHint.textContent = "";
+      return;
+    }
     const selected = new Set(selectedColumns);
     const hasUnified = selected.has("email");
     const selectedRaw = RAW_EMAIL_COLUMNS.filter((column) => selected.has(column));
-    const order = getEmailPrecedence(emailPreferenceValue);
 
     el.emailColumnsHint.className = "hint-text";
     if (!hasUnified && selectedRaw.length === 0) {
@@ -1746,7 +1801,7 @@
     }
 
     if (hasUnified && selectedRaw.length === 0) {
-      el.emailColumnsHint.textContent = `Exports one email column using ${order.join(" -> ")}`;
+      el.emailColumnsHint.textContent = "Exports one best email column.";
       el.emailColumnsHint.classList.add("success");
       return;
     }
@@ -1756,16 +1811,20 @@
       return;
     }
 
-    el.emailColumnsHint.textContent = `Exports ${selectedRaw.length} owner/company detail field(s).`;
+    el.emailColumnsHint.textContent = `Exports ${selectedRaw.length} email detail field(s).`;
     el.emailColumnsHint.classList.add("warn");
   }
 
   function updatePhoneColumnsHint() {
     if (!el.phoneColumnsHint) return;
+    if (!contactGoalPhoneEnabled) {
+      el.phoneColumnsHint.className = "hint-text";
+      el.phoneColumnsHint.textContent = "";
+      return;
+    }
     const selected = new Set(selectedColumns);
     const hasUnified = selected.has("phone");
     const selectedRaw = RAW_PHONE_COLUMNS.filter((column) => selected.has(column));
-    const order = getPhonePrecedence(phonePreferenceValue);
 
     el.phoneColumnsHint.className = "hint-text";
     if (!hasUnified && selectedRaw.length === 0) {
@@ -1775,7 +1834,7 @@
     }
 
     if (hasUnified && selectedRaw.length === 0) {
-      el.phoneColumnsHint.textContent = `Exports one phone column using ${order.join(" -> ")}`;
+      el.phoneColumnsHint.textContent = "Exports one best phone column.";
       el.phoneColumnsHint.classList.add("success");
       return;
     }
@@ -1790,9 +1849,10 @@
   }
 
   function onSelectAllColumns() {
-    selectedColumns = showAdvancedFields
+    const allVisibleColumns = showAdvancedFields
       ? [...CSV_COLUMNS]
-      : normalizeSelectedColumns(CSV_COLUMNS.filter((column) => !ADVANCED_COLUMNS.has(column)));
+      : CSV_COLUMNS.filter((column) => !ADVANCED_COLUMNS.has(column));
+    selectedColumns = normalizeSelectedColumnsForContactGoals(allVisibleColumns);
     emailOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "email", RAW_EMAIL_COLUMNS);
     phoneOutputModeValue = inferOutputModeFromColumns(new Set(selectedColumns), "phone", RAW_PHONE_COLUMNS);
     el.emailOutputMode.value = emailOutputModeValue;
@@ -1823,7 +1883,7 @@
 
   function onColumnSelectionChange() {
     const checked = Array.from(el.columnList.querySelectorAll("input[type='checkbox']:checked")).map((node) => node.value);
-    selectedColumns = normalizeSelectedColumns(checked);
+    selectedColumns = normalizeSelectedColumnsForContactGoals(checked);
     const selectedSet = new Set(selectedColumns);
     emailOutputModeValue = inferOutputModeFromColumns(selectedSet, "email", RAW_EMAIL_COLUMNS);
     phoneOutputModeValue = inferOutputModeFromColumns(selectedSet, "phone", RAW_PHONE_COLUMNS);
@@ -1838,21 +1898,28 @@
   }
 
   function updateColumnsTitle() {
-    const availableCount = showAdvancedFields
-      ? CSV_COLUMNS.length
-      : CSV_COLUMNS.filter((column) => !ADVANCED_COLUMNS.has(column)).length;
-    const selectedVisibleCount = showAdvancedFields
-      ? selectedColumns.length
-      : selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)).length;
+    const disabledGoalColumns = getDisabledGoalColumnsSet();
+    const visibleColumns = showAdvancedFields
+      ? CSV_COLUMNS.filter((column) => !disabledGoalColumns.has(column))
+      : CSV_COLUMNS.filter((column) => !disabledGoalColumns.has(column) && !ADVANCED_COLUMNS.has(column));
+    const visibleSet = new Set(visibleColumns);
+    const availableCount = visibleColumns.length;
+    const selectedVisibleCount = selectedColumns.filter((column) => visibleSet.has(column)).length;
     el.columnsTitle.textContent = `Export columns (${selectedVisibleCount}/${availableCount})`;
   }
 
   function persistSelectedColumns() {
-    storageSet({ selectedColumns }).catch(() => {});
+    storageSet({
+      selectedColumns
+    }).catch(() => {});
   }
 
-  function normalizeSelectedColumns(columns) {
-    if (!Array.isArray(columns)) return [...DEFAULT_SELECTED_COLUMNS];
+  function normalizeSelectedColumns(columns, optionsInput) {
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const fallbackColumns = Array.isArray(options.fallbackColumns) && options.fallbackColumns.length > 0
+      ? options.fallbackColumns
+      : DEFAULT_SELECTED_COLUMNS;
+    if (!Array.isArray(columns)) return [...fallbackColumns];
     const out = [];
     const seen = new Set();
     for (const column of columns) {
@@ -1861,7 +1928,7 @@
       out.push(column);
     }
     if (out.length === 0) {
-      return [...DEFAULT_SELECTED_COLUMNS];
+      return [...fallbackColumns];
     }
     return out;
   }
@@ -1914,6 +1981,7 @@
   async function enrichRowsBestEffort(rows, options) {
     const opts = options || {};
     const force = opts.force === true;
+    const selectedLeadDiscovery = shouldEnableLeadDiscoveryForSelection();
 
     if (!Array.isArray(rows) || rows.length === 0) return rows;
     if (enrichRunning) return Array.isArray(lastRows) ? lastRows : rows;
@@ -1928,16 +1996,26 @@
         type: MSG.ENRICH_ROWS,
         rows,
         options: {
-          maxPagesPerSite: clampInt(el.siteMaxPages.value, 1, 120, 12),
+          maxPagesPerSite: FOCUSED_CRAWL_MAX_PAGES,
           timeoutMs: 10000,
           visibleTabs: Boolean(el.showEnrichmentTabs.checked),
-          scanSocialLinks: Boolean(el.scanSocialLinks.checked),
-          requireEmail: !el.requireEmailForLeads || Boolean(el.requireEmailForLeads.checked),
-          aggressiveEmailHunt: Boolean(el.aggressiveEmailHunt && el.aggressiveEmailHunt.checked),
-          maxSocialPages: 2,
-          leadDiscoveryEnabled: Boolean(el.leadDiscoveryEnabled.checked),
+          contactGoals: {
+            email: Boolean(el.contactGoalEmail && el.contactGoalEmail.checked),
+            phone: Boolean(el.contactGoalPhone && el.contactGoalPhone.checked)
+          },
+          filters: readFilterConfig({
+            minRating: el.minRating.value,
+            maxRating: el.maxRating.value,
+            minReviews: el.minReviews.value,
+            maxReviews: el.maxReviews.value,
+            hasWebsite: el.hasWebsite.checked,
+            hasPhone: el.hasPhone.checked,
+            hasEmail: !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false
+          }),
+          maxSocialPages: 4,
+          leadDiscoveryEnabled: selectedLeadDiscovery,
           discoverySources: {
-            google: Boolean(el.discoveryGoogleEnabled.checked),
+            google: selectedLeadDiscovery,
             linkedin: false,
             yelp: false
           },
@@ -1977,7 +2055,7 @@
       setState(`Enrichment: ${enrichSummary.enriched || 0} enriched, ${enrichSummary.skipped || 0} skipped, ${enrichSummary.blocked || 0} blocked, pages ${enrichSummary.pages_visited || 0}/${enrichSummary.pages_discovered || 0}`);
       if (personalCount > 0 || companyCount > 0) {
         setLeadSignal(
-          `Saved emails: personal ${personalCount}, company fallback ${companyCount}, discovery ${Math.max(0, discoveryRecovered)}`,
+          `Saved emails: ${Math.max(0, personalCount + companyCount)}, discovery ${Math.max(0, discoveryRecovered)}`,
           "success"
         );
       } else {

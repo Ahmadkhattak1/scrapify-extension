@@ -1,4 +1,4 @@
-# GBP Maps Scraper (Chrome Extension)
+# Scrapify (Chrome Extension)
 
 Chrome extension (Manifest V3) to scrape Google Maps business profile rows from the currently open search results page, apply filters, and export CSV.
 
@@ -14,23 +14,20 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
   - category include/exclude
   - has website
   - has phone
+  - keep only leads with email
 - Optional `Infinite scroll` mode (ignores max rows and keeps scraping until end-of-results or Stop)
 - Optional website enrichment mode (category-agnostic):
-  - crawls internal website pages (configurable pages/site) instead of scanning only landing page
-  - skips common blog/news/article paths to avoid low-value crawl pages
-  - scans public pages for owner/founder/president/CEO-style names and emails
-  - tracks discovered social links and can scan Facebook pages for fallback email when website email is missing
-  - optional external lead discovery mode:
-    - trigger: when website is missing or website scan returns no email
-    - order: Website -> Google Search
-    - discovery uses Google Search only and evaluates the top 3 results per query
-    - budget defaults: Google (2 queries/3 results)
+  - primary contact goals are explicit: `email`, `phone`, or both
+  - scans focused routes (`/contact`, `/about`, `/team`, `/careers`) with common aliases plus homepage/footer signals
+  - skips low-value pages like blog/news/product/catalog routes
+  - always includes Facebook/social fallback when selected contact goals are still missing
+  - contact flow is deterministic: `GBP website -> homepage/contact/about/team/careers -> Facebook (GBP link or site social link) -> unavailable`
   - optional visible-tab mode opens scan tabs without stealing focus from your active tab
   - skips blocked/unavailable websites and keeps core GBP data
 - Persistent run/session snapshots in `chrome.storage.local` so progress/results survive popup close/reopen
 - Email precedence output fields:
-  - `email` (single unified export email based on popup precedence preference)
-  - `primary_email` (personal email first; falls back to company/contact)
+  - `email` (single unified export email)
+  - `primary_email` (best discovered email from website/Facebook flow)
   - `primary_email_type` (`personal` or `company`)
   - `primary_email_source` (`website`, `facebook`, etc.)
 - Fast pre-filtering from list cards for rating/review/name/category constraints to avoid opening every listing
@@ -65,12 +62,11 @@ Chrome extension (Manifest V3) to scrape Google Maps business profile rows from 
 4. Optional: enable **Infinite scroll** to ignore max rows.
 5. Choose export columns (All/None or individual checkboxes).
 6. Click **Start Scrape**.
-7. Optional: enable **Enrich websites (owner/email, best effort)** before export.
-   - set **Website pages per site** (crawl depth)
+7. Optional: enable **Enrich websites** before export.
+   - set primary contact goals: **Collect emails**, **Collect phone numbers**, or both
+   - focused crawl checks homepage + contact/about/team/careers routes (and common aliases)
    - optional: enable **Show tabs while enriching**
-   - optional: enable **Hunt email on social links**
-   - optional: enable **Enable external lead discovery**
-   - optional: toggle **Google Search (top 3 results)**
+   - Facebook/social fallback runs automatically during enrichment
    - enrichment auto-starts after scrape completion when enabled
 8. Click **Export CSV** after completion (or after stop).
 

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="260" viewBox="0 0 920 260" fill="none">
+  <defs>
+    <linearGradient id="scrapifyGrad" x1="18" y1="37" x2="204" y2="223" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#08ABA5"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="37" width="186" height="186" rx="44" fill="url(#scrapifyGrad)"/>
+  <rect x="19.5" y="38.5" width="183" height="183" rx="42.5" stroke="#FFFFFF" stroke-opacity="0.26"/>
+  <path d="M163 74C128 63 82 73 72 101C65 121 83 132 111 145C145 160 160 174 152 192C142 219 97 224 63 213" stroke="white" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="155" cy="87" r="7" fill="#FFD652"/>
+  <text x="212" y="144" fill="#0D1F36" font-family="Arial, Helvetica, sans-serif" font-size="108" font-weight="700" letter-spacing="0.2">crapify</text>
+  <text x="216" y="198" fill="#405B78" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="400" letter-spacing="0.4">Maps Lead Scraper</text>
+</svg>

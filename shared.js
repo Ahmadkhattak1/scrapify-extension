@@ -541,6 +541,17 @@
     return normalizeText(value) !== "";
   }
 
+  function hasAnyEmailValue(row) {
+    const value = row && typeof row === "object" ? row : {};
+    const candidates = [value.primary_email, value.owner_email, value.contact_email, value.email];
+    return candidates.some((candidate) => {
+      const clean = normalizeText(candidate).toLowerCase();
+      if (!clean || !clean.includes("@")) return false;
+      const [local = "", domain = ""] = clean.split("@");
+      return local.length > 0 && domain.includes(".") && !/\s/.test(clean);
+    });
+  }
+
   function safeLower(value) {
     return normalizeText(value).toLowerCase();
   }
@@ -597,6 +608,10 @@
     }
 
     if (f.hasPhone === true && !hasValue(row.phone)) {
+      return false;
+    }
+
+    if (f.hasEmail === true && !hasAnyEmailValue(row)) {
       return false;
     }
 
@@ -657,7 +672,8 @@
       categoryInclude: normalizeText(values.categoryInclude),
       categoryExclude: normalizeText(values.categoryExclude),
       hasWebsite: Boolean(values.hasWebsite),
-      hasPhone: Boolean(values.hasPhone)
+      hasPhone: Boolean(values.hasPhone),
+      hasEmail: Boolean(values.hasEmail)
     };
   }
 

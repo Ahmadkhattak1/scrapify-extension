@@ -109,6 +109,7 @@
     const infiniteScroll = Boolean(config.infiniteScroll);
     state.runInfiniteScroll = infiniteScroll;
     const filters = normalizeRuntimeFilters(config.filters || {});
+    const scrapeStageFilters = toScrapeStageFilters(filters);
     state.activeFilters = { ...filters };
     const sourceQuery = getCurrentQuery();
     const sourceUrl = window.location.href;
@@ -195,7 +196,7 @@
           const quickData = buildQuickCardData(card);
           const seenCapture = updateSeenStats(quickData);
 
-          if (!quickCardPassesFilter(card, quickData, filters)) {
+          if (!quickCardPassesFilter(card, quickData, scrapeStageFilters)) {
             state.fastSkipped += 1;
             sendProgress();
             continue;
@@ -208,7 +209,7 @@
             );
             backfillSeenStatsFromRow(row, seenCapture);
 
-            if (row && applyFilters(row, filters)) {
+            if (row && applyFilters(row, scrapeStageFilters)) {
               const guardedRow = applyWebsiteOwnershipGuard(row);
               const key = dedupeKey(guardedRow);
               if (key) {
@@ -247,8 +248,8 @@
         }
       }
 
-      if (hasAnyActiveFilter(filters) && state.rows.length > 0) {
-        const finalFilteredRows = state.rows.filter((row) => applyFilters(row, filters));
+      if (hasAnyActiveFilter(scrapeStageFilters) && state.rows.length > 0) {
+        const finalFilteredRows = state.rows.filter((row) => applyFilters(row, scrapeStageFilters));
         if (finalFilteredRows.length !== state.rows.length) {
           state.rows = finalFilteredRows;
           state.matched = finalFilteredRows.length;
@@ -318,23 +319,77 @@
       detailMatched = await waitForDetails(expectedIdentity, 3200);
     }
     if (!detailMatched && fallbackRow) {
-      return fallbackRow;
+      return sanitizeWebsiteForRowIdentity(fallbackRow, fallbackRow);
     }
 
-    const detailRow = extractBusinessRow(sourceQuery, sourceUrl);
+    const detailRow = await extractBusinessRowStable(sourceQuery, sourceUrl, expectedIdentity, fallbackRow);
     if (
       detailRow &&
       expectedIdentity &&
       expectedIdentity.hasIdentity === true &&
       !isRowMatchingExpected(detailRow, expectedIdentity)
     ) {
-      return fallbackRow || detailRow;
+      return sanitizeWebsiteForRowIdentity(fallbackRow || detailRow, fallbackRow);
+    }
+    if (
+      detailRow &&
+      fallbackRow &&
+      normalizeText(detailRow.name) &&
+      normalizeText(fallbackRow.name) &&
+      !areLikelySameBusinessName(detailRow.name, fallbackRow.name)
+    ) {
+      return sanitizeWebsiteForRowIdentity(fallbackRow, fallbackRow);
     }
 
     if (detailRow && fallbackRow) {
-      return mergeRows(detailRow, fallbackRow);
+      return sanitizeWebsiteForRowIdentity(mergeRows(detailRow, fallbackRow), fallbackRow);
     }
-    return detailRow || fallbackRow;
+    return sanitizeWebsiteForRowIdentity(detailRow || fallbackRow, fallbackRow);
+  }
+
+  async function extractBusinessRowStable(sourceQuery, sourceUrl, expectedIdentity, fallbackRow) {
+    const maxAttempts = 6;
+    let lastRow = null;
+    let previousWebsite = "";
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const row = extractBusinessRow(sourceQuery, sourceUrl);
+      if (!row) {
+        await sleep(220);
+        continue;
+      }
+      if (expectedIdentity && expectedIdentity.hasIdentity === true && !isRowMatchingExpected(row, expectedIdentity)) {
+        await sleep(250);
+        continue;
+      }
+      alignRowWithExpectedIdentity(row, expectedIdentity);
+
+      lastRow = row;
+      const website = normalizeBusinessWebsiteUrl(row.website);
+      const hasSocialFallback = Boolean(normalizeFacebookProfileUrl(row.listing_facebook));
+      const hasContactSignals =
+        Boolean(normalizeText(row.address)) ||
+        Boolean(sanitizePhoneText(row.phone)) ||
+        hasSocialFallback;
+      if (!website) {
+        if (attempt >= maxAttempts - 1 || (attempt >= 2 && hasContactSignals)) {
+          return row;
+        }
+        await sleep(320 + attempt * 80);
+        continue;
+      }
+
+      const businessName = normalizeText(row.name) || normalizeText(fallbackRow && fallbackRow.name);
+      const likelyForBusiness = isWebsiteLikelyForBusinessName(website, businessName);
+      if (likelyForBusiness && (website === previousWebsite || attempt >= 1)) {
+        return row;
+      }
+
+      previousWebsite = website;
+      await sleep(280);
+    }
+
+    return lastRow;
   }
 
   function extractBusinessRow(sourceQuery, sourceUrl) {
@@ -378,6 +433,7 @@
     const listingPhone = sanitizePhoneText(normalizeFieldValue(phone, "Phone"));
 
     const websiteHref = extractWebsiteFromDetailPanel();
+    const listingFacebook = extractFacebookFromDetailPanel();
 
     const hours =
       textFrom("div.t39EBf") ||
@@ -407,6 +463,7 @@
       website_phone: "",
       website_phone_source: "",
       website: websiteHref,
+      listing_facebook: listingFacebook,
       email: "",
       owner_name: "",
       owner_title: "",
@@ -415,11 +472,11 @@
       primary_email: "",
       primary_email_type: "",
       primary_email_source: "",
-      website_scan_status: websiteHref ? "not_requested" : "no_website",
+      website_scan_status: websiteHref || listingFacebook ? "not_requested" : "no_website",
       site_pages_visited: 0,
       site_pages_discovered: 0,
       social_pages_scanned: 0,
-      social_links: "",
+      social_links: listingFacebook ? listingFacebook : "",
       discovery_status: "not_requested",
       discovery_source: "",
       discovery_query: "",
@@ -453,6 +510,7 @@
     const quickData = buildQuickCardData(card);
     const lines = cardText.split(/\n+/).map((line) => normalizeText(line)).filter(Boolean);
     const websiteFromCard = extractWebsiteFromCard(card);
+    const listingFacebook = extractFacebookFromCard(card);
     const phoneFromCard = lines.map((line) => sanitizePhoneText(line)).find(Boolean) || "";
 
     const name =
@@ -477,6 +535,7 @@
       website_phone: "",
       website_phone_source: "",
       website: websiteFromCard,
+      listing_facebook: listingFacebook,
       email: "",
       owner_name: "",
       owner_title: "",
@@ -485,11 +544,11 @@
       primary_email: "",
       primary_email_type: "",
       primary_email_source: "",
-      website_scan_status: websiteFromCard ? "not_requested" : "no_website",
+      website_scan_status: websiteFromCard || listingFacebook ? "not_requested" : "no_website",
       site_pages_visited: 0,
       site_pages_discovered: 0,
       social_pages_scanned: 0,
-      social_links: "",
+      social_links: listingFacebook ? listingFacebook : "",
       discovery_status: "not_requested",
       discovery_source: "",
       discovery_query: "",
@@ -505,29 +564,56 @@
   function extractWebsiteFromCard(card) {
     if (!card) return "";
 
-    const cardRoot = card.closest("[role='article']") || card;
-    const roots = [cardRoot, card].filter(Boolean);
+    // Keep extraction scoped to the card itself to avoid leaking links from
+    // neighboring listings when Google Maps virtualizes the list.
+    const roots = [card].filter(Boolean);
     const selectors = [
       "a[data-item-id*='authority'][href]",
       "a[data-item-id*='website'][href]",
       "a[aria-label^='Website'][href]",
-      "a[aria-label*='Website:'][href]"
+      "a[aria-label*='Website:'][href]",
+      "a[aria-label*='open website' i][href]",
+      "[data-tooltip*='website' i]",
+      "[aria-label*='website' i]"
     ];
 
     for (const root of roots) {
       for (const selector of selectors) {
         const nodes = Array.from(root.querySelectorAll(selector)).slice(0, 40);
         for (const node of nodes) {
-          const href = normalizeBusinessWebsiteUrl((node.getAttribute && node.getAttribute("href")) || node.href || "");
-          if (isValidWebsiteLink(href)) {
-            return href;
-          }
-          const textHit = findWebsiteInText(
+          const match = extractWebsiteCandidateFromNode(node, {
+            matchBusinessName: null,
+            matchCard: card
+          });
+          if (match) return match;
+        }
+      }
+    }
+
+    return "";
+  }
+
+  function extractFacebookFromCard(card) {
+    if (!card) return "";
+
+    const roots = [card].filter(Boolean);
+    const selectors = [
+      "a[href*='facebook.com'][href]",
+      "a[aria-label*='facebook' i][href]",
+      "a[data-item-id*='authority'][href]"
+    ];
+
+    for (const root of roots) {
+      for (const selector of selectors) {
+        const nodes = Array.from(root.querySelectorAll(selector)).slice(0, 40);
+        for (const node of nodes) {
+          const href = normalizeFacebookProfileUrl((node.getAttribute && node.getAttribute("href")) || node.href || "");
+          if (href) return href;
+
+          const textHit = findFacebookInText(
             `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
           );
-          if (textHit) {
-            return textHit;
-          }
+          if (textHit) return textHit;
         }
       }
     }
@@ -540,6 +626,7 @@
     const link = resolveCardLink(card);
     const href = normalizeMapsUrl((link && (link.href || link.getAttribute("href"))) || row.maps_url || "");
     const placeId = normalizeText(parsePlaceIdFromUrl(href) || row.place_id);
+    const slug = mapsPlaceSlug(href);
     const cardName =
       normalizeText((link && link.getAttribute("aria-label")) || "") ||
       normalizeText(row.name) ||
@@ -549,25 +636,54 @@
     return {
       href,
       placeId,
+      slug,
       name: normalizedName,
-      hasIdentity: Boolean(href || placeId || normalizedName)
+      hasIdentity: Boolean(href || placeId || slug || normalizedName)
     };
+  }
+
+  function alignRowWithExpectedIdentity(row, expectedIdentity) {
+    if (!row || typeof row !== "object") return;
+    if (!expectedIdentity || expectedIdentity.hasIdentity !== true) return;
+
+    const expectedHref = normalizeMapsUrl(expectedIdentity.href);
+    if (expectedHref) {
+      row.maps_url = expectedHref;
+    }
+
+    if (!normalizeText(row.place_id)) {
+      const expectedPlaceId = normalizeText(expectedIdentity.placeId || parsePlaceIdFromUrl(expectedHref));
+      if (expectedPlaceId) {
+        row.place_id = expectedPlaceId;
+      }
+    }
   }
 
   function isRowMatchingExpected(row, expectedIdentity) {
     if (!row || !expectedIdentity) return true;
     if (expectedIdentity.hasIdentity !== true) return true;
 
+    const expectedPlaceId = normalizeText(expectedIdentity.placeId);
+    const expectedSlug = normalizeText(expectedIdentity.slug || mapsPlaceSlug(expectedIdentity.href));
     const rowPlaceId = normalizeText(row.place_id);
-    if (expectedIdentity.placeId && rowPlaceId) {
-      return expectedIdentity.placeId === rowPlaceId;
+    if (expectedPlaceId) {
+      if (rowPlaceId) {
+        return expectedPlaceId === rowPlaceId;
+      }
+      const rowSlugWithPlaceFallback = mapsPlaceSlug(normalizeMapsUrl(row.maps_url || window.location.href));
+      if (expectedSlug && rowSlugWithPlaceFallback) {
+        return expectedSlug === rowSlugWithPlaceFallback;
+      }
+      return false;
     }
 
-    const rowMapsUrl = normalizeMapsUrl(row.maps_url || window.location.href);
-    const rowSlug = mapsPlaceSlug(rowMapsUrl);
-    const expectedSlug = mapsPlaceSlug(expectedIdentity.href);
-    if (expectedSlug && rowSlug && expectedSlug === rowSlug) {
-      return true;
+    if (expectedSlug) {
+      const rowMapsUrl = normalizeMapsUrl(row.maps_url || window.location.href);
+      const rowSlug = mapsPlaceSlug(rowMapsUrl);
+      if (rowSlug) {
+        return expectedSlug === rowSlug;
+      }
+      return false;
     }
 
     const rowName = normalizeNameForMatch(row.name);
@@ -580,6 +696,14 @@
   }
 
   function extractWebsiteFromDetailPanel() {
+    const panelRoot = resolveActiveDetailPanelRoot();
+    const roots = collectDetailPanelRoots(panelRoot);
+    const detailName = normalizeText(
+      textFromWithin(panelRoot, "h1.DUwDvf") ||
+      textFromWithin(panelRoot, "h1") ||
+      textFrom("h1.DUwDvf") ||
+      textFrom("[role='main'] h1")
+    );
     const linkSelectors = [
       "a[data-item-id='authority']",
       "a[data-item-id*='authority']",
@@ -587,20 +711,24 @@
       "a[aria-label^='Website']",
       "a[aria-label*='Website:']",
       "a[aria-label*='website']",
+      "a[aria-label*='open website' i]",
       "[role='main'] a[href^='http'][aria-label*='Website']",
-      "[role='main'] a[jsaction*='authority'][href]"
+      "[role='main'] a[jsaction*='authority'][href]",
+      "[data-tooltip*='website' i]",
+      "[aria-label*='website' i]"
     ];
 
-    for (const selector of linkSelectors) {
-      const nodes = Array.from(document.querySelectorAll(selector));
-      for (const node of nodes) {
-        const href = normalizeBusinessWebsiteUrl((node.getAttribute && node.getAttribute("href")) || node.href || "");
-        if (isValidWebsiteLink(href)) return href;
-
-        const textHit = findWebsiteInText(
-          `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
-        );
-        if (textHit) return textHit;
+    for (const root of roots) {
+      for (const selector of linkSelectors) {
+        const nodes = Array.from(root.querySelectorAll(selector));
+        for (const node of nodes) {
+          if (isNodeInsideResultsList(node)) continue;
+          if (!isRenderedElement(node)) continue;
+          const match = extractWebsiteCandidateFromNode(node, {
+            matchBusinessName: detailName
+          });
+          if (match) return match;
+        }
       }
     }
 
@@ -610,20 +738,255 @@
       "button[data-item-id*='website']",
       "button[aria-label^='Website']",
       "button[aria-label*='Website:']",
+      "button[aria-label*='open website' i]",
+      "[role='button'][aria-label*='website' i]",
+      "[data-tooltip*='website' i]",
       "[role='main'] [aria-label*='Website']"
     ];
 
-    for (const selector of textSelectors) {
-      const nodes = Array.from(document.querySelectorAll(selector));
-      for (const node of nodes) {
-        const textHit = findWebsiteInText(
-          `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
-        );
-        if (textHit) return textHit;
+    for (const root of roots) {
+      for (const selector of textSelectors) {
+        const nodes = Array.from(root.querySelectorAll(selector));
+        for (const node of nodes) {
+          if (isNodeInsideResultsList(node)) continue;
+          if (!isRenderedElement(node)) continue;
+          const match = extractWebsiteCandidateFromNode(node, {
+            matchBusinessName: detailName
+          });
+          if (match) return match;
+        }
       }
     }
 
     return "";
+  }
+
+  function extractFacebookFromDetailPanel() {
+    const panelRoot = resolveActiveDetailPanelRoot();
+    const roots = collectDetailPanelRoots(panelRoot);
+    const linkSelectors = [
+      "a[href*='facebook.com']",
+      "a[aria-label*='facebook' i][href]",
+      "[role='main'] a[href*='facebook.com']"
+    ];
+
+    for (const root of roots) {
+      for (const selector of linkSelectors) {
+        const nodes = Array.from(root.querySelectorAll(selector));
+        for (const node of nodes) {
+          if (isNodeInsideResultsList(node)) continue;
+          if (!isRenderedElement(node)) continue;
+          const href = normalizeFacebookProfileUrl((node.getAttribute && node.getAttribute("href")) || node.href || "");
+          if (href) return href;
+
+          const textHit = findFacebookInText(
+            `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
+          );
+          if (textHit) return textHit;
+        }
+      }
+    }
+
+    const textSelectors = [
+      "button[aria-label*='facebook' i]",
+      "[role='button'][aria-label*='facebook' i]",
+      "[aria-label*='facebook.com' i]"
+    ];
+
+    for (const root of roots) {
+      for (const selector of textSelectors) {
+        const nodes = Array.from(root.querySelectorAll(selector));
+        for (const node of nodes) {
+          if (isNodeInsideResultsList(node)) continue;
+          if (!isRenderedElement(node)) continue;
+          const textHit = findFacebookInText(
+            `${normalizeText(node.textContent || "")} ${normalizeText((node.getAttribute && node.getAttribute("aria-label")) || "")}`
+          );
+          if (textHit) return textHit;
+        }
+      }
+    }
+
+    return "";
+  }
+
+  function resolveActiveDetailPanelRoot() {
+    const heading = document.querySelector("h1.DUwDvf") || document.querySelector("[role='main'] h1");
+    if (!heading) {
+      return document.querySelector("[role='main']") || document.body || document.documentElement;
+    }
+
+    let current = heading;
+    for (let depth = 0; current && depth < 10; depth += 1) {
+      const hasActionButtons = Boolean(
+        current.querySelector("a[data-item-id*='authority'], button[data-item-id*='authority'], button[data-item-id='address'], button[data-item-id^='phone:tel']")
+      );
+      if (hasActionButtons) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+
+    return heading.closest("[role='main']") || heading.parentElement || document.body || document.documentElement;
+  }
+
+  function collectDetailPanelRoots(panelRoot) {
+    const seen = new Set();
+    const out = [];
+    const push = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      out.push(node);
+    };
+
+    push(panelRoot);
+    if (panelRoot && typeof panelRoot.closest === "function") {
+      push(panelRoot.closest("[role='main']"));
+    }
+    push(document.querySelector("[role='main']"));
+    push(document.body);
+    push(document.documentElement);
+    return out;
+  }
+
+  function isNodeInsideResultsList(node) {
+    if (!node || typeof node.closest !== "function") return false;
+    return Boolean(
+      node.closest("div[role='feed']") ||
+      node.closest("div[aria-label*='Results' i]") ||
+      node.closest("div[role='article']") ||
+      node.closest("div.Nv2PK")
+    );
+  }
+
+  function isRenderedElement(node) {
+    if (!node || typeof node.getBoundingClientRect !== "function") return false;
+    const style = window.getComputedStyle(node);
+    if (!style) return true;
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+      return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function extractWebsiteCandidateFromNode(node, optionsInput) {
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const matchBusinessName = normalizeText(options.matchBusinessName);
+    const matchCard = options.matchCard || null;
+    const candidates = collectUrlCarrierNodes(node);
+
+    for (const candidateNode of candidates) {
+      const hrefMatch = extractDirectWebsiteUrlFromNode(candidateNode);
+      if (hrefMatch) {
+        return hrefMatch;
+      }
+    }
+
+    for (const candidateNode of candidates) {
+      const textBlob = buildNodeTextBlob(candidateNode);
+      if (!textBlob) continue;
+      const textHit = findWebsiteInText(textBlob);
+      if (!textHit) continue;
+      if (matchCard) {
+        if (isWebsiteLikelyForCard(textHit, matchCard)) {
+          return textHit;
+        }
+        continue;
+      }
+      if (!matchBusinessName || isWebsiteLikelyForBusinessName(textHit, matchBusinessName)) {
+        return textHit;
+      }
+    }
+
+    return "";
+  }
+
+  function collectUrlCarrierNodes(node) {
+    const out = [];
+    const seen = new Set();
+    const push = (candidate) => {
+      if (!candidate || typeof candidate !== "object") return;
+      if (seen.has(candidate)) return;
+      seen.add(candidate);
+      out.push(candidate);
+    };
+
+    push(node);
+    if (node && typeof node.closest === "function") {
+      push(node.closest("a[href]"));
+      push(node.closest("[data-href]"));
+      push(node.closest("[data-url]"));
+      push(node.closest("[data-value]"));
+      push(node.closest("[role='link']"));
+      push(node.closest("button"));
+    }
+    if (node && typeof node.querySelectorAll === "function") {
+      const descendants = node.querySelectorAll("a[href], [data-href], [data-url], [data-value], [role='link'], button");
+      for (const descendant of Array.from(descendants).slice(0, 10)) {
+        push(descendant);
+      }
+    }
+    return out;
+  }
+
+  function extractDirectWebsiteUrlFromNode(node) {
+    if (!node || typeof node !== "object") return "";
+
+    const directAttributes = [
+      node.href,
+      node.src,
+      readNodeAttribute(node, "href"),
+      readNodeAttribute(node, "data-href"),
+      readNodeAttribute(node, "data-url"),
+      readNodeAttribute(node, "data-link"),
+      readNodeAttribute(node, "data-link-url"),
+      readNodeAttribute(node, "data-target-url"),
+      readNodeAttribute(node, "data-value"),
+      readNodeAttribute(node, "data-website"),
+      readNodeAttribute(node, "data-website-url"),
+      readNodeAttribute(node, "ping")
+    ];
+
+    const dataset = node && node.dataset && typeof node.dataset === "object" ? Object.values(node.dataset) : [];
+    for (const candidate of [...directAttributes, ...dataset]) {
+      const normalized = normalizeBusinessWebsiteUrl(candidate);
+      if (isValidWebsiteLink(normalized)) {
+        return normalized;
+      }
+    }
+
+    return "";
+  }
+
+  function readNodeAttribute(node, name) {
+    if (!node || typeof node.getAttribute !== "function") return "";
+    return normalizeText(node.getAttribute(name) || "");
+  }
+
+  function buildNodeTextBlob(node) {
+    if (!node || typeof node !== "object") return "";
+    const parts = [
+      normalizeText(node.textContent || ""),
+      readNodeAttribute(node, "aria-label"),
+      readNodeAttribute(node, "title"),
+      readNodeAttribute(node, "data-href"),
+      readNodeAttribute(node, "data-url"),
+      readNodeAttribute(node, "data-link"),
+      readNodeAttribute(node, "data-link-url"),
+      readNodeAttribute(node, "data-target-url"),
+      readNodeAttribute(node, "data-value"),
+      readNodeAttribute(node, "data-website"),
+      readNodeAttribute(node, "data-website-url"),
+      normalizeText(node.href || ""),
+      normalizeText(node.src || "")
+    ];
+    const dataset = node && node.dataset && typeof node.dataset === "object" ? Object.values(node.dataset) : [];
+    for (const value of dataset) {
+      parts.push(normalizeText(value));
+    }
+    return normalizeText(parts.join(" "));
   }
 
   function findWebsiteInText(text) {
@@ -655,6 +1018,22 @@
     return "";
   }
 
+  function findFacebookInText(text) {
+    const raw = normalizeText(text);
+    if (!raw) return "";
+
+    const pattern = /(?:https?:\/\/)?(?:www\.|m\.)?facebook\.com\/[^\s<>()\[\]{}"']+/gi;
+    let match = pattern.exec(raw);
+    while (match) {
+      const matchedText = normalizeText(match[0]).replace(/[),.;]+$/, "");
+      const normalized = normalizeFacebookProfileUrl(matchedText);
+      if (normalized) return normalized;
+      match = pattern.exec(raw);
+    }
+
+    return "";
+  }
+
   function isValidWebsiteLink(url) {
     const normalized = normalizeBusinessWebsiteUrl(url);
     if (!normalized) return false;
@@ -670,6 +1049,77 @@
     }
   }
 
+  function normalizeFacebookProfileUrl(url) {
+    const normalized = normalizeBusinessWebsiteUrl(url);
+    if (!normalized) return "";
+
+    try {
+      const parsed = new URL(normalized);
+      const host = normalizeText(parsed.hostname).toLowerCase();
+      if (!host.includes("facebook.com")) return "";
+
+      const path = normalizeText(parsed.pathname || "").toLowerCase().replace(/\/+$/, "");
+      if (!path || path === "/") return "";
+      if (path.startsWith("/sharer") || path.startsWith("/share.php")) return "";
+      if (path.startsWith("/l.php")) return "";
+      if (path.startsWith("/dialog/") || path.startsWith("/plugins/")) return "";
+      if (path.startsWith("/privacy") || path.startsWith("/policies") || path.startsWith("/terms")) return "";
+      if (path.startsWith("/help") || path.startsWith("/legal") || path.startsWith("/settings")) return "";
+      if (path.startsWith("/login") || path.startsWith("/recover") || path.startsWith("/checkpoint")) return "";
+      if (path.startsWith("/watch") || path.startsWith("/reel") || path.startsWith("/story.php")) return "";
+      if (path.startsWith("/groups") || path.startsWith("/events") || path.startsWith("/marketplace")) return "";
+
+      const segments = path.split("/").filter(Boolean);
+      const firstSegment = segments[0] || "";
+      if (!firstSegment) return "";
+      if (firstSegment === "profile.php") {
+        return normalizeText(parsed.searchParams.get("id")) ? normalized : "";
+      }
+      if (firstSegment === "pg") {
+        const secondSegment = segments[1] || "";
+        return secondSegment ? normalized : "";
+      }
+      if (firstSegment === "pages") {
+        const secondSegment = segments[1] || "";
+        const numericId = segments.find((segment) => /^\d{5,}$/.test(segment)) || "";
+        return secondSegment || numericId ? normalized : "";
+      }
+
+      const reservedTopLevel = new Set([
+        "about",
+        "ads",
+        "business",
+        "dialog",
+        "events",
+        "gaming",
+        "groups",
+        "hashtag",
+        "help",
+        "legal",
+        "login",
+        "marketplace",
+        "messages",
+        "notifications",
+        "pages",
+        "people",
+        "plugins",
+        "policies",
+        "privacy",
+        "recover",
+        "search",
+        "settings",
+        "share.php",
+        "sharer",
+        "terms",
+        "watch"
+      ]);
+      if (reservedTopLevel.has(firstSegment)) return "";
+      return /^[a-z0-9._-]{3,}$/i.test(firstSegment) ? normalized : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
   function normalizeWebsiteHost(url) {
     const normalized = normalizeBusinessWebsiteUrl(url);
     if (!normalized) return "";
@@ -680,6 +1130,92 @@
     } catch (_error) {
       return "";
     }
+  }
+
+  function hasFacebookFallbackInRow(row) {
+    const source = row && typeof row === "object" ? row : {};
+    if (normalizeFacebookProfileUrl(source.listing_facebook)) return true;
+
+    const socialLinks = normalizeText(source.social_links)
+      .split(/\s*\|\s*|\s*,\s*|\n+/)
+      .map((entry) => normalizeFacebookProfileUrl(entry))
+      .filter(Boolean);
+    return socialLinks.length > 0;
+  }
+
+  function normalizeWebsiteOwnerKey(url) {
+    const normalized = normalizeBusinessWebsiteUrl(url);
+    if (!normalized) return "";
+    const facebookProfile = normalizeFacebookProfileUrl(normalized);
+    if (facebookProfile) {
+      return facebookProfile.toLowerCase();
+    }
+    return normalizeWebsiteHost(normalized);
+  }
+
+  function isWebsiteLikelyForBusinessName(url, businessName) {
+    if (normalizeFacebookProfileUrl(url)) {
+      return true;
+    }
+    const host = normalizeWebsiteHost(url);
+    if (!host) return false;
+    const hostRoot = host.split(".")[0].replace(/[^a-z0-9]/g, "");
+    if (!hostRoot) return false;
+
+    const nameTokens = normalizeBusinessNameKey(businessName)
+      .split(/\s+/)
+      .filter((token) => token.length >= 3);
+    if (nameTokens.length === 0) {
+      return true;
+    }
+    return nameTokens.some((token) => hostRoot.includes(token) || token.includes(hostRoot));
+  }
+
+  function sanitizeWebsiteForRowIdentity(row, fallbackRow) {
+    if (!row || typeof row !== "object") return row;
+    const website = normalizeBusinessWebsiteUrl(row.website);
+    if (!website) {
+      row.website = "";
+      row.website_scan_status = hasFacebookFallbackInRow(row) ? "not_requested" : "no_website";
+      return row;
+    }
+
+    const fallbackName = normalizeText(fallbackRow && fallbackRow.name);
+    const rowName = normalizeText(row.name);
+    if (fallbackName && rowName && !areLikelySameBusinessName(rowName, fallbackName)) {
+      row.name = fallbackName;
+    }
+
+    row.website = website;
+    if (!normalizeText(row.website_scan_status)) {
+      row.website_scan_status = "not_requested";
+    }
+    return row;
+  }
+
+  function isWebsiteLikelyForCard(url, card) {
+    if (normalizeFacebookProfileUrl(url)) {
+      return true;
+    }
+    const host = normalizeWebsiteHost(url);
+    if (!host) return false;
+    const hostRoot = host.split(".")[0].replace(/[^a-z0-9]/g, "");
+    if (!hostRoot) return false;
+
+    const link = resolveCardLink(card);
+    const cardName = normalizeText(
+      (link && link.getAttribute("aria-label")) ||
+      (card && card.getAttribute && card.getAttribute("aria-label")) ||
+      (card && card.textContent) ||
+      ""
+    );
+    const nameTokens = normalizeBusinessNameKey(cardName)
+      .split(/\s+/)
+      .filter((token) => token.length >= 3);
+    if (nameTokens.length === 0) {
+      return true;
+    }
+    return nameTokens.some((token) => hostRoot.includes(token) || token.includes(hostRoot));
   }
 
   function normalizeBusinessNameKey(name) {
@@ -717,28 +1253,29 @@
   function applyWebsiteOwnershipGuard(row) {
     if (!row || typeof row !== "object") return row;
     const website = normalizeBusinessWebsiteUrl(row.website);
+    const isSocialWebsite = Boolean(normalizeFacebookProfileUrl(website));
     if (!website) {
       row.website = "";
       if (!normalizeText(row.website_scan_status)) {
-        row.website_scan_status = "no_website";
+        row.website_scan_status = hasFacebookFallbackInRow(row) ? "not_requested" : "no_website";
       }
       return row;
     }
 
-    const host = normalizeWebsiteHost(website);
-    if (!host) {
+    const ownerKey = normalizeWebsiteOwnerKey(website);
+    if (!ownerKey) {
       row.website = "";
-      row.website_scan_status = "no_website";
+      row.website_scan_status = hasFacebookFallbackInRow(row) ? "not_requested" : "no_website";
       return row;
     }
 
     const placeId = normalizeText(row.place_id);
     const mapsUrl = normalizeMapsUrl(row.maps_url || "");
     const businessName = normalizeText(row.name);
-    const existing = state.websiteHostOwners.get(host);
+    const existing = state.websiteHostOwners.get(ownerKey);
 
     if (!existing) {
-      state.websiteHostOwners.set(host, {
+      state.websiteHostOwners.set(ownerKey, {
         placeIds: new Set(placeId ? [placeId] : []),
         mapsUrls: new Set(mapsUrl ? [mapsUrl] : []),
         names: new Set(businessName ? [businessName] : []),
@@ -754,9 +1291,11 @@
       (mapsUrl && existing.mapsUrls.has(mapsUrl)) ||
       (businessName && existing.primaryName && areLikelySameBusinessName(businessName, existing.primaryName));
 
-    if (!sameIdentity) {
+    // Allow multiple leads to share one normal website host.
+    // Keep strict matching for social profiles to avoid cross-assignment.
+    if (!sameIdentity && isSocialWebsite) {
       row.website = "";
-      row.website_scan_status = "no_website";
+      row.website_scan_status = hasFacebookFallbackInRow(row) ? "not_requested" : "no_website";
       return row;
     }
 
@@ -1083,6 +1622,13 @@
     return normalizeText(node[attrName] || node.getAttribute(attrName) || "");
   }
 
+  function textFromWithin(root, selector) {
+    if (!root || typeof root.querySelector !== "function") return "";
+    const node = root.querySelector(selector);
+    if (!node) return "";
+    return normalizeText(node.textContent || "");
+  }
+
   function findResultsFeed() {
     return findResultsFeedWithCards() ||
       document.querySelector("div[role='feed']") ||
@@ -1268,10 +1814,19 @@
 
   async function waitForDetails(expectedIdentity, timeoutMs) {
     const timeoutAt = Date.now() + timeoutMs;
+    let matchedAt = 0;
     while (Date.now() < timeoutAt) {
       const hasName = Boolean(document.querySelector("h1.DUwDvf") || document.querySelector("[role='main'] h1"));
       if (hasName && isDetailPanelMatch(expectedIdentity)) {
-        return true;
+        matchedAt = matchedAt || Date.now();
+        if (hasDetailPanelActionSignals()) {
+          return true;
+        }
+        if (Date.now() - matchedAt >= 900) {
+          return true;
+        }
+      } else {
+        matchedAt = 0;
       }
       await sleep(120);
     }
@@ -1315,6 +1870,31 @@
     );
   }
 
+  function hasDetailPanelActionSignals() {
+    const root = resolveActiveDetailPanelRoot();
+    const roots = collectDetailPanelRoots(root);
+    const selectors = [
+      "a[data-item-id*='authority']",
+      "a[data-item-id*='website']",
+      "button[data-item-id*='authority']",
+      "button[data-item-id*='website']",
+      "button[data-item-id='address']",
+      "button[data-item-id^='phone:tel']",
+      "[aria-label*='website' i]",
+      "[aria-label*='facebook' i]",
+      "a[href*='facebook.com']"
+    ];
+    return roots.some((candidateRoot) => {
+      if (!candidateRoot || typeof candidateRoot.querySelector !== "function") {
+        return false;
+      }
+      return selectors.some((selector) => {
+        const matches = Array.from(candidateRoot.querySelectorAll(selector)).slice(0, 20);
+        return matches.some((match) => !isNodeInsideResultsList(match) && isRenderedElement(match));
+      });
+    });
+  }
+
   async function attemptReturnToResultsList() {
     const backSelectors = [
       "button[aria-label*='Back to results' i]",
@@ -1348,15 +1928,26 @@
     }
 
     const detailUrl = normalizeMapsUrl(window.location.href);
+    const expectedPlaceId = normalizeText(expectedIdentity.placeId);
+    const expectedSlug = normalizeText(expectedIdentity.slug || mapsPlaceSlug(expectedIdentity.href));
     const detailPlaceId = normalizeText(parsePlaceIdFromUrl(detailUrl));
-    if (expectedIdentity.placeId && detailPlaceId) {
-      return expectedIdentity.placeId === detailPlaceId;
+    if (expectedPlaceId) {
+      if (detailPlaceId) {
+        return expectedPlaceId === detailPlaceId;
+      }
+      const detailSlugWithPlaceFallback = mapsPlaceSlug(detailUrl);
+      if (expectedSlug && detailSlugWithPlaceFallback) {
+        return expectedSlug === detailSlugWithPlaceFallback;
+      }
+      return false;
     }
 
     const detailSlug = mapsPlaceSlug(detailUrl);
-    const expectedSlug = mapsPlaceSlug(expectedIdentity.href);
-    if (expectedSlug && detailSlug && expectedSlug === detailSlug) {
-      return true;
+    if (expectedSlug) {
+      if (detailSlug) {
+        return expectedSlug === detailSlug;
+      }
+      return false;
     }
 
     const detailName = normalizeNameForMatch(
@@ -1654,7 +2245,8 @@
       categoryInclude: normalizeText(source.categoryInclude),
       categoryExclude: normalizeText(source.categoryExclude),
       hasWebsite: source.hasWebsite === true,
-      hasPhone: source.hasPhone === true
+      hasPhone: source.hasPhone === true,
+      hasEmail: source.hasEmail === true || source.requireEmailForLeads === true
     };
   }
 
@@ -1669,8 +2261,17 @@
       normalizeText(f.categoryInclude) !== "" ||
       normalizeText(f.categoryExclude) !== "" ||
       f.hasWebsite === true ||
-      f.hasPhone === true
+      f.hasPhone === true ||
+      f.hasEmail === true
     );
+  }
+
+  function toScrapeStageFilters(filters) {
+    const source = filters && typeof filters === "object" ? filters : {};
+    return {
+      ...source,
+      hasEmail: false
+    };
   }
 
   function sleep(ms) {

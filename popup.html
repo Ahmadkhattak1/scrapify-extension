@@ -4,14 +4,16 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GBP Maps Scraper</title>
+  <title>Scrapify</title>
+  <link rel="icon" type="image/png" href="assets/brand/icon-32.png" />
   <link rel="stylesheet" href="popup.css" />
 </head>
 
 <body>
   <main class="app">
     <header class="app-header">
-      <h1>GBP Maps Scraper</h1>
+      <h1 class="sr-only">Scrapify Maps Lead Scraper</h1>
+      <img class="brand-logo" src="assets/brand/scrapify-logo.svg" alt="Scrapify logo" />
     </header>
 
     <div class="scrollable-content">
@@ -122,6 +124,15 @@
                 </div>
               </label>
             </div>
+            <div class="form-row toggles-row">
+              <label class="toggle-group">
+                <span class="toggle-label">Keep only leads with email</span>
+                <div class="toggle">
+                  <input id="requireEmailForLeads" type="checkbox" class="toggle-checkbox" checked />
+                  <div class="toggle-switch"></div>
+                </div>
+              </label>
+            </div>
           </div>
         </details>
 
@@ -153,22 +164,19 @@
             </div>
 
             <div class="enrichment-settings">
-              <label class="input-group">
-                <span>Website pages per site (focused crawl)</span>
-                <input id="siteMaxPages" type="number" min="1" max="120" step="1" value="12" />
-              </label>
-
+              <p class="hint-text">Focused crawl checks homepage + contact/about/team/careers routes first, then automatically falls back to Facebook links from GBP and discovered site socials if contact details are still missing.</p>
+              <p class="contact-goals-title">Primary contact goals</p>
               <div class="form-row">
-                <label class="input-group">
-                  <span>Best email priority</span>
-                  <select id="emailPreference">
-                    <option value="owner">Owner first (rec.)</option>
-                    <option value="personal_then_company">Personal, then company</option>
-                    <option value="primary">Best auto first</option>
-                    <option value="contact">Company first</option>
-                  </select>
-                </label>
-                <label class="input-group">
+                <div class="advanced-toggles contact-goal-toggle">
+                  <label class="toggle-group">
+                    <span class="toggle-label">Collect emails</span>
+                    <div class="toggle">
+                      <input id="contactGoalEmail" type="checkbox" class="toggle-checkbox" checked />
+                      <div class="toggle-switch"></div>
+                    </div>
+                  </label>
+                </div>
+                <label id="emailOutputGroup" class="input-group">
                   <span class="label-with-info">
                     Email columns
                     <span class="info-dot" title="Controls how many email columns are exported."></span>
@@ -180,20 +188,18 @@
                   </select>
                 </label>
               </div>
-              <div class="hints">
-                <p id="emailPreferenceHint" class="hint-text"></p>
-                <p id="emailColumnsHint" class="hint-text"></p>
-              </div>
 
               <div class="form-row">
-                <label class="input-group">
-                  <span>Best phone priority</span>
-                  <select id="phonePreference">
-                    <option value="listing">Listing first (rec.)</option>
-                    <option value="website">Website first</option>
-                  </select>
-                </label>
-                <label class="input-group">
+                <div class="advanced-toggles contact-goal-toggle">
+                  <label class="toggle-group">
+                    <span class="toggle-label">Collect phone numbers</span>
+                    <div class="toggle">
+                      <input id="contactGoalPhone" type="checkbox" class="toggle-checkbox" checked />
+                      <div class="toggle-switch"></div>
+                    </div>
+                  </label>
+                </div>
+                <label id="phoneOutputGroup" class="input-group">
                   <span class="label-with-info">
                     Phone columns
                     <span class="info-dot" title="Controls how many phone columns are exported."></span>
@@ -205,58 +211,26 @@
                   </select>
                 </label>
               </div>
+
               <div class="hints">
-                <p id="phonePreferenceHint" class="hint-text"></p>
+                <p id="contactGoalsHint" class="hint-text"></p>
+                <p id="emailColumnsHint" class="hint-text"></p>
+              </div>
+
+              <div class="hints">
                 <p id="phoneColumnsHint" class="hint-text"></p>
               </div>
 
               <div class="advanced-toggles">
-                <label class="toggle-group">
+                <label id="showEnrichmentTabsRow" class="toggle-group">
                   <span class="toggle-label">Show tabs while enriching</span>
                   <div class="toggle">
                     <input id="showEnrichmentTabs" type="checkbox" class="toggle-checkbox" />
                     <div class="toggle-switch"></div>
                   </div>
                 </label>
-                <label class="toggle-group">
-                  <span class="toggle-label">Hunt email on Facebook links</span>
-                  <div class="toggle">
-                    <input id="scanSocialLinks" type="checkbox" class="toggle-checkbox" checked />
-                    <div class="toggle-switch"></div>
-                  </div>
-                </label>
-                <label class="toggle-group">
-                  <span class="toggle-label">Keep only leads with email</span>
-                  <div class="toggle">
-                    <input id="requireEmailForLeads" type="checkbox" class="toggle-checkbox" checked />
-                    <div class="toggle-switch"></div>
-                  </div>
-                </label>
-                <label class="toggle-group">
-                  <span class="toggle-label">Aggressive email hunt (slower)</span>
-                  <div class="toggle">
-                    <input id="aggressiveEmailHunt" type="checkbox" class="toggle-checkbox" />
-                    <div class="toggle-switch"></div>
-                  </div>
-                </label>
               </div>
 
-              <div class="discovery-section">
-                <label class="toggle-group large secondary">
-                  <span class="toggle-label">Enable Google Search lead discovery</span>
-                  <div class="toggle">
-                    <input id="leadDiscoveryEnabled" type="checkbox" class="toggle-checkbox" />
-                    <div class="toggle-switch"></div>
-                  </div>
-                </label>
-                <label class="toggle-group sub-toggle">
-                  <span class="toggle-label">Google Search (top 3 results)</span>
-                  <div class="toggle">
-                    <input id="discoveryGoogleEnabled" type="checkbox" class="toggle-checkbox" checked />
-                    <div class="toggle-switch"></div>
-                  </div>
-                </label>
-              </div>
             </div>
           </div>
         </details>
