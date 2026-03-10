@@ -3364,6 +3364,75 @@ function shouldQueueFocusedCrawlLink(url, _score, _intent, _visitedCount, _queue
   return Boolean(focusedCrawlPageType(url));
 }
 
+function isLikelyHomepageUrl(url) {
+  const normalized = normalizeBusinessWebsiteUrl(url) || normalizeWebsiteUrl(url) || normalizeText(url);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const path = normalizeText(parsed.pathname || "").toLowerCase().replace(/\/+$/, "");
+    return path === "" || path === "/" || /^\/index(?:\.[a-z0-9]{2,6})?$/i.test(path);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function normalizeFocusedHintType(value) {
+  const lower = normalizeText(value).toLowerCase();
+  if (!lower) return "";
+  if (lower === "contact" || lower.startsWith("contact")) return "contact";
+  if (lower === "about" || lower.startsWith("about")) return "about";
+  if (lower === "team" || lower.startsWith("team")) return "team";
+  if (lower === "careers" || lower === "career" || lower.startsWith("career")) return "careers";
+  return "";
+}
+
+function normalizeFocusedHintEntries(entries, intent) {
+  if (!Array.isArray(entries) || entries.length === 0) return [];
+
+  const unique = new Map();
+  for (const rawEntry of entries) {
+    let link = "";
+    let type = "";
+    let weight = 0;
+
+    if (typeof rawEntry === "string") {
+      link = rawEntry;
+    } else if (rawEntry && typeof rawEntry === "object") {
+      link = normalizeText(rawEntry.url || rawEntry.link || rawEntry.href);
+      type = normalizeFocusedHintType(rawEntry.type || rawEntry.pageType || rawEntry.kind);
+      weight = Number(rawEntry.weight || rawEntry.score || 0);
+    }
+
+    const normalizedLink = normalizeBusinessWebsiteUrl(link) || normalizeWebsiteUrl(link);
+    if (!normalizedLink) continue;
+
+    let score = crawlPriorityScore(normalizedLink, intent);
+    if (type === "contact") {
+      score += 12;
+    } else if (type === "about") {
+      score += 8;
+    } else if (type === "team") {
+      score += 7;
+    } else if (type === "careers") {
+      score += 6;
+    }
+    if (Number.isFinite(weight)) {
+      score += Math.max(0, Math.min(5, weight));
+    }
+
+    const existing = unique.get(normalizedLink);
+    if (!existing || score > existing.score || (!existing.type && type)) {
+      unique.set(normalizedLink, {
+        link: normalizedLink,
+        type,
+        score
+      });
+    }
+  }
+
+  return Array.from(unique.values()).sort((a, b) => b.score - a.score);
+}
+
 async function scanWebsite(startUrl, options) {
   let tab = null;
   const emails = new Set();
@@ -3401,7 +3470,7 @@ async function scanWebsite(startUrl, options) {
   if (strictFocusedPageFlow) {
     firstUrl = `${baseOrigin}/`;
   }
-  const skipSitemapLookup = socialRootScan || options.skipSitemapLookup === true || focusedSinglePageScan || strictFocusedPageFlow;
+  const skipSitemapLookup = socialRootScan || options.skipSitemapLookup === true || focusedSinglePageScan;
   const maxPagesCap = socialRootScan ? 4 : focusedSinglePageScan ? 1 : FOCUSED_CRAWL_MAX_PAGES;
   const effectiveMaxPages = maxPagesCap;
   const sitemapQueueBudget = Math.max(6, effectiveMaxPages * 2);
@@ -3418,12 +3487,47 @@ async function scanWebsite(startUrl, options) {
   const queued = new Set();
   const discovered = new Set();
   const focusedPageTypeQueueCounts = new Map();
+  const focusedTypeHintByKey = new Map();
+  const forcedFocusedKeys = new Set();
+  const maxForcedFocusedLinks = Math.max(3, Math.min(8, effectiveMaxPages));
+  let forcedFocusedQueued = 0;
+  let sourceFallbackEnabled = !socialRootScan && !focusedSinglePageScan;
+
+  const normalizedQueueUrl = (url) => canonicalizeCrawlUrl(url, baseOrigin) || stripHash(url) || "";
+  const normalizedQueueKey = (url) => {
+    const normalized = normalizedQueueUrl(url);
+    return stripHash(normalized);
+  };
+  const setFocusedTypeHint = (url, rawType) => {
+    const type = normalizeFocusedHintType(rawType);
+    const key = normalizedQueueKey(url);
+    if (!type || !key) return;
+    focusedTypeHintByKey.set(key, type);
+  };
+  const focusedTypeForUrl = (url) => {
+    const key = normalizedQueueKey(url);
+    const hintedType = key ? normalizeFocusedHintType(focusedTypeHintByKey.get(key)) : "";
+    return hintedType || focusedCrawlPageType(url);
+  };
+  const ensureForcedFocused = (url) => {
+    const key = normalizedQueueKey(url);
+    if (!key) return false;
+    if (forcedFocusedKeys.has(key)) return true;
+    if (forcedFocusedQueued >= maxForcedFocusedLinks) return false;
+    forcedFocusedKeys.add(key);
+    forcedFocusedQueued += 1;
+    return true;
+  };
+  const isForcedFocusedUrl = (url) => {
+    const key = normalizedQueueKey(url);
+    return Boolean(key && forcedFocusedKeys.has(key));
+  };
 
   const focusedPageTypeQueueCount = (type) => Number(focusedPageTypeQueueCounts.get(type) || 0);
   const canQueueFocusedPageType = (type) => !type || focusedPageTypeQueueCount(type) < FOCUSED_CRAWL_MAX_PATHS_PER_TYPE;
 
   const markFocusedPageTypeQueued = (url) => {
-    const type = focusedCrawlPageType(url);
+    const type = focusedTypeForUrl(url);
     if (type) {
       focusedPageTypeQueueCounts.set(type, focusedPageTypeQueueCount(type) + 1);
     }
@@ -3435,7 +3539,7 @@ async function scanWebsite(startUrl, options) {
     const seedKey = stripHash(normalizedSeed);
     if (!normalizedSeed || !seedKey || queued.has(seedKey)) continue;
     if (strictFocusedPageFlow) {
-      const seedType = focusedCrawlPageType(normalizedSeed);
+      const seedType = focusedTypeForUrl(normalizedSeed);
       if (seedType && !canQueueFocusedPageType(seedType)) {
         continue;
       }
@@ -3593,7 +3697,9 @@ async function scanWebsite(startUrl, options) {
             assertNotStopped();
             let extracted = null;
             try {
-              extracted = await executeExtraction(tab.id, options.timeoutMs);
+              extracted = await executeExtraction(tab.id, options.timeoutMs, {
+                parseSourceHtml: false
+              });
               lastExtractionError = null;
             } catch (extractionError) {
               lastExtractionError = extractionError;
@@ -3726,11 +3832,12 @@ async function scanWebsite(startUrl, options) {
         }
 
         const sitemapEntries = prioritizeCrawlLinkEntries(sitemapLinks, intent);
+        let queuedFromSitemap = 0;
         for (const entry of sitemapEntries.slice(0, sitemapQueueBudget)) {
           const normalizedLink = canonicalizeCrawlUrl(entry.link, baseOrigin);
           if (!normalizedLink) continue;
-          if (!shouldQueueFocusedCrawlLink(normalizedLink, entry.score, intent, visited.size, queue.length)) continue;
-          const pageType = focusedCrawlPageType(normalizedLink);
+          const pageType = focusedTypeForUrl(normalizedLink);
+          if (!shouldQueueFocusedCrawlLink(normalizedLink, entry.score, intent, visited.size, queue.length) && !pageType) continue;
           if (strictFocusedPageFlow && !canQueueFocusedPageType(pageType)) continue;
           const linkKey = stripHash(normalizedLink);
           if (!linkKey) continue;
@@ -3741,10 +3848,16 @@ async function scanWebsite(startUrl, options) {
           queued.add(linkKey);
           queue.push(normalizedLink);
           markFocusedPageTypeQueued(normalizedLink);
+          queuedFromSitemap += 1;
           if (queue.length >= sitemapQueueBudget) break;
           if (entry.score >= 6) {
             highIntentDiscovered.add(linkKey);
           }
+        }
+
+        if (queuedFromSitemap > 0) {
+          // Sitemap produced focused crawl candidates, so skip expensive HTML source fallback parsing.
+          sourceFallbackEnabled = false;
         }
 
         reportProgress("sitemap_queue", queue[0] || baseOrigin);
@@ -3757,13 +3870,13 @@ async function scanWebsite(startUrl, options) {
       const nextUrl = queue.shift();
       const nextKey = stripHash(nextUrl);
       if (!nextKey || visited.has(nextKey)) continue;
-      if (strictFocusedPageFlow && visited.size > 0 && !focusedCrawlPageType(nextUrl)) {
+      if (strictFocusedPageFlow && visited.size > 0 && !focusedTypeForUrl(nextUrl) && !isForcedFocusedUrl(nextUrl)) {
         continue;
       }
 
       visited.add(nextKey);
       pagesVisited = visited.size;
-      if (isHighIntentPath(nextUrl, intent)) {
+      if (focusedTypeForUrl(nextUrl) || isForcedFocusedUrl(nextUrl)) {
         priorityPagesVisited += 1;
       }
       reportProgress("site_page", nextUrl);
@@ -3775,7 +3888,9 @@ async function scanWebsite(startUrl, options) {
         await waitForTabComplete(tab.id, options.timeoutMs);
         assertNotStopped();
         await sleep(800);
-        pageData = await executeExtraction(tab.id, options.timeoutMs);
+        pageData = await executeExtraction(tab.id, options.timeoutMs, {
+          parseSourceHtml: sourceFallbackEnabled && isLikelyHomepageUrl(nextUrl)
+        });
       } catch (_sitePageError) {
         assertNotStopped();
         reportProgress("site_page_error", nextUrl);
@@ -3809,6 +3924,10 @@ async function scanWebsite(startUrl, options) {
       for (const social of pageData.socialLinks || []) {
         registerSocialCandidate(social);
       }
+      if (pageData.hasFooterFacebookLink === true) {
+        // Direct footer Facebook link is already available; no need to parse raw HTML source fallback.
+        sourceFallbackEnabled = false;
+      }
 
       const hasSignalOnPage =
         (Array.isArray(pageData.emails) && pageData.emails.length > 0) ||
@@ -3839,16 +3958,72 @@ async function scanWebsite(startUrl, options) {
       }
 
       if (!socialRootScan && !focusedSinglePageScan) {
-        const prioritizedLinks = prioritizeCrawlLinkEntries([
-          ...(Array.isArray(pageData.relatedLinks) ? pageData.relatedLinks : []),
-          ...(Array.isArray(pageData.internalLinks) ? pageData.internalLinks : [])
-        ], intent).slice(0, perPageLinkBudget);
+        const focusedHintEntries = normalizeFocusedHintEntries(pageData.focusedLinks, intent).slice(0, perPageLinkBudget);
+        for (const entry of focusedHintEntries) {
+          const normalizedLink = canonicalizeCrawlUrl(entry.link, baseOrigin);
+          if (!normalizedLink) continue;
+          const hintType = normalizeFocusedHintType(entry.type);
+          const linkKey = stripHash(normalizedLink);
+          if (!linkKey) continue;
+          if (visited.has(linkKey) || queued.has(linkKey)) continue;
+          if (discovered.size >= options.maxDiscoveredPages) continue;
 
-        for (const entry of prioritizedLinks) {
+          if (hintType) {
+            if (!canQueueFocusedPageType(hintType)) continue;
+            setFocusedTypeHint(normalizedLink, hintType);
+          } else if (!ensureForcedFocused(normalizedLink)) {
+            continue;
+          }
+
+          discovered.add(linkKey);
+          queued.add(linkKey);
+          queue.push(normalizedLink);
+          markFocusedPageTypeQueued(normalizedLink);
+          if (entry.score >= 6 || hintType === "contact" || isForcedFocusedUrl(normalizedLink)) {
+            highIntentDiscovered.add(linkKey);
+          }
+        }
+
+        const prioritizedRelatedLinks = prioritizeCrawlLinkEntries(
+          Array.isArray(pageData.relatedLinks) ? pageData.relatedLinks : [],
+          intent
+        ).slice(0, perPageLinkBudget);
+
+        for (const entry of prioritizedRelatedLinks) {
+          const normalizedLink = canonicalizeCrawlUrl(entry.link, baseOrigin);
+          if (!normalizedLink) continue;
+          const linkKey = stripHash(normalizedLink);
+          if (!linkKey) continue;
+          if (visited.has(linkKey) || queued.has(linkKey)) continue;
+          if (discovered.size >= options.maxDiscoveredPages) continue;
+
+          const pageType = focusedTypeForUrl(normalizedLink);
+          const forcedFocused = !pageType;
+          if (forcedFocused) {
+            if (!ensureForcedFocused(normalizedLink)) continue;
+          } else if (!canQueueFocusedPageType(pageType)) {
+            continue;
+          }
+
+          discovered.add(linkKey);
+          queued.add(linkKey);
+          queue.push(normalizedLink);
+          markFocusedPageTypeQueued(normalizedLink);
+          if (entry.score >= 6 || forcedFocused) {
+            highIntentDiscovered.add(linkKey);
+          }
+        }
+
+        const prioritizedInternalLinks = prioritizeCrawlLinkEntries(
+          Array.isArray(pageData.internalLinks) ? pageData.internalLinks : [],
+          intent
+        ).slice(0, perPageLinkBudget);
+
+        for (const entry of prioritizedInternalLinks) {
           const normalizedLink = canonicalizeCrawlUrl(entry.link, baseOrigin);
           if (!normalizedLink) continue;
           if (!shouldQueueFocusedCrawlLink(normalizedLink, entry.score, intent, visited.size, queue.length)) continue;
-          const pageType = focusedCrawlPageType(normalizedLink);
+          const pageType = focusedTypeForUrl(normalizedLink);
           if (!pageType) continue;
           if (!canQueueFocusedPageType(pageType)) continue;
 
@@ -3879,7 +4054,9 @@ async function scanWebsite(startUrl, options) {
         }
       }
 
-      const queueHasFocusedTarget = queue.some((queuedUrl) => isFocusedCrawlTarget(queuedUrl, intent));
+      const queueHasFocusedTarget = queue.some(
+        (queuedUrl) => focusedTypeForUrl(queuedUrl) || isForcedFocusedUrl(queuedUrl)
+      );
       if (
         noSignalStreak >= noSignalExitThreshold &&
         emails.size === 0 &&
@@ -4761,6 +4938,11 @@ function isLikelyFacebookBusinessPageUrl(url) {
     const numericId = segments.find((segment) => /^\d{5,}$/.test(segment)) || "";
     return Boolean(secondSegment || numericId);
   }
+  if (firstSegment === "p") {
+    const secondSegment = path.split("/").filter(Boolean)[1] || "";
+    // Modern Facebook business pages are often exposed as /p/<name-id>/.
+    return /^[a-z0-9._-]{4,}$/i.test(secondSegment);
+  }
 
   const reservedTopLevel = new Set([
     "about",
@@ -5482,12 +5664,16 @@ function promiseWithTimeout(promise, timeoutMs, message) {
   });
 }
 
-function executeExtraction(tabId, timeoutMs) {
+function executeExtraction(tabId, timeoutMs, extractionOptions) {
+  const scriptOptions = extractionOptions && typeof extractionOptions === "object"
+    ? extractionOptions
+    : {};
   const task = new Promise((resolve, reject) => {
     chrome.scripting.executeScript(
       {
         target: { tabId },
-        func: extractPageDataScript
+        func: extractPageDataScript,
+        args: [scriptOptions]
       },
       (results) => {
         if (chrome.runtime.lastError) {
@@ -5531,7 +5717,11 @@ function defaultFilename() {
   return `gbp_export_${stamp}.csv`;
 }
 
-async function extractPageDataScript() {
+async function extractPageDataScript(extractionOptionsInput) {
+  const extractionOptions = extractionOptionsInput && typeof extractionOptionsInput === "object"
+    ? extractionOptionsInput
+    : {};
+  const parseSourceHtmlEnabled = extractionOptions.parseSourceHtml !== false;
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
 
   const isPlaceholderEmailParts = (localPart, domainPart) => {
@@ -6466,9 +6656,46 @@ async function extractPageDataScript() {
   const relatedLinkSet = new Set();
   const internalLinkSet = new Set();
   const socialLinkSet = new Set();
-  const relatedKeywords = /(about|contact|team|leadership|management|staff|company|our-story|who-we-are|founder|owner)/i;
+  const focusedLinkMap = new Map();
+  const relatedKeywords = /(about|contact|get\s+in\s+touch|reach\s+us|call\s+us|team|leadership|management|staff|company|our-story|who-we-are|founder|owner|careers?|jobs?|join\s+us|work\s+with\s+us|vacanc(?:y|ies))/i;
   const pageOrigin = window.location.origin;
   const anchors = Array.from(document.querySelectorAll("a[href]"));
+  let hasFooterFacebookLink = false;
+
+  const inferFocusedTypeFromText = (value) => {
+    const text = normalize(value).toLowerCase();
+    if (!text) return "";
+    if (/(?:^|\b)(contact(?:\s*us)?|get\s*in\s*touch|reach\s*us|call\s*us)(?:\b|$)/i.test(text)) return "contact";
+    if (/(?:^|\b)(about(?:\s*us)?|our\s*story|who\s*we\s*are|company)(?:\b|$)/i.test(text)) return "about";
+    if (/(?:^|\b)(team|our\s*team|leadership|management|staff|founder|owner)(?:\b|$)/i.test(text)) return "team";
+    if (/(?:^|\b)(careers?|jobs?|join\s*us|work\s*with\s*us|vacanc(?:y|ies))(?:\b|$)/i.test(text)) return "careers";
+    return "";
+  };
+
+  const focusedTypeRank = (type) => {
+    const normalized = normalize(type).toLowerCase();
+    if (normalized === "contact") return 4;
+    if (normalized === "about") return 3;
+    if (normalized === "team") return 2;
+    if (normalized === "careers") return 1;
+    return 0;
+  };
+
+  const registerFocusedLink = (absoluteUrl, type, source) => {
+    const normalizedType = inferFocusedTypeFromText(type);
+    if (!absoluteUrl || !normalizedType) return;
+    if (!isCrawlableInternal(absoluteUrl)) return;
+    const existing = focusedLinkMap.get(absoluteUrl);
+    const currentRank = existing ? focusedTypeRank(existing.type) : 0;
+    const nextRank = focusedTypeRank(normalizedType);
+    if (!existing || nextRank >= currentRank) {
+      focusedLinkMap.set(absoluteUrl, {
+        url: absoluteUrl,
+        type: normalizedType,
+        source: normalize(source || "")
+      });
+    }
+  };
 
   const collectSocialFromWrappedUrl = (urlValue) => {
     try {
@@ -6503,6 +6730,7 @@ async function extractPageDataScript() {
     const href = anchor.getAttribute("href") || "";
     const text = normalize(anchor.textContent || "");
     const aria = normalize(anchor.getAttribute("aria-label") || "");
+    const title = normalize(anchor.getAttribute("title") || "");
     collectSocialUrlsFromText(`${href} ${text} ${aria}`, socialLinkSet);
 
     if (href.toLowerCase().startsWith("mailto:")) {
@@ -6540,19 +6768,75 @@ async function extractPageDataScript() {
     const absoluteSocial = normalizeSocialUrl(absolute);
     if (absoluteSocial) {
       socialLinkSet.add(absoluteSocial);
+      let socialHost = "";
+      try {
+        socialHost = normalize(new URL(absoluteSocial).hostname || "").toLowerCase();
+      } catch (_socialUrlError) {
+        socialHost = "";
+      }
+      if (socialHost.includes("facebook.com") && typeof anchor.closest === "function") {
+        if (anchor.closest("footer, [role='contentinfo'], [id*='footer' i], [class*='footer' i]")) {
+          hasFooterFacebookLink = true;
+        }
+      }
       continue;
     }
     collectSocialFromWrappedUrl(absolute);
 
     if (isCrawlableInternal(absolute)) {
       internalLinkSet.add(absolute);
+      const focusedType = inferFocusedTypeFromText(`${text} ${aria} ${title} ${absolute}`);
+      if (focusedType) {
+        registerFocusedLink(absolute, focusedType, "anchor");
+      }
     }
 
-    const probe = `${text} ${absolute}`;
+    const probe = `${text} ${aria} ${title} ${absolute}`;
     if (!relatedKeywords.test(probe)) continue;
 
     if (relatedLinkSet.size < 30) {
       relatedLinkSet.add(absolute);
+    }
+  }
+
+  const shouldParseSourceHtmlFallback =
+    parseSourceHtmlEnabled &&
+    !hasFooterFacebookLink &&
+    focusedLinkMap.size === 0;
+  const rawHtmlSource = shouldParseSourceHtmlFallback
+    ? normalize(document.documentElement ? document.documentElement.innerHTML : "")
+    : "";
+  if (shouldParseSourceHtmlFallback && rawHtmlSource) {
+    const htmlSnippet = rawHtmlSource.slice(0, 260000);
+    const sourceAnchorPattern = /<a\b[^>]{0,1200}?href\s*=\s*(["'])(.*?)\1[\s\S]{0,280}?<\/a>/gi;
+    let sourceMatch = sourceAnchorPattern.exec(htmlSnippet);
+    let sourceScanned = 0;
+    while (sourceMatch && sourceScanned < 280) {
+      sourceScanned += 1;
+      const hrefValue = normalize(decodeHtmlEntities(sourceMatch[2] || ""));
+      let absolute = "";
+      try {
+        absolute = new URL(hrefValue, window.location.href).toString();
+      } catch (_error) {
+        absolute = "";
+      }
+
+      if (absolute && isCrawlableInternal(absolute)) {
+        internalLinkSet.add(absolute);
+        const sourceText = normalize(
+          decodeEscapedText(decodeHtmlEntities(sourceMatch[0] || ""))
+            .replace(/<[^>]+>/g, " ")
+        );
+        const sourceFocusedType = inferFocusedTypeFromText(sourceText);
+        if (sourceFocusedType) {
+          registerFocusedLink(absolute, sourceFocusedType, "html_source");
+          if (relatedLinkSet.size < 30) {
+            relatedLinkSet.add(absolute);
+          }
+        }
+      }
+
+      sourceMatch = sourceAnchorPattern.exec(htmlSnippet);
     }
   }
 
@@ -6619,8 +6903,10 @@ async function extractPageDataScript() {
     phones: Array.from(phones).slice(0, 20),
     ownerCandidates,
     relatedLinks: Array.from(relatedLinkSet).slice(0, 50),
+    focusedLinks: Array.from(focusedLinkMap.values()).slice(0, 40),
     internalLinks: Array.from(internalLinkSet).slice(0, 260),
     socialLinks: Array.from(socialLinkSet).slice(0, 12),
+    hasFooterFacebookLink,
     blocked,
     platform,
     hasContactSignals,
