@@ -64,6 +64,8 @@ body {
 .actions {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 button {
@@ -155,7 +157,6 @@ table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
-  min-width: 920px;
   table-layout: fixed;
 }
 
@@ -190,6 +191,79 @@ th {
   text-overflow: ellipsis;
 }
 
+th.can-autofit {
+  position: relative;
+  padding-right: 18px;
+  user-select: none;
+}
+
+.header-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tracking-header {
+  display: grid;
+  gap: 4px;
+}
+
+.tracking-title-input {
+  width: 100%;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  padding: 0;
+}
+
+.tracking-title-input::placeholder {
+  color: #70849f;
+}
+
+.tracking-header-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.tracking-bulk-btn {
+  border: 1px solid #c7d3e5;
+  border-radius: 6px;
+  background: #f8fbff;
+  color: #1f2f45;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+
+.tracking-bulk-btn:hover {
+  background: #edf4ff;
+}
+
+.col-resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 10px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 3;
+}
+
+.col-resize-handle:hover {
+  background: rgba(31, 111, 255, 0.08);
+}
+
+body.is-resizing-columns,
+body.is-resizing-columns * {
+  cursor: col-resize !important;
+}
+
 tbody tr:nth-child(even) {
   background: var(--row-alt);
 }
@@ -203,6 +277,16 @@ td {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+td.tracking-cell {
+  text-align: center;
+}
+
+.tracking-checkbox {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
 }
 
 td.row-index,
@@ -233,6 +317,32 @@ a.cell-link {
 
 a.cell-link:hover {
   text-decoration: underline;
+}
+
+button.cell-copy {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: #0c5fcb;
+  text-decoration: none;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+button.cell-copy:hover {
+  text-decoration: underline;
+}
+
+button.cell-copy.copied {
+  color: #13643a;
 }
 
 .cell-status {

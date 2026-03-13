@@ -27,6 +27,8 @@ const CONTROL_PANEL_PATH = "popup.html";
 const CONTROL_PANEL_ANCHOR_WINDOW_KEY = "controlPanelAnchorWindowId";
 const CONTROL_PANEL_WINDOW_WIDTH = 420;
 const CONTROL_PANEL_WINDOW_HEIGHT = 760;
+const CONTROL_PANEL_WINDOW_RIGHT_OFFSET = 24;
+const CONTROL_PANEL_WINDOW_TOP_OFFSET = 60;
 let lastEnrichPersistAtMs = 0;
 let activeEnrichRun = null;
 const autoOpenedResultsRunIds = new Set();
@@ -47,6 +49,7 @@ const FOCUSED_CRAWL_SEED_PATHS = [
   "/jobs"
 ];
 let hiddenScanWindowId = null;
+const controlPanelRestoreInFlight = new Set();
 
 self.addEventListener("unhandledrejection", (event) => {
   const reason = event && event.reason;
@@ -211,37 +214,157 @@ function setControlPanelAnchorWindowId(windowId) {
   }).catch(() => {});
 }
 
-function openControlPanelWindow(url, anchorWindowId) {
-  const createOptions = {
-    url,
-    type: "popup",
-    focused: true,
+async function getControlPanelAnchorWindowId() {
+  const data = await storageGet([CONTROL_PANEL_ANCHOR_WINDOW_KEY]).catch(() => ({}));
+  const normalized = Number(data[CONTROL_PANEL_ANCHOR_WINDOW_KEY]);
+  return Number.isFinite(normalized) && normalized >= 0 ? normalized : null;
+}
+
+function getControlPanelWindowBounds(anchorWindow) {
+  const bounds = {
     width: CONTROL_PANEL_WINDOW_WIDTH,
-    height: CONTROL_PANEL_WINDOW_HEIGHT,
-    incognito: isCurrentContextIncognito()
+    height: CONTROL_PANEL_WINDOW_HEIGHT
   };
 
+  if (!anchorWindow || anchorWindow.type !== "normal") {
+    return bounds;
+  }
+
+  const anchorLeft = Number(anchorWindow.left);
+  const anchorTop = Number(anchorWindow.top);
+  const anchorWidth = Number(anchorWindow.width);
+  if (Number.isFinite(anchorLeft) && Number.isFinite(anchorWidth)) {
+    bounds.left = anchorLeft + anchorWidth - CONTROL_PANEL_WINDOW_WIDTH - CONTROL_PANEL_WINDOW_RIGHT_OFFSET;
+  }
+  if (Number.isFinite(anchorTop)) {
+    bounds.top = anchorTop + CONTROL_PANEL_WINDOW_TOP_OFFSET;
+  }
+  return bounds;
+}
+
+function withControlPanelAnchorWindow(anchorWindowId, callback) {
   const normalizedAnchorId = Number(anchorWindowId);
   if (!Number.isFinite(normalizedAnchorId) || normalizedAnchorId < 0) {
-    chrome.windows.create(createOptions, () => {});
+    callback(null);
     return;
   }
 
   chrome.windows.get(normalizedAnchorId, {}, (anchorWindow) => {
-    if (!chrome.runtime.lastError && anchorWindow && anchorWindow.type === "normal") {
-      if (typeof anchorWindow.incognito === "boolean") {
-        createOptions.incognito = anchorWindow.incognito;
-      }
-      const anchorLeft = Number(anchorWindow.left);
-      const anchorTop = Number(anchorWindow.top);
-      const anchorWidth = Number(anchorWindow.width);
-      if (Number.isFinite(anchorLeft) && Number.isFinite(anchorWidth)) {
-        createOptions.left = Math.max(0, anchorLeft + anchorWidth - CONTROL_PANEL_WINDOW_WIDTH - 24);
-      }
-      if (Number.isFinite(anchorTop)) {
-        createOptions.top = Math.max(0, anchorTop + 60);
-      }
+    if (chrome.runtime.lastError || !anchorWindow || anchorWindow.type !== "normal") {
+      callback(null);
+      return;
     }
+    callback(anchorWindow);
+  });
+}
+
+function restoreControlPanelWindow(windowId, anchorWindowId, callback) {
+  const normalizedWindowId = Number(windowId);
+  if (!Number.isFinite(normalizedWindowId) || normalizedWindowId < 0) {
+    if (typeof callback === "function") {
+      callback();
+    }
+    return;
+  }
+
+  withControlPanelAnchorWindow(anchorWindowId, (anchorWindow) => {
+    const updateOptions = {
+      focused: true,
+      ...getControlPanelWindowBounds(anchorWindow)
+    };
+
+    chrome.windows.update(normalizedWindowId, { state: "normal" }, () => {
+      chrome.windows.update(normalizedWindowId, updateOptions, () => {
+        if (typeof callback === "function") {
+          callback();
+        }
+      });
+    });
+  });
+}
+
+function findControlPanelPopupTab(tabs, index, callback) {
+  if (!Array.isArray(tabs) || index >= tabs.length) {
+    callback(null);
+    return;
+  }
+
+  const candidate = tabs[index];
+  const candidateWindowId = Number(candidate && candidate.windowId);
+  if (!candidate || !candidate.id || !Number.isFinite(candidateWindowId) || candidateWindowId < 0) {
+    findControlPanelPopupTab(tabs, index + 1, callback);
+    return;
+  }
+
+  chrome.windows.get(candidateWindowId, {}, (windowRef) => {
+    if (!chrome.runtime.lastError && windowRef && windowRef.type === "popup") {
+      callback(candidate);
+      return;
+    }
+    findControlPanelPopupTab(tabs, index + 1, callback);
+  });
+}
+
+function controlPanelWindowNeedsRestore(windowRef) {
+  if (!windowRef || windowRef.type !== "popup") {
+    return false;
+  }
+
+  const state = normalizeText(windowRef.state).toLowerCase();
+  const width = Number(windowRef.width);
+  const height = Number(windowRef.height);
+
+  if (state && state !== "normal") {
+    return true;
+  }
+  if (Number.isFinite(width) && width !== CONTROL_PANEL_WINDOW_WIDTH) {
+    return true;
+  }
+  if (Number.isFinite(height) && height !== CONTROL_PANEL_WINDOW_HEIGHT) {
+    return true;
+  }
+  return false;
+}
+
+function maybeRestoreLockedControlPanelWindow(windowRef) {
+  const normalizedWindowId = Number(windowRef && windowRef.id);
+  if (!Number.isFinite(normalizedWindowId) || normalizedWindowId < 0) {
+    return;
+  }
+  if (!controlPanelWindowNeedsRestore(windowRef) || controlPanelRestoreInFlight.has(normalizedWindowId)) {
+    return;
+  }
+
+  const controlPanelUrl = chrome.runtime.getURL(CONTROL_PANEL_PATH);
+  chrome.tabs.query({ windowId: normalizedWindowId, url: `${controlPanelUrl}*` }, (tabs) => {
+    if (chrome.runtime.lastError || !Array.isArray(tabs) || tabs.length === 0) {
+      return;
+    }
+
+    controlPanelRestoreInFlight.add(normalizedWindowId);
+    void getControlPanelAnchorWindowId()
+      .catch(() => null)
+      .then((anchorWindowId) => {
+        restoreControlPanelWindow(normalizedWindowId, anchorWindowId, () => {
+          controlPanelRestoreInFlight.delete(normalizedWindowId);
+        });
+      });
+  });
+}
+
+function openControlPanelWindow(url, anchorWindowId) {
+  withControlPanelAnchorWindow(anchorWindowId, (anchorWindow) => {
+    const createOptions = {
+      url,
+      type: "popup",
+      focused: true,
+      state: "normal",
+      incognito: anchorWindow && typeof anchorWindow.incognito === "boolean"
+        ? anchorWindow.incognito
+        : isCurrentContextIncognito(),
+      ...getControlPanelWindowBounds(anchorWindow)
+    };
+
     chrome.windows.create(createOptions, () => {});
   });
 }
@@ -259,19 +382,19 @@ function openOrFocusControlPanel(anchorWindowId) {
       return;
     }
 
-    const existing = Array.isArray(tabs)
-      ? tabs.find((tab) => tab && tab.id && tabMatchesCurrentContext(tab))
-      : null;
-    if (!existing || !existing.id) {
-      openControlPanelWindow(controlPanelUrl, normalizedAnchorId);
-      return;
-    }
+    const candidates = Array.isArray(tabs)
+      ? tabs.filter((tab) => tab && tab.id && tabMatchesCurrentContext(tab))
+      : [];
 
-    chrome.tabs.update(existing.id, { active: true }, () => {});
-    const existingWindowId = Number(existing.windowId);
-    if (Number.isFinite(existingWindowId) && existingWindowId >= 0) {
-      chrome.windows.update(existingWindowId, { focused: true }, () => {});
-    }
+    findControlPanelPopupTab(candidates, 0, (existing) => {
+      if (!existing || !existing.id) {
+        openControlPanelWindow(controlPanelUrl, normalizedAnchorId);
+        return;
+      }
+
+      chrome.tabs.update(existing.id, { active: true }, () => {});
+      restoreControlPanelWindow(existing.windowId, normalizedAnchorId);
+    });
   });
 }
 
@@ -303,9 +426,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
-  if (message.type === MSG.SCRAPE_DONE) {
-    handleScrapeDone(message);
+  if (message.type === MSG.OPEN_RESULTS_VIEWER) {
+    openOrFocusResultsPage(normalizeText(message.runId));
+    safeSendResponse(sendResponse, { ok: true });
     return false;
+  }
+
+  if (message.type === MSG.SCRAPE_DONE) {
+    handleScrapeDone(message)
+      .then(() => {
+        safeSendResponse(sendResponse, { ok: true });
+      })
+      .catch((error) => {
+        console.warn("[scrape:done] post-processing failed", error && error.message ? error.message : error);
+        safeSendResponse(sendResponse, {
+          ok: false,
+          error: error && error.message ? error.message : "Post-scrape processing failed"
+        });
+      });
+    return true;
   }
 
   return false;
@@ -345,6 +484,14 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
       setControlPanelAnchorWindowId(focusedWindowId);
     }
   });
+});
+
+chrome.windows.onBoundsChanged.addListener((windowRef) => {
+  maybeRestoreLockedControlPanelWindow(windowRef);
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  controlPanelRestoreInFlight.delete(Number(windowId));
 });
 
 void refreshActionBadge();
@@ -624,14 +771,14 @@ function handleStopEnrich(sendResponse) {
   });
 }
 
-function handleScrapeDone(message) {
+async function handleScrapeDone(message) {
   const runId = normalizeText(message && message.run_id);
   const rows = Array.isArray(message && message.rows) ? message.rows : [];
   const summary = message && typeof message.summary === "object" ? message.summary : {};
   const filters = message && typeof message.filters === "object" ? message.filters : {};
   const scrapeStopped = summary.stopped === true;
 
-  void handlePostScrape(runId, rows, { scrapeStopped, filters });
+  await handlePostScrape(runId, rows, { scrapeStopped, filters });
 }
 
 async function handlePostScrape(runId, rowsInput, metaInput) {
@@ -664,6 +811,9 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
 
   const queuedRows = prepareRowsForEnrichment(rows, "queued");
   await storageSet({ lastRows: queuedRows }).catch(() => {});
+  if (queuedRows.length > 0) {
+    maybeAutoOpenResultsForRun(runId);
+  }
 
   if (queuedRows.length === 0) {
     await saveEnrichSession(
@@ -812,29 +962,40 @@ function openOrFocusResultsPage(runId) {
 }
 
 async function shouldAutoOpenResultsTab() {
-  const data = await storageGet(["showEnrichmentTabsEnabled"]).catch(() => ({}));
-  return data.showEnrichmentTabsEnabled === true;
+  // The results viewer is separate from visible enrichment crawl tabs and should
+  // always open for completed scrape runs.
+  return true;
 }
 
-function maybeAutoOpenResultsForRun(runId, _options) {
+function maybeAutoOpenResultsForRun(runId, optionsInput) {
+  const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+  const force = options.force === true;
   const targetRunId = normalizeText(runId);
+  const openViewer = () => {
+    if (!targetRunId) {
+      openOrFocusResultsPage("");
+      return;
+    }
+
+    if (!force && autoOpenedResultsRunIds.has(targetRunId)) {
+      return;
+    }
+
+    autoOpenedResultsRunIds.add(targetRunId);
+    openOrFocusResultsPage(targetRunId);
+  };
+
+  if (force) {
+    openViewer();
+    return;
+  }
 
   void shouldAutoOpenResultsTab().then((allowed) => {
     if (!allowed) {
       return;
     }
 
-    if (!targetRunId) {
-      openOrFocusResultsPage("");
-      return;
-    }
-
-    if (autoOpenedResultsRunIds.has(targetRunId)) {
-      return;
-    }
-
-    autoOpenedResultsRunIds.add(targetRunId);
-    openOrFocusResultsPage(targetRunId);
+    openViewer();
   }).catch(() => {});
 }
 
@@ -856,6 +1017,7 @@ function prepareRowsForEnrichment(rows, statusForWebsite) {
     const socialPagesScanned = Number(sourceRow.social_pages_scanned || 0);
     const discoveredWebsite = normalizeBusinessWebsiteUrl(sourceRow.discovered_website);
     const listingFacebook = pickRowFacebookFallback(sourceRow);
+    const facebookCouldBe = normalizeFacebookProfileUrl(sourceRow.facebook_could_be);
     const ownerName = normalizeText(sourceRow.owner_name);
     const ownerContext = {
       businessName: normalizeText(sourceRow.name),
@@ -909,6 +1071,7 @@ function prepareRowsForEnrichment(rows, statusForWebsite) {
       owner_name: safeOwnerName,
       owner_title: safeOwnerTitle,
       listing_facebook: listingFacebook,
+      facebook_could_be: facebookCouldBe,
       email,
       owner_email: ownerEmail,
       contact_email: contactEmail,
@@ -952,6 +1115,7 @@ function createEnrichedRowFromSource(sourceRow) {
   const safeOwnerTitle = safeOwnerName ? normalizeText(base.owner_title) : "";
   const safeOwnerConfidence = safeOwnerName ? normalizeText(base.owner_confidence) : "";
   const listingFacebook = pickRowFacebookFallback(base);
+  const facebookCouldBe = normalizeFacebookProfileUrl(base.facebook_could_be);
 
   return {
     ...base,
@@ -962,6 +1126,7 @@ function createEnrichedRowFromSource(sourceRow) {
     owner_name: safeOwnerName,
     owner_title: safeOwnerTitle,
     listing_facebook: listingFacebook,
+    facebook_could_be: facebookCouldBe,
     email,
     owner_email: ownerEmail,
     contact_email: contactEmail,
@@ -1342,6 +1507,18 @@ function parseStoredSocialLinks(value) {
   return Array.from(new Set(parts));
 }
 
+function mergeStoredSocialLinks(existingValue, additionsInput) {
+  const merged = new Set(parseStoredSocialLinks(existingValue));
+  const additions = Array.isArray(additionsInput) ? additionsInput : [additionsInput];
+  for (const candidate of additions) {
+    const normalized = normalizeFacebookProfileUrl(candidate) || normalizeBusinessWebsiteUrl(candidate) || normalizeWebsiteUrl(candidate);
+    if (normalized) {
+      merged.add(normalized);
+    }
+  }
+  return Array.from(merged).join(" | ");
+}
+
 async function enrichRows(rows, options) {
   const config = options && typeof options === "object" ? options : {};
   const maxPagesPerSite = FOCUSED_CRAWL_MAX_PAGES;
@@ -1461,6 +1638,7 @@ async function enrichRows(rows, options) {
         sourceQuery: sourceRow.source_query,
         businessWebsite: targetUrl,
         discoveredWebsite: enrichedRow.discovered_website,
+        preferFacebookEmail: contactGoals.email === true,
         seedSocialLinks: sourceSocialLinks,
         shouldStop: config.shouldStop,
         onTabChange: config.onScanTabChange,
@@ -1591,9 +1769,11 @@ async function enrichRows(rows, options) {
         !sameWebsiteHost(listingFacebook, website)
       ) {
         const followupIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
-        const needsEmailAfterSite = followupIntent.needsEmail;
+        const needsFacebookEmailAfterSite =
+          contactGoals.email === true &&
+          normalizeText(enrichedRow.primary_email_source).toLowerCase() !== "facebook";
         const needsPhoneAfterSite = followupIntent.needsPhone;
-        if (needsEmailAfterSite || needsPhoneAfterSite) {
+        if (needsFacebookEmailAfterSite || needsPhoneAfterSite) {
           const socialFallbackScan = await runSiteScan(listingFacebook, "listing_social");
           const hasEmailFromFallback = scanHasAnyEmail(socialFallbackScan);
           const hasPhoneFromFallback = Boolean(sanitizePhoneText(socialFallbackScan.primaryPhone));
@@ -1601,6 +1781,65 @@ async function enrichRows(rows, options) {
             overwrite: hasEmailFromFallback || hasPhoneFromFallback,
             overwriteWithoutEmail: hasEmailFromFallback || hasPhoneFromFallback
           });
+        }
+      }
+
+      const confirmedFacebookAfterSite = pickRowFacebookFallback(enrichedRow);
+      if (confirmedFacebookAfterSite) {
+        enrichedRow.facebook_could_be = "";
+      }
+      const shouldLookupFacebookOutsideWebsite =
+        !confirmedFacebookAfterSite &&
+        contactGoals.email === true &&
+        normalizeText(enrichedRow.primary_email_source).toLowerCase() !== "facebook";
+      if (shouldLookupFacebookOutsideWebsite) {
+        emitEnrichProgress(summary, {
+          currentName: sourceRow.name,
+          currentUrl: rowCurrentUrl,
+          phase: "facebook_lookup",
+          sitePagesVisited: summary.pages_visited + rowPagesVisited,
+          sitePagesDiscovered: summary.pages_discovered + rowPagesDiscovered,
+          socialScanned: summary.social_scanned + rowSocialScanned
+        });
+
+        const facebookLookup = await discoverFacebookViaGoogleSearch(enrichedRow, {
+          timeoutMs,
+          visibleTabs,
+          shouldStop: config.shouldStop,
+          onScanTabChange: config.onScanTabChange
+        });
+        const confirmedFacebook = normalizeFacebookProfileUrl(facebookLookup.confirmedUrl);
+        const possibleFacebook = normalizeFacebookProfileUrl(facebookLookup.possibleUrl);
+
+        if (confirmedFacebook) {
+          const hadEmailBeforeFacebookLookup = rowHasAnyEmail(enrichedRow);
+          enrichedRow.listing_facebook = confirmedFacebook;
+          enrichedRow.facebook_could_be = "";
+          enrichedRow.social_links = mergeStoredSocialLinks(enrichedRow.social_links, [confirmedFacebook]);
+          rowCurrentUrl = confirmedFacebook;
+
+          const facebookIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
+          const needsFacebookEmailAfterLookup =
+            contactGoals.email === true &&
+            normalizeText(enrichedRow.primary_email_source).toLowerCase() !== "facebook";
+          if (needsFacebookEmailAfterLookup || facebookIntent.needsPhone) {
+            const externalFacebookScan = await runSiteScan(confirmedFacebook, "listing_social");
+            const facebookScanHasEmail = scanHasAnyEmail(externalFacebookScan);
+            const facebookScanHasPhone = Boolean(sanitizePhoneText(externalFacebookScan.primaryPhone));
+            applyScanResultToRow(enrichedRow, externalFacebookScan, {
+              overwrite: facebookScanHasEmail || facebookScanHasPhone,
+              overwriteWithoutEmail: facebookScanHasEmail || facebookScanHasPhone
+            });
+
+            if (!hadEmailBeforeFacebookLookup && facebookScanHasEmail) {
+              rowDiscoveryEmailRecovered = true;
+              enrichedRow.discovery_status = "recovered_email";
+              enrichedRow.discovery_source = "google_facebook";
+              enrichedRow.discovery_query = normalizeText(facebookLookup.query);
+            }
+          }
+        } else if (possibleFacebook && !normalizeFacebookProfileUrl(enrichedRow.facebook_could_be)) {
+          enrichedRow.facebook_could_be = possibleFacebook;
         }
       }
 
@@ -1892,6 +2131,7 @@ function sourceLabel(source) {
   const value = normalizeText(source).toLowerCase();
   if (!value) return "website";
   if (value === "google") return "Google Search";
+  if (value === "google_facebook") return "Google Facebook";
   return value;
 }
 
@@ -2526,6 +2766,327 @@ function isPotentialPersonalEmail(email) {
   if (!local || !domain) return false;
   if (isGenericMailboxLocalPart(local)) return false;
   return true;
+}
+
+const ADDRESS_MATCH_NOISE_TOKENS = new Set([
+  ...LOCATION_NOISE_TOKENS,
+  "address",
+  "building",
+  "bldg",
+  "suite",
+  "ste",
+  "unit",
+  "floor",
+  "fl"
+]);
+
+function normalizePhoneDigitsForMatch(value) {
+  const digits = sanitizePhoneText(value).replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length === 11 && digits.startsWith("1")) {
+    return digits.slice(1);
+  }
+  return digits;
+}
+
+function collectPhoneMatchKeys(valuesInput) {
+  const values = Array.isArray(valuesInput) ? valuesInput : [valuesInput];
+  const out = [];
+  const seen = new Set();
+  for (const value of values) {
+    const normalized = normalizePhoneDigitsForMatch(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function tokenizeAddressMatchText(value) {
+  const text = normalizeText(value).toLowerCase().replace(/[^a-z0-9\s]/g, " ");
+  if (!text) return [];
+
+  const out = [];
+  const seen = new Set();
+  for (const part of text.split(/\s+/)) {
+    const token = /^[0-9]+[a-z]?$/i.test(part) ? part : normalizeSemanticToken(part);
+    if (!token || token.length < 2) continue;
+    if (ADDRESS_MATCH_NOISE_TOKENS.has(token)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+  }
+  return out;
+}
+
+function extractAddressNumberToken(value) {
+  const match = normalizeText(value).toLowerCase().match(/\b\d{1,6}[a-z]?\b/);
+  return match ? match[0] : "";
+}
+
+function scoreAddressEvidenceMatch(referenceInput, candidatesInput) {
+  const reference = normalizeText(referenceInput);
+  const candidates = Array.isArray(candidatesInput) ? candidatesInput : [candidatesInput];
+  if (!reference) {
+    return { matched: false, score: 0, candidate: "" };
+  }
+
+  const referenceTokens = tokenizeAddressMatchText(reference);
+  if (referenceTokens.length === 0) {
+    return { matched: false, score: 0, candidate: "" };
+  }
+
+  const referenceNumber = extractAddressNumberToken(reference);
+  let best = { matched: false, score: 0, candidate: "" };
+
+  for (const rawCandidate of candidates) {
+    const candidate = normalizeText(rawCandidate);
+    if (!candidate) continue;
+    const candidateTokens = tokenizeAddressMatchText(candidate);
+    if (candidateTokens.length === 0) continue;
+
+    const overlap = tokenOverlapRatio(referenceTokens, candidateTokens);
+    const matchCount = tokenMatchCount(referenceTokens, candidateTokens);
+    const numberMatch = referenceNumber && extractAddressNumberToken(candidate) === referenceNumber;
+    let score = overlap;
+    if (numberMatch) score += 0.28;
+    if (matchCount >= 3) score += 0.12;
+    if (matchCount >= 4) score += 0.08;
+
+    const matched =
+      Boolean(numberMatch && matchCount >= 2 && overlap >= 0.34) ||
+      Boolean(numberMatch && matchCount >= 3) ||
+      Boolean(matchCount >= 4 && overlap >= 0.72);
+
+    if (score > best.score || (score === best.score && matched && !best.matched)) {
+      best = {
+        matched,
+        score,
+        candidate
+      };
+    }
+  }
+
+  return best;
+}
+
+function buildFacebookSearchQueries(row) {
+  const source = row && typeof row === "object" ? row : {};
+  const name = normalizeText(source.name);
+  if (!name) return [];
+
+  const address = normalizeText(source.address);
+  const locationHint = address || normalizeText(source.source_query);
+  const phone = collectPhoneMatchKeys([
+    source.phone,
+    source.listing_phone,
+    source.website_phone
+  ])[0] || "";
+
+  const candidates = [];
+  if (address && phone) {
+    candidates.push(`${name} ${address} ${phone} facebook`);
+  }
+  if (address) {
+    candidates.push(`${name} ${address} facebook`);
+  }
+  if (locationHint && phone) {
+    candidates.push(`${name} ${locationHint} ${phone} facebook`);
+  }
+  if (locationHint) {
+    candidates.push(`${name} ${locationHint} facebook`);
+  }
+  if (phone) {
+    candidates.push(`${name} ${phone} facebook`);
+  }
+  candidates.push(`${name} facebook`);
+
+  const out = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const normalized = normalizeText(candidate);
+    if (!normalized || seen.has(normalized.toLowerCase())) continue;
+    seen.add(normalized.toLowerCase());
+    out.push(normalized);
+  }
+  return out;
+}
+
+function normalizeFacebookDiscoveryCandidateUrl(url) {
+  const normalized = normalizeFacebookProfileUrl(url);
+  if (!normalized) return "";
+  const probeUrls = buildSocialProbeUrls(normalized);
+  return normalizeFacebookProfileUrl(probeUrls[0] || normalized);
+}
+
+function evaluateFacebookSearchCandidate(candidateInput, row, semanticContextInput) {
+  const candidate = candidateInput && typeof candidateInput === "object" ? candidateInput : {};
+  const rowData = row && typeof row === "object" ? row : {};
+  const pageData = candidate.pageData && typeof candidate.pageData === "object" ? candidate.pageData : {};
+  const semanticProfile = pageData.semanticProfile && typeof pageData.semanticProfile === "object"
+    ? pageData.semanticProfile
+    : {};
+  const semanticContext = semanticContextInput && typeof semanticContextInput === "object"
+    ? semanticContextInput
+    : buildBusinessSemanticContext({
+      businessName: normalizeText(rowData.name),
+      businessCategory: normalizeText(rowData.category),
+      businessAddress: normalizeText(rowData.address || rowData.source_query),
+      businessWebsite: normalizeText(rowData.website),
+      discoveredWebsite: normalizeText(rowData.discovered_website)
+    });
+  const normalizedUrl = normalizeFacebookDiscoveryCandidateUrl(candidate.url);
+  if (!normalizedUrl) {
+    return { status: "reject", url: "", score: 0, matchedOn: "" };
+  }
+
+  const semanticEvidence = scoreBusinessSemanticEvidence({
+    url: normalizedUrl,
+    title: normalizeText(candidate.title),
+    snippet: normalizeText(candidate.snippet),
+    pageData
+  }, semanticContext);
+  const titleSimilarity = Math.max(
+    businessNameSimilarityScore(rowData.name, normalizeText(candidate.title)),
+    businessNameSimilarityScore(rowData.name, normalizeText(semanticProfile.pageTitle)),
+    businessNameSimilarityScore(rowData.name, Array.isArray(semanticProfile.orgNames) ? semanticProfile.orgNames.join(" | ") : "")
+  );
+  const rowPhoneKeys = collectPhoneMatchKeys([
+    rowData.phone,
+    rowData.listing_phone,
+    rowData.website_phone
+  ]);
+  const pagePhoneKeys = collectPhoneMatchKeys(Array.isArray(pageData.phones) ? pageData.phones : []);
+  const phoneMatched = rowPhoneKeys.some((phoneKey) => pagePhoneKeys.includes(phoneKey));
+  const addressMatch = scoreAddressEvidenceMatch(rowData.address, [
+    ...(Array.isArray(pageData.addresses) ? pageData.addresses : []),
+    semanticProfile.metaDescription,
+    semanticProfile.headingText,
+    semanticProfile.textSample
+  ]);
+
+  let score = semanticEvidence.score;
+  if (phoneMatched) score += 0.18;
+  if (addressMatch.matched) score += 0.14;
+  score += Math.min(0.08, titleSimilarity * 0.08);
+  const boundedScore = Math.min(0.99, Math.max(0, score));
+
+  if ((phoneMatched && (semanticEvidence.score >= 0.28 || titleSimilarity >= 0.45)) || addressMatch.matched) {
+    return {
+      status: "confirmed",
+      url: normalizedUrl,
+      score: boundedScore,
+      matchedOn: phoneMatched ? "phone" : "address"
+    };
+  }
+
+  if (semanticEvidence.score >= 0.78 && titleSimilarity >= 0.56) {
+    return {
+      status: "probable",
+      url: normalizedUrl,
+      score: boundedScore,
+      matchedOn: ""
+    };
+  }
+
+  return {
+    status: "reject",
+    url: normalizedUrl,
+    score: boundedScore,
+    matchedOn: ""
+  };
+}
+
+async function discoverFacebookViaGoogleSearch(row, optionsInput) {
+  const rowData = row && typeof row === "object" ? row : {};
+  const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+  const timeoutMs = clampInt(options.timeoutMs, 5000, 30000, 12000);
+  const visibleTabs = options.visibleTabs === true;
+  const queries = buildFacebookSearchQueries(rowData).slice(0, 5);
+  if (queries.length === 0) {
+    return { attempted: false, confirmedUrl: "", possibleUrl: "", query: "", matchedOn: "", confidence: 0 };
+  }
+
+  const semanticContext = buildBusinessSemanticContext({
+    businessName: normalizeText(rowData.name),
+    businessCategory: normalizeText(rowData.category),
+    businessAddress: normalizeText(rowData.address || rowData.source_query),
+    businessWebsite: normalizeText(rowData.website),
+    discoveredWebsite: normalizeText(rowData.discovered_website)
+  });
+  const seenUrls = new Set();
+  let bestProbable = null;
+
+  for (const query of queries) {
+    if (isEnrichStopRequested(options)) {
+      throw createEnrichStopError();
+    }
+
+    const googleCandidates = await searchGoogleCandidates(query, {
+      timeoutMs,
+      visibleTabs,
+      maxResults: 2,
+      siteFilter: "facebook.com",
+      includeDirectoryHosts: true,
+      shouldStop: options.shouldStop,
+      onScanTabChange: options.onScanTabChange
+    });
+
+    for (const candidate of googleCandidates) {
+      const normalizedUrl = normalizeFacebookDiscoveryCandidateUrl(candidate && candidate.url);
+      if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
+      seenUrls.add(normalizedUrl);
+
+      const pageData = await openTabAndExtractData(
+        normalizedUrl,
+        {
+          timeoutMs,
+          visibleTabs,
+          shouldStop: options.shouldStop,
+          onScanTabChange: options.onScanTabChange
+        },
+        (tabId, extractionTimeout) => executeExtraction(tabId, extractionTimeout, {
+          parseSourceHtml: false
+        })
+      ).catch(() => null);
+      if (!pageData) continue;
+
+      const evaluation = evaluateFacebookSearchCandidate({
+        url: normalizedUrl,
+        title: normalizeText(candidate && candidate.title),
+        snippet: normalizeText(candidate && candidate.snippet),
+        pageData
+      }, rowData, semanticContext);
+
+      if (evaluation.status === "confirmed") {
+        return {
+          attempted: true,
+          confirmedUrl: evaluation.url,
+          possibleUrl: "",
+          query,
+          matchedOn: evaluation.matchedOn,
+          confidence: evaluation.score
+        };
+      }
+
+      if (evaluation.status === "probable" && (!bestProbable || evaluation.score > bestProbable.confidence)) {
+        bestProbable = {
+          url: evaluation.url,
+          query,
+          confidence: evaluation.score
+        };
+      }
+    }
+  }
+
+  return {
+    attempted: true,
+    confirmedUrl: "",
+    possibleUrl: bestProbable ? bestProbable.url : "",
+    query: bestProbable ? bestProbable.query : (queries[queries.length - 1] || ""),
+    matchedOn: "",
+    confidence: bestProbable ? bestProbable.confidence : 0
+  };
 }
 
 function scoreOwnerLookupCandidate(url, contextInput) {
@@ -3451,6 +4012,7 @@ async function scanWebsite(startUrl, options) {
   let sitemapAttempted = false;
   let noSignalStreak = 0;
   const intent = normalizeScanIntent(options.intent);
+  const preferFacebookEmail = options.preferFacebookEmail === true;
   const normalizedStartUrl = normalizeBusinessWebsiteUrl(startUrl) || normalizeWebsiteUrl(startUrl) || startUrl;
   const baseOrigin = new URL(normalizedStartUrl).origin;
   let firstUrl = canonicalizeCrawlUrl(normalizedStartUrl, baseOrigin) || stripHash(normalizedStartUrl) || normalizedStartUrl;
@@ -3633,6 +4195,7 @@ async function scanWebsite(startUrl, options) {
   const scanQueuedSocialCandidates = async (optionsInput) => {
     const scanOptions = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
     const prioritizeEmailGoal = scanOptions.prioritizeEmailGoal === true && intent.needsEmail;
+    const shouldPreferSocialEmail = scanOptions.preferFacebookEmail === true || preferFacebookEmail;
     let companyEmailNow = chooseContactEmail(Array.from(emails), "", contactSelectionOptions);
     let trustedCompanyEmailNow = Boolean(companyEmailNow && isTrustedCollectedEmail(companyEmailNow));
     let primaryPhoneNow = choosePrimaryPhone(Array.from(phones));
@@ -3645,7 +4208,7 @@ async function scanWebsite(startUrl, options) {
     const shouldTrySocial =
       facebookQueue.length > 0 &&
       Number(options.maxSocialPages || 0) > 0 &&
-      (needsEmailNow || needsPhoneNow || prioritizeEmailGoal);
+      (needsEmailNow || needsPhoneNow || prioritizeEmailGoal || shouldPreferSocialEmail);
 
     if (!shouldTrySocial || !tab || tab.id == null) {
       return {
@@ -3888,8 +4451,9 @@ async function scanWebsite(startUrl, options) {
         await waitForTabComplete(tab.id, options.timeoutMs);
         assertNotStopped();
         await sleep(800);
+        const shouldParseSourceHtml = !socialRootScan && !searchRootScan && !directoryRootScan;
         pageData = await executeExtraction(tab.id, options.timeoutMs, {
-          parseSourceHtml: sourceFallbackEnabled && isLikelyHomepageUrl(nextUrl)
+          parseSourceHtml: shouldParseSourceHtml
         });
       } catch (_sitePageError) {
         assertNotStopped();
@@ -4047,7 +4611,8 @@ async function scanWebsite(startUrl, options) {
       if (shouldTryHomepageSocialFirst) {
         homepageSocialAttempted = true;
         const homepageSocialResult = await scanQueuedSocialCandidates({
-          prioritizeEmailGoal: true
+          prioritizeEmailGoal: true,
+          preferFacebookEmail
         });
         if (homepageSocialResult.goalsMet) {
           break;
@@ -4068,7 +4633,8 @@ async function scanWebsite(startUrl, options) {
     }
 
     await scanQueuedSocialCandidates({
-      prioritizeEmailGoal: false
+      prioritizeEmailGoal: false,
+      preferFacebookEmail
     });
 
   } finally {
@@ -4499,6 +5065,10 @@ function chooseContactEmail(emails, ownerEmail, optionsInput) {
     : [];
   const list = sanitizeEmailList(emails).filter((email) => email !== ownerEmail);
   if (list.length === 0) return "";
+  const facebookPreferredList = sourceMap
+    ? list.filter((email) => normalizeText(sourceMap.get(email)).toLowerCase() === "facebook")
+    : [];
+  const candidatePool = facebookPreferredList.length > 0 ? facebookPreferredList : list;
 
   const priorityPrefixes = [
     "owner",
@@ -4549,17 +5119,17 @@ function chooseContactEmail(emails, ownerEmail, optionsInput) {
   const hasSelectionContext = preferredHosts.length > 0 || sourceMap instanceof Map;
   if (!hasSelectionContext) {
     for (const prefix of priorityPrefixes) {
-      const hit = list.find((email) => hasMailboxPrefix(localPartForEmail(email), prefix));
+      const hit = candidatePool.find((email) => hasMailboxPrefix(localPartForEmail(email), prefix));
       if (hit) return hit;
     }
-    return list[0] || "";
+    return candidatePool[0] || "";
   }
 
   let best = "";
   let bestScore = Number.NEGATIVE_INFINITY;
   let bestPrefixScore = 0;
 
-  for (const email of list) {
+  for (const email of candidatePool) {
     const domain = domainForEmail(email);
     const aligned = isEmailAlignedWithBusiness(email, preferredHosts);
     const freeMailbox = isFreeMailboxDomain(domain);
@@ -4571,8 +5141,8 @@ function chooseContactEmail(emails, ownerEmail, optionsInput) {
     score += hitPrefixScore * 1.5;
     if (aligned) score += 26;
     if (freeMailbox) score += 10;
-    if (source === "website") score += 18;
-    if (source === "facebook") score += 6;
+    if (source === "website") score += 8;
+    if (source === "facebook") score += 26;
 
     if (preferredHosts.length > 0 && source === "website" && !aligned && !freeMailbox) {
       score -= 32;
@@ -4821,8 +5391,8 @@ function estimateEmailConfidence(params) {
   let score = 0.6;
   if (type === "personal") score += 0.26;
   if (type === "company") score += 0.14;
-  if (source === "website") score += 0.06;
-  if (source === "facebook") score -= 0.07;
+  if (source === "website") score += 0.03;
+  if (source === "facebook") score += 0.1;
   if (ownerEmail && ownerEmail === primaryEmail) score += 0.05;
 
   const local = localPartForEmail(primaryEmail);
@@ -5903,6 +6473,28 @@ async function extractPageDataScript(extractionOptionsInput) {
     return selectedDigits;
   };
 
+  const normalizeAddressCandidate = (value) => {
+    let text = normalize(value);
+    if (!text) return "";
+    text = text
+      .replace(/^(?:our\s+)?address\s*[:\-]?\s*/i, "")
+      .replace(/^located\s+at\s+/i, "");
+    if (!text || text.length < 8 || text.length > 180) return "";
+    if (/@|https?:\/\//i.test(text)) return "";
+    return text;
+  };
+
+  const isLikelyAddressCandidate = (value) => {
+    const text = normalizeAddressCandidate(value);
+    if (!text) return false;
+    const lower = text.toLowerCase();
+    const hasStreetNumber = /\b\d{1,6}[a-z]?\b/i.test(text);
+    const hasStreetType = /\b(street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|highway|hwy|way|court|ct|circle|cir|parkway|pkwy|place|pl|suite|ste|unit|floor|fl)\b/i.test(lower);
+    const hasPostalCode = /\b\d{5}(?:-\d{4})?\b/.test(text);
+    const hasComma = text.includes(",");
+    return (hasStreetNumber && hasStreetType) || (hasStreetNumber && hasPostalCode) || (hasStreetNumber && hasComma);
+  };
+
   const decodeHtmlEntities = (value) => {
     const raw = normalize(value);
     if (!raw) return "";
@@ -5918,7 +6510,32 @@ async function extractPageDataScript(extractionOptionsInput) {
       .replace(/\\x40/gi, "@")
       .replace(/\\u0040/gi, "@")
       .replace(/\\x2e/gi, ".")
-      .replace(/\\u002e/gi, ".");
+      .replace(/\\u002e/gi, ".")
+      .replace(/\\x2f/gi, "/")
+      .replace(/\\u002f/gi, "/")
+      .replace(/\\x3a/gi, ":")
+      .replace(/\\u003a/gi, ":")
+      .replace(/\\x3f/gi, "?")
+      .replace(/\\u003f/gi, "?")
+      .replace(/\\x3d/gi, "=")
+      .replace(/\\u003d/gi, "=")
+      .replace(/\\x26/gi, "&")
+      .replace(/\\u0026/gi, "&");
+    return normalize(out);
+  };
+
+  const decodeUrlEncodedContactText = (value) => {
+    let out = normalize(value);
+    if (!out) return "";
+    out = out
+      .replace(/%40/gi, "@")
+      .replace(/%2e/gi, ".")
+      .replace(/%2f/gi, "/")
+      .replace(/%3a/gi, ":")
+      .replace(/%3f/gi, "?")
+      .replace(/%3d/gi, "=")
+      .replace(/%26/gi, "&")
+      .replace(/%23/gi, "#");
     return normalize(out);
   };
 
@@ -6422,14 +7039,26 @@ async function extractPageDataScript(extractionOptionsInput) {
     await prepareFacebookPage();
   }
 
-  const rawBodyText = normalize(document.body ? document.body.innerText || "" : "");
+  const rawBodyMultiline = document.body ? String(document.body.innerText || "") : "";
+  const rawBodyText = normalize(rawBodyMultiline);
+  const rawBodyLines = rawBodyMultiline
+    .split(/\n+/)
+    .map((line) => normalize(line))
+    .filter(Boolean);
   const bodyText = deobfuscateEmailText(rawBodyText);
   const emails = new Set();
   const phones = new Set();
+  const addresses = new Set();
   const ownerCandidates = [];
   const orgNameSet = new Set();
   const platform = detectPlatform();
   const structuredSocialCandidates = new Set();
+
+  const registerAddress = (value) => {
+    const normalizedAddress = normalizeAddressCandidate(value);
+    if (!normalizedAddress || !isLikelyAddressCandidate(normalizedAddress)) return;
+    addresses.add(normalizedAddress);
+  };
 
   const isKnownSocialHost = (hostValue) => {
     const host = normalize(hostValue).toLowerCase();
@@ -6495,6 +7124,33 @@ async function extractPageDataScript(extractionOptionsInput) {
     }
   };
 
+  const collectSourceSignals = (text, emailTarget, socialTarget) => {
+    const sourceText = normalize(text);
+    if (!sourceText) return;
+
+    const candidates = [];
+    const pushCandidate = (value) => {
+      const normalizedValue = normalize(value);
+      if (!normalizedValue) return;
+      if (!candidates.includes(normalizedValue)) {
+        candidates.push(normalizedValue);
+      }
+    };
+
+    pushCandidate(sourceText);
+    pushCandidate(sourceText.replace(/\\\//g, "/").replace(/&quot;/gi, "\"").replace(/&#x2F;/gi, "/"));
+    pushCandidate(decodeEscapedText(decodeHtmlEntities(sourceText)));
+    pushCandidate(decodeUrlEncodedContactText(sourceText));
+    pushCandidate(decodeUrlEncodedContactText(decodeEscapedText(decodeHtmlEntities(sourceText))));
+
+    for (const candidate of candidates) {
+      collectEmailsFromText(candidate, emailTarget);
+      if (socialTarget instanceof Set) {
+        collectSocialUrlsFromText(candidate, socialTarget);
+      }
+    }
+  };
+
   collectEmailsFromText(rawBodyText, emails);
   collectEmailsFromText(bodyText, emails);
 
@@ -6518,6 +7174,9 @@ async function extractPageDataScript(extractionOptionsInput) {
     const phone = normalizePhone(value);
     if (phone) phones.add(phone);
   }
+  for (const line of rawBodyLines.slice(0, 500)) {
+    registerAddress(line);
+  }
 
   const platformNodes = collectPlatformNodes(platform);
   for (const node of platformNodes) {
@@ -6529,6 +7188,7 @@ async function extractPageDataScript(extractionOptionsInput) {
       const phone = normalizePhone(phoneValue);
       if (phone) phones.add(phone);
     }
+    registerAddress(text);
     const ownerHit = parseOwnerCandidate(text);
     if (ownerHit) {
       ownerCandidates.push({
@@ -6561,6 +7221,7 @@ async function extractPageDataScript(extractionOptionsInput) {
       const aria = normalize(node.getAttribute("aria-label") || "");
       if (!aria) continue;
       collectEmailsFromText(aria, emails);
+      registerAddress(aria);
     }
   }
 
@@ -6593,6 +7254,19 @@ async function extractPageDataScript(extractionOptionsInput) {
       if (normalizedSocial) {
         structuredSocialCandidates.add(normalizedSocial);
       }
+    }
+
+    const addressValue = obj.address;
+    if (typeof addressValue === "string") {
+      registerAddress(addressValue);
+    } else if (addressValue && typeof addressValue === "object") {
+      registerAddress([
+        addressValue.streetAddress,
+        addressValue.addressLocality,
+        addressValue.addressRegion,
+        addressValue.postalCode,
+        addressValue.addressCountry
+      ].filter(Boolean).join(", "));
     }
 
     if (nameValue && isLikelyPersonName(nameValue) && /person/.test(typeValue)) {
@@ -6803,9 +7477,12 @@ async function extractPageDataScript(extractionOptionsInput) {
     parseSourceHtmlEnabled &&
     !hasFooterFacebookLink &&
     focusedLinkMap.size === 0;
-  const rawHtmlSource = shouldParseSourceHtmlFallback
-    ? normalize(document.documentElement ? document.documentElement.innerHTML : "")
+  const rawHtmlSource = parseSourceHtmlEnabled && document.documentElement
+    ? normalize(document.documentElement.innerHTML.slice(0, hostname.includes("facebook.com") ? 520000 : 320000))
     : "";
+  if (rawHtmlSource) {
+    collectSourceSignals(rawHtmlSource, emails, socialLinkSet);
+  }
   if (shouldParseSourceHtmlFallback && rawHtmlSource) {
     const htmlSnippet = rawHtmlSource.slice(0, 260000);
     const sourceAnchorPattern = /<a\b[^>]{0,1200}?href\s*=\s*(["'])(.*?)\1[\s\S]{0,280}?<\/a>/gi;
@@ -6901,6 +7578,7 @@ async function extractPageDataScript(extractionOptionsInput) {
   return {
     emails: Array.from(emails).slice(0, 60),
     phones: Array.from(phones).slice(0, 20),
+    addresses: Array.from(addresses).slice(0, 12),
     ownerCandidates,
     relatedLinks: Array.from(relatedLinkSet).slice(0, 50),
     focusedLinks: Array.from(focusedLinkMap.values()).slice(0, 40),

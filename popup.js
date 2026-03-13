@@ -37,6 +37,8 @@
     "email_confidence",
     "email_source_url",
     "no_email_reason",
+    "listing_facebook",
+    "facebook_could_be",
     "website_scan_status",
     "site_pages_visited",
     "site_pages_discovered",
@@ -71,7 +73,7 @@
       id: "crawl",
       title: "Enrichment Crawl Meta",
       description: "Website and social scan diagnostics",
-      columns: ["website_scan_status", "site_pages_visited", "site_pages_discovered", "social_pages_scanned", "social_links"],
+      columns: ["listing_facebook", "facebook_could_be", "website_scan_status", "site_pages_visited", "site_pages_discovered", "social_pages_scanned", "social_links"],
       advanced: true
     },
     {
@@ -97,6 +99,8 @@
     email_confidence: { text: "Meta", tone: "meta" },
     email_source_url: { text: "Meta", tone: "meta" },
     no_email_reason: { text: "Meta", tone: "meta" },
+    listing_facebook: { text: "Social", tone: "raw" },
+    facebook_could_be: { text: "Review", tone: "meta" },
     website_scan_status: { text: "Meta", tone: "meta" },
     site_pages_visited: { text: "Meta", tone: "meta" },
     site_pages_discovered: { text: "Meta", tone: "meta" },
@@ -135,6 +139,7 @@
     toggleAdvancedBtn: document.getElementById("toggleAdvancedBtn"),
     columnsAllBtn: document.getElementById("columnsAllBtn"),
     columnsNoneBtn: document.getElementById("columnsNoneBtn"),
+    openViewerBtn: document.getElementById("openViewerBtn"),
     startBtn: document.getElementById("startBtn"),
     stopBtn: document.getElementById("stopBtn"),
     processed: document.getElementById("processed"),
@@ -209,6 +214,7 @@
   }
 
   function bindEvents() {
+    el.openViewerBtn.addEventListener("click", onOpenViewer);
     el.startBtn.addEventListener("click", onStart);
     el.stopBtn.addEventListener("click", onStop);
     el.infiniteScroll.addEventListener("change", onInfiniteScrollToggle);
@@ -323,6 +329,22 @@
       } else {
         setError(error && error.message ? error.message : "Could not start scrape");
       }
+    }
+  }
+
+  async function onOpenViewer() {
+    clearError();
+
+    try {
+      const response = await sendRuntimeMessage({
+        type: MSG.OPEN_RESULTS_VIEWER,
+        runId: ""
+      });
+      if (!response || response.ok !== true) {
+        throw new Error((response && response.error) || "Could not open results viewer");
+      }
+    } catch (error) {
+      setError(error && error.message ? error.message : "Could not open results viewer");
     }
   }
 
@@ -1950,6 +1972,8 @@
       column === "email_confidence" ||
       column === "email_source_url" ||
       column === "no_email_reason" ||
+      column === "listing_facebook" ||
+      column === "facebook_could_be" ||
       column === "website_phone" ||
       column === "website_phone_source" ||
       column === "website_scan_status" ||

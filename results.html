@@ -15,6 +15,8 @@
           <p id="metaText" class="meta">Waiting for data...</p>
         </div>
         <div class="actions">
+          <input id="importFileInput" type="file" accept=".csv,text/csv" hidden />
+          <button id="importBtn" type="button">Import CSV</button>
           <button id="refreshBtn" type="button">Refresh</button>
           <button id="exportBtn" type="button" class="primary" disabled>Export CSV</button>
         </div>
@@ -32,6 +34,7 @@
 
         <div id="tableWrap" class="table-wrap hidden">
           <table id="resultsTable">
+            <colgroup id="tableCols"></colgroup>
             <thead id="tableHead"></thead>
             <tbody id="tableBody"></tbody>
           </table>
