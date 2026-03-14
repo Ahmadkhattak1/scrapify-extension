@@ -10,7 +10,7 @@
     "48": "assets/brand/icon-48.png",
     "128": "assets/brand/icon-128.png"
   },
-  "permissions": ["activeTab", "tabs", "storage", "downloads", "scripting"],
+  "permissions": ["activeTab", "tabs", "storage", "downloads", "scripting", "unlimitedStorage"],
   "host_permissions": ["https://www.google.com/maps/*", "https://*/*", "http://*/*"],
   "incognito": "split",
   "background": {

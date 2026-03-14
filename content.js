@@ -24,6 +24,7 @@
   const state = {
     isRunning: false,
     stopRequested: false,
+    inlineEnrichmentActive: false,
     runId: "",
     runTabId: null,
     runStartedAtIso: "",
@@ -48,7 +49,8 @@
     matched: 0,
     duplicates: 0,
     fastSkipped: 0,
-    errors: 0
+    errors: 0,
+    enrichmentStats: createEmptyEnrichmentStats()
   };
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -81,6 +83,7 @@
 
     if (message.type === MSG.STOP_SCRAPE) {
       state.stopRequested = true;
+      requestInlineEnrichmentStopBestEffort();
       persistScrapeSession({ status: "stopping", force: true });
       sendResponse({ ok: true });
       return false;
@@ -110,6 +113,7 @@
     state.runInfiniteScroll = infiniteScroll;
     const filters = normalizeRuntimeFilters(config.filters || {});
     const scrapeStageFilters = toScrapeStageFilters(filters);
+    const enrichmentConfig = normalizeRuntimeEnrichment(config.enrichment || {});
     state.activeFilters = { ...filters };
     const sourceQuery = getCurrentQuery();
     const sourceUrl = window.location.href;
@@ -215,13 +219,25 @@
               if (key) {
                 if (state.seenKeys.has(key)) {
                   state.duplicates += 1;
+                  sendProgress();
+                  continue;
                 } else {
                   state.seenKeys.add(key);
-                  state.rows.push(guardedRow);
-                  state.matched += 1;
                 }
-              } else {
-                state.rows.push(guardedRow);
+              }
+
+              let outputRow = guardedRow;
+              if (enrichmentConfig.enabled) {
+                const enrichmentResult = await enrichRowInline(guardedRow, enrichmentConfig);
+                if (enrichmentResult && enrichmentResult.stopped === true) {
+                  sendProgress({ force: true });
+                  break;
+                }
+                outputRow = enrichmentResult ? enrichmentResult.row : null;
+              }
+
+              if (outputRow) {
+                state.rows.push(outputRow);
                 state.matched += 1;
               }
             }
@@ -263,7 +279,10 @@
         fast_skipped: state.fastSkipped,
         ...getPerformanceStats(),
         errors: state.errors,
-        stopped: state.stopRequested
+        stopped: state.stopRequested,
+        inline_enrichment_completed: enrichmentConfig.enabled === true,
+        output_filters_applied: enrichmentConfig.enabled === true,
+        ...state.enrichmentStats
       };
 
       persistScrapeSession({
@@ -2083,7 +2102,11 @@
       state.persistedRowsCount = rows.length;
     }
 
-    chrome.storage.local.set(payload, () => {});
+    chrome.storage.local.set(payload, () => {
+      if (chrome.runtime.lastError) {
+        console.warn("[scrape:session] storage write failed", chrome.runtime.lastError.message || chrome.runtime.lastError);
+      }
+    });
   }
 
   function getScrapeRuntimeState() {
@@ -2104,12 +2127,15 @@
       source_url: state.sourceUrl,
       filters: state.activeFilters,
       infinite_scroll: state.runInfiniteScroll,
+      inline_enrichment_active: state.inlineEnrichmentActive === true,
+      ...state.enrichmentStats,
       ...perf
     };
   }
 
   function resetState() {
     state.stopRequested = false;
+    state.inlineEnrichmentActive = false;
     state.runId = "";
     state.runTabId = null;
     state.runStartedAtIso = "";
@@ -2135,6 +2161,7 @@
     state.duplicates = 0;
     state.fastSkipped = 0;
     state.errors = 0;
+    state.enrichmentStats = createEmptyEnrichmentStats();
   }
 
   function sendProgress(options) {
@@ -2156,6 +2183,8 @@
       duplicates: state.duplicates,
       fast_skipped: state.fastSkipped,
       filters: state.activeFilters,
+      inline_enrichment_active: state.inlineEnrichmentActive === true,
+      ...state.enrichmentStats,
       ...perf,
       errors: state.errors
     };
@@ -2234,6 +2263,150 @@
       avg_rating_seen: state.seenRatingCount > 0 ? Number((state.seenRatingSum / state.seenRatingCount).toFixed(3)) : "",
       avg_reviews_seen: state.seenReviewsCount > 0 ? Number((state.seenReviewsSum / state.seenReviewsCount).toFixed(3)) : ""
     };
+  }
+
+  function createEmptyEnrichmentStats() {
+    return {
+      enriched: 0,
+      skipped: 0,
+      blocked: 0,
+      pages_visited: 0,
+      pages_discovered: 0,
+      social_scanned: 0,
+      personal_email_found: 0,
+      company_email_found: 0,
+      discovery_attempted: 0,
+      discovery_website_recovered: 0,
+      discovery_email_recovered: 0
+    };
+  }
+
+  function mergeEnrichmentStats(summaryInput) {
+    const summary = summaryInput && typeof summaryInput === "object" ? summaryInput : {};
+    state.enrichmentStats.enriched += Number(summary.enriched || 0);
+    state.enrichmentStats.skipped += Number(summary.skipped || 0);
+    state.enrichmentStats.blocked += Number(summary.blocked || 0);
+    state.enrichmentStats.pages_visited += Number(summary.pages_visited || summary.site_pages_visited || 0);
+    state.enrichmentStats.pages_discovered += Number(summary.pages_discovered || summary.site_pages_discovered || 0);
+    state.enrichmentStats.social_scanned += Number(summary.social_scanned || 0);
+    state.enrichmentStats.personal_email_found += Number(summary.personal_email_found || 0);
+    state.enrichmentStats.company_email_found += Number(summary.company_email_found || 0);
+    state.enrichmentStats.discovery_attempted += Number(summary.discovery_attempted || 0);
+    state.enrichmentStats.discovery_website_recovered += Number(summary.discovery_website_recovered || 0);
+    state.enrichmentStats.discovery_email_recovered += Number(summary.discovery_email_recovered || 0);
+  }
+
+  function normalizeRuntimeEnrichment(input) {
+    const source = input && typeof input === "object" ? input : {};
+    return {
+      enabled: source.enabled === true,
+      visibleTabs: source.visibleTabs === true,
+      leadDiscoveryEnabled: source.leadDiscoveryEnabled === true,
+      contactGoals: {
+        email: !(source.contactGoals && source.contactGoals.email === false),
+        phone: !(source.contactGoals && source.contactGoals.phone === false)
+      }
+    };
+  }
+
+  async function enrichRowInline(row, enrichmentConfig) {
+    if (!row || typeof row !== "object") {
+      return { row: null, stopped: false };
+    }
+    if (!enrichmentConfig || enrichmentConfig.enabled !== true) {
+      return { row, stopped: false };
+    }
+    if (state.stopRequested) {
+      return { row: null, stopped: true };
+    }
+
+    state.inlineEnrichmentActive = true;
+    sendProgress({ force: true });
+
+    try {
+      const response = await sendRuntimeMessage({
+        type: MSG.ENRICH_ROWS,
+        rows: [row],
+        source_run_id: state.runId,
+        options: {
+          timeoutMs: 10000,
+          visibleTabs: enrichmentConfig.visibleTabs === true,
+          filters: state.activeFilters,
+          requireEmail: state.activeFilters.hasEmail === true,
+          contactGoals: enrichmentConfig.contactGoals,
+          maxSocialPages: 4,
+          leadDiscoveryEnabled: enrichmentConfig.leadDiscoveryEnabled === true,
+          discoverySources: {
+            google: enrichmentConfig.leadDiscoveryEnabled === true,
+            linkedin: false,
+            yelp: false
+          },
+          discoveryTrigger: "missing_website_or_missing_email",
+          discoveryBudget: {
+            googleQueries: 2,
+            googlePages: 3,
+            linkedinPages: 0,
+            yelpPages: 0
+          }
+        },
+        meta: {
+          reason: "inline_during_scrape",
+          persistSession: false,
+          sharedRegistryKey: state.runId
+        }
+      });
+
+      if (!response || response.type !== MSG.ENRICH_DONE) {
+        throw new Error((response && response.error) || "Website enrichment failed");
+      }
+
+      const enrichSummary = response.summary || {};
+      mergeEnrichmentStats(enrichSummary);
+
+      if (enrichSummary.stopped === true || state.stopRequested) {
+        return { row: null, stopped: true };
+      }
+
+      const outputRows = Array.isArray(response.rows) ? response.rows : [];
+      return {
+        row: outputRows.length > 0 ? outputRows[0] : null,
+        stopped: false
+      };
+    } catch (error) {
+      if (isInlineEnrichStopError(error) || state.stopRequested) {
+        return { row: null, stopped: true };
+      }
+      throw error;
+    } finally {
+      state.inlineEnrichmentActive = false;
+      sendProgress({ force: true });
+    }
+  }
+
+  function requestInlineEnrichmentStopBestEffort() {
+    if (state.inlineEnrichmentActive !== true) {
+      return;
+    }
+    chrome.runtime.sendMessage({ type: MSG.STOP_ENRICH }, () => {
+      void chrome.runtime.lastError;
+    });
+  }
+
+  function isInlineEnrichStopError(error) {
+    const message = normalizeText(error && error.message).toLowerCase();
+    return message.includes("stopped by user") || message.includes("no enrichment run is active");
+  }
+
+  function sendRuntimeMessage(message) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "Runtime message failed"));
+          return;
+        }
+        resolve(response);
+      });
+    });
   }
 
   function normalizeRuntimeFilters(input) {

@@ -33,6 +33,7 @@ let lastEnrichPersistAtMs = 0;
 let activeEnrichRun = null;
 const autoOpenedResultsRunIds = new Set();
 let lastAutoEnrichSourceRunId = "";
+const sharedInlineWebsiteOwnerRegistries = new Map();
 const ACTION_DEFAULT_TITLE = "Scrapify";
 const ACTION_RUNNING_COLOR = "#127a3e";
 const ACTION_STOPPING_COLOR = "#b54708";
@@ -534,6 +535,7 @@ function handleExportCsv(message, sendResponse) {
 
 async function handleEnrichRows(message, sendResponse) {
   const rows = Array.isArray(message.rows) ? message.rows : [];
+  const meta = message && typeof message.meta === "object" ? message.meta : {};
   if (activeEnrichRun) {
     safeSendResponse(sendResponse, {
       type: MSG.ENRICH_ERROR,
@@ -545,7 +547,9 @@ async function handleEnrichRows(message, sendResponse) {
   try {
     const result = await startEnrichRun(rows, message.options || {}, {
       sourceRunId: normalizeText(message.source_run_id),
-      reason: "manual"
+      reason: normalizeText(meta.reason) || "manual",
+      persistSession: meta.persistSession !== false,
+      sharedRegistryKey: normalizeText(meta.sharedRegistryKey)
     });
     safeSendResponse(sendResponse, {
       type: MSG.ENRICH_DONE,
@@ -596,6 +600,8 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
   const startedAt = new Date().toISOString();
   const sourceRunId = normalizeText(meta.sourceRunId);
   const reason = normalizeText(meta.reason).toLowerCase();
+  const persistSession = meta.persistSession !== false;
+  const sharedRegistryKey = normalizeText(meta.sharedRegistryKey);
   const shouldAutoOpenOnTerminal = reason === "auto_after_scrape";
   const runControl = {
     runId,
@@ -603,7 +609,8 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
     reason: normalizeText(meta.reason),
     startedAt,
     stopRequested: false,
-    scanTabId: null
+    scanTabId: null,
+    persistSession
   };
 
   activeEnrichRun = runControl;
@@ -614,36 +621,38 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
     title: `${ACTION_DEFAULT_TITLE} (enrichment running)`
   });
 
-  await saveEnrichSession(
-    {
-      run_id: runId,
-      source_run_id: sourceRunId,
-      reason: normalizeText(meta.reason),
-      status: "running",
-      started_at: startedAt,
-      total: rows.length,
-      processed: 0,
-      enriched: 0,
-      skipped: 0,
-      blocked: 0,
-      errors: 0,
-      social_scanned: 0,
-      pages_visited: 0,
-      pages_discovered: 0,
-      personal_email_found: 0,
-      company_email_found: 0,
-      discovery_attempted: 0,
-      discovery_website_recovered: 0,
-      discovery_email_recovered: 0,
-      current: "",
-      current_url: "",
-      phase: "init",
-      lead_signal_text: "Website enrichment started",
-      lead_signal_tone: "info"
-    },
-    true,
-    rows
-  );
+  if (persistSession) {
+    await saveEnrichSession(
+      {
+        run_id: runId,
+        source_run_id: sourceRunId,
+        reason: normalizeText(meta.reason),
+        status: "running",
+        started_at: startedAt,
+        total: rows.length,
+        processed: 0,
+        enriched: 0,
+        skipped: 0,
+        blocked: 0,
+        errors: 0,
+        social_scanned: 0,
+        pages_visited: 0,
+        pages_discovered: 0,
+        personal_email_found: 0,
+        company_email_found: 0,
+        discovery_attempted: 0,
+        discovery_website_recovered: 0,
+        discovery_email_recovered: 0,
+        current: "",
+        current_url: "",
+        phase: "init",
+        lead_signal_text: "Website enrichment started",
+        lead_signal_tone: "info"
+      },
+      true,
+      rows
+    );
+  }
 
   try {
     const contactGoals = normalizeContactGoals(options.contactGoals);
@@ -660,6 +669,7 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
       contactGoals,
       leadDiscoveryEnabled,
       discoverySources,
+      websiteHostOwners: sharedRegistryKey ? getSharedInlineWebsiteOwnerRegistry(sharedRegistryKey) : null,
       shouldStop: () => runControl.stopRequested === true,
       onScanTabChange: (tabId) => {
         runControl.scanTabId = Number.isFinite(Number(tabId)) ? Number(tabId) : null;
@@ -682,22 +692,24 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
     }
     const stopped = result && result.summary && result.summary.stopped === true;
 
-    await saveEnrichSession(
-      {
-        run_id: runId,
-        source_run_id: sourceRunId,
-        reason: normalizeText(meta.reason),
-        status: stopped ? "stopped" : "done",
-        started_at: startedAt,
-        completed_at: new Date().toISOString(),
-        ...result.summary,
-        phase: stopped ? "stopped" : "done",
-        lead_signal_text: stopped ? "Enrichment stopped by user" : "Website enrichment completed",
-        lead_signal_tone: stopped ? "warn" : "success"
-      },
-      true,
-      result.rows
-    );
+    if (persistSession) {
+      await saveEnrichSession(
+        {
+          run_id: runId,
+          source_run_id: sourceRunId,
+          reason: normalizeText(meta.reason),
+          status: stopped ? "stopped" : "done",
+          started_at: startedAt,
+          completed_at: new Date().toISOString(),
+          ...result.summary,
+          phase: stopped ? "stopped" : "done",
+          lead_signal_text: stopped ? "Enrichment stopped by user" : "Website enrichment completed",
+          lead_signal_tone: stopped ? "warn" : "success"
+        },
+        true,
+        result.rows
+      );
+    }
 
     if (shouldAutoOpenOnTerminal) {
       maybeAutoOpenResultsForRun(sourceRunId || runId);
@@ -705,19 +717,21 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
 
     return result;
   } catch (error) {
-    await saveEnrichSession(
-      {
-        run_id: runId,
-        source_run_id: sourceRunId,
-        reason: normalizeText(meta.reason),
-        status: "error",
-        started_at: startedAt,
-        completed_at: new Date().toISOString(),
-        error: error && error.message ? error.message : "Website enrichment failed",
-        phase: "error"
-      },
-      false
-    );
+    if (persistSession) {
+      await saveEnrichSession(
+        {
+          run_id: runId,
+          source_run_id: sourceRunId,
+          reason: normalizeText(meta.reason),
+          status: "error",
+          started_at: startedAt,
+          completed_at: new Date().toISOString(),
+          error: error && error.message ? error.message : "Website enrichment failed",
+          phase: "error"
+        },
+        false
+      );
+    }
 
     if (shouldAutoOpenOnTerminal) {
       maybeAutoOpenResultsForRun(sourceRunId || runId);
@@ -752,19 +766,21 @@ function handleStopEnrich(sendResponse) {
     closeTab(runningTabId).catch(() => {});
   }
 
-  saveEnrichSession(
-    {
-      run_id: run.runId,
-      status: "stopping",
-      phase: "stopping",
-      lead_signal_text: "Stop requested",
-      lead_signal_tone: "warn"
-    },
-    false
-  ).catch(() => {});
+  if (run.persistSession !== false) {
+    saveEnrichSession(
+      {
+        run_id: run.runId,
+        status: "stopping",
+        phase: "stopping",
+        lead_signal_text: "Stop requested",
+        lead_signal_tone: "warn"
+      },
+      false
+    ).catch(() => {});
 
-  // User stop should surface partial results immediately.
-  maybeAutoOpenResultsForRun(normalizeText(run.sourceRunId) || normalizeText(run.runId), { force: true });
+    // User stop should surface partial results immediately.
+    maybeAutoOpenResultsForRun(normalizeText(run.sourceRunId) || normalizeText(run.runId), { force: true });
+  }
 
   safeSendResponse(sendResponse, {
     ok: true
@@ -777,13 +793,15 @@ async function handleScrapeDone(message) {
   const summary = message && typeof message.summary === "object" ? message.summary : {};
   const filters = message && typeof message.filters === "object" ? message.filters : {};
   const scrapeStopped = summary.stopped === true;
+  const inlineEnrichmentCompleted = summary.inline_enrichment_completed === true || summary.output_filters_applied === true;
 
-  await handlePostScrape(runId, rows, { scrapeStopped, filters });
+  await handlePostScrape(runId, rows, { scrapeStopped, filters, inlineEnrichmentCompleted });
 }
 
 async function handlePostScrape(runId, rowsInput, metaInput) {
   const meta = metaInput && typeof metaInput === "object" ? metaInput : {};
   const scrapeStopped = meta.scrapeStopped === true;
+  const inlineEnrichmentCompleted = meta.inlineEnrichmentCompleted === true;
   const rawRows = prepareRowsForEnrichment(rowsInput, "not_requested");
   const filters = await resolveScrapeFilters(runId, meta.filters);
   const rows = applyScrapeFilters(rawRows, filters);
@@ -799,13 +817,14 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
     }
   }));
 
-  if (!settings.enrichmentEnabled || scrapeStopped) {
+  if (!settings.enrichmentEnabled || scrapeStopped || inlineEnrichmentCompleted) {
     const outputRows = applyOutputFilters(rows, filters);
     if (outputRows.length !== rows.length) {
       await syncScrapeSessionFiltersAndCounts(runId, filters, outputRows.length).catch(() => {});
     }
     await storageSet({ lastRows: outputRows }).catch(() => {});
     maybeAutoOpenResultsForRun(runId, scrapeStopped ? { force: true } : {});
+    clearSharedInlineWebsiteOwnerRegistry(runId);
     return;
   }
 
@@ -844,6 +863,7 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
       queuedRows
     );
     maybeAutoOpenResultsForRun(runId);
+    clearSharedInlineWebsiteOwnerRegistry(runId);
     return;
   }
 
@@ -913,6 +933,7 @@ async function handlePostScrape(runId, rowsInput, metaInput) {
   ).catch((error) => {
     console.warn("[enrich:auto] failed", error && error.message ? error.message : error);
   });
+  clearSharedInlineWebsiteOwnerRegistry(runId);
 }
 
 async function readEnrichmentSettings() {
@@ -1093,6 +1114,25 @@ function prepareRowsForEnrichment(rows, statusForWebsite) {
       discovered_website: discoveredWebsite
     };
   });
+}
+
+function getSharedInlineWebsiteOwnerRegistry(runId) {
+  const key = normalizeText(runId);
+  if (!key) {
+    return new Map();
+  }
+  let existing = sharedInlineWebsiteOwnerRegistries.get(key);
+  if (!existing) {
+    existing = new Map();
+    sharedInlineWebsiteOwnerRegistries.set(key, existing);
+  }
+  return existing;
+}
+
+function clearSharedInlineWebsiteOwnerRegistry(runId) {
+  const key = normalizeText(runId);
+  if (!key) return;
+  sharedInlineWebsiteOwnerRegistries.delete(key);
 }
 
 function createEnrichedRowFromSource(sourceRow) {
@@ -1289,6 +1329,13 @@ function sameWebsiteHost(urlA, urlB) {
   const hostB = normalizeWebsiteHostKey(urlB);
   if (!hostA || !hostB) return false;
   return hostA === hostB;
+}
+
+function sameBusinessWebsiteDomain(urlA, urlB) {
+  const hostA = normalizeHostForMatch(hostnameForUrl(normalizeBusinessWebsiteUrl(urlA) || normalizeWebsiteUrl(urlA)));
+  const hostB = normalizeHostForMatch(hostnameForUrl(normalizeBusinessWebsiteUrl(urlB) || normalizeWebsiteUrl(urlB)));
+  if (!hostA || !hostB) return false;
+  return hostA === hostB || hostA.endsWith(`.${hostB}`) || hostB.endsWith(`.${hostA}`);
 }
 
 function extractSocialProfileKeyFromUrl(url, hostInput) {
@@ -1546,7 +1593,7 @@ async function enrichRows(rows, options) {
     discovery_email_recovered: 0,
     stopped: false
   };
-  const websiteHostOwners = new Map();
+  const websiteHostOwners = config.websiteHostOwners instanceof Map ? config.websiteHostOwners : new Map();
 
   const outputRows = [];
   let resumeIndex = rows.length;
@@ -1611,7 +1658,8 @@ async function enrichRows(rows, options) {
       continue;
     }
 
-    const runSiteScan = async (targetUrl, phasePrefix) => {
+    const runSiteScan = async (targetUrl, phasePrefix, overridesInput) => {
+      const overrides = overridesInput && typeof overridesInput === "object" ? overridesInput : {};
       const rowIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
       const phaseInit = phasePrefix === "discovery" ? "discovery_site_init" : "site_init";
       emitEnrichProgress(summary, {
@@ -1629,8 +1677,8 @@ async function enrichRows(rows, options) {
         timeoutMs,
         visibleTabs,
         scanSocialLinks: true,
-        maxSocialPages,
-        skipSitemapLookup: phasePrefix === "discovery",
+        maxSocialPages: overrides.maxSocialPages != null ? overrides.maxSocialPages : maxSocialPages,
+        skipSitemapLookup: overrides.skipSitemapLookup === true || phasePrefix === "discovery",
         intent: rowIntent,
         businessName: sourceRow.name,
         businessCategory: sourceRow.category,
@@ -1639,7 +1687,7 @@ async function enrichRows(rows, options) {
         businessWebsite: targetUrl,
         discoveredWebsite: enrichedRow.discovered_website,
         preferFacebookEmail: contactGoals.email === true,
-        seedSocialLinks: sourceSocialLinks,
+        seedSocialLinks: Array.isArray(overrides.seedSocialLinks) ? overrides.seedSocialLinks : sourceSocialLinks,
         shouldStop: config.shouldStop,
         onTabChange: config.onScanTabChange,
         onProgress: (scanProgress) => {
@@ -1663,6 +1711,27 @@ async function enrichRows(rows, options) {
       rowSocialScanned += Number(scan.socialScanned || 0);
       rowCurrentUrl = targetUrl;
       return scan;
+    };
+
+    let websiteSourceRetryRan = false;
+    const runWebsiteSourceRetryIfNeeded = async () => {
+      if (websiteSourceRetryRan) return null;
+      if (!website) return null;
+      if (contactGoals.email !== true) return null;
+      if (rowHasAnyEmail(enrichedRow)) return null;
+      websiteSourceRetryRan = true;
+
+      const retryScan = await runSiteScan(website, "site_retry", {
+        maxSocialPages: 0,
+        skipSitemapLookup: true,
+        seedSocialLinks: []
+      });
+      const retryHasEmail = scanHasAnyEmail(retryScan);
+      applyScanResultToRow(enrichedRow, retryScan, {
+        overwrite: retryHasEmail,
+        overwriteWithoutEmail: retryHasEmail
+      });
+      return retryScan;
     };
 
     try {
@@ -1764,6 +1833,14 @@ async function enrichRows(rows, options) {
       }
 
       if (
+        contactGoals.email === true &&
+        !rowHasAnyEmail(enrichedRow) &&
+        Number(firstScan.socialScanned || 0) > 0
+      ) {
+        await runWebsiteSourceRetryIfNeeded();
+      }
+
+      if (
         website &&
         listingFacebook &&
         !sameWebsiteHost(listingFacebook, website)
@@ -1781,6 +1858,9 @@ async function enrichRows(rows, options) {
             overwrite: hasEmailFromFallback || hasPhoneFromFallback,
             overwriteWithoutEmail: hasEmailFromFallback || hasPhoneFromFallback
           });
+          if (!hasEmailFromFallback && contactGoals.email === true) {
+            await runWebsiteSourceRetryIfNeeded();
+          }
         }
       }
 
@@ -1837,6 +1917,9 @@ async function enrichRows(rows, options) {
               enrichedRow.discovery_source = "google_facebook";
               enrichedRow.discovery_query = normalizeText(facebookLookup.query);
             }
+            if (!facebookScanHasEmail && contactGoals.email === true) {
+              await runWebsiteSourceRetryIfNeeded();
+            }
           }
         } else if (possibleFacebook && !normalizeFacebookProfileUrl(enrichedRow.facebook_could_be)) {
           enrichedRow.facebook_could_be = possibleFacebook;
@@ -1845,7 +1928,7 @@ async function enrichRows(rows, options) {
 
       const postSiteIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
       const stillMissingAnyGoal = postSiteIntent.needsEmail || postSiteIntent.needsPhone;
-      if (discovery.enabled && stillMissingAnyGoal && !preDiscoveryRan) {
+      if (discovery.enabled && stillMissingAnyGoal && !preDiscoveryRan && !website) {
         const discoveryResult = await runLeadDiscovery(enrichedRow, {
           ...discovery,
           timeoutMs,
@@ -1869,7 +1952,7 @@ async function enrichRows(rows, options) {
             enrichedRow.discovery_status = "no_match";
           }
         }
-        if (discoveredCandidate && !sameWebsiteHost(discoveredCandidate, website)) {
+        if (discoveredCandidate && !website && !sameWebsiteHost(discoveredCandidate, website)) {
           const hadEmailBeforeDiscoveryScan = rowHasAnyEmail(enrichedRow);
           const discoveryScan = await runSiteScan(discoveredCandidate, "discovery");
           const discoveryScanHasEmail = scanHasAnyEmail(discoveryScan);
@@ -2032,6 +2115,9 @@ function isEnrichStopError(error) {
 function emitEnrichProgress(summary, context) {
   const ctx = context || {};
   const activeRun = activeEnrichRun;
+  if (!activeRun || activeRun.persistSession === false) {
+    return;
+  }
   const payload = {
     type: MSG.ENRICH_PROGRESS,
     run_id: normalizeText(activeRun && activeRun.runId),
@@ -2940,6 +3026,39 @@ function evaluateFacebookSearchCandidate(candidateInput, row, semanticContextInp
     return { status: "reject", url: "", score: 0, matchedOn: "" };
   }
 
+  const canonicalWebsiteCandidates = Array.from(new Set([
+    normalizeBusinessWebsiteUrl(rowData.website),
+    normalizeBusinessWebsiteUrl(rowData.discovered_website)
+  ].filter(Boolean)));
+  const pageWebsiteLinks = Array.from(new Set(
+    (Array.isArray(pageData.websiteLinks) ? pageData.websiteLinks : [])
+      .map((value) => normalizeBusinessWebsiteUrl(value) || normalizeWebsiteUrl(value))
+      .filter(Boolean)
+  ));
+  const matchedWebsiteLink = pageWebsiteLinks.find((link) =>
+    canonicalWebsiteCandidates.some((expected) => sameBusinessWebsiteDomain(link, expected))
+  ) || "";
+  const hasCanonicalWebsite = canonicalWebsiteCandidates.length > 0;
+  const hasPageWebsite = pageWebsiteLinks.length > 0;
+
+  if (matchedWebsiteLink) {
+    return {
+      status: "confirmed",
+      url: normalizedUrl,
+      score: 0.98,
+      matchedOn: "website"
+    };
+  }
+
+  if (hasCanonicalWebsite && hasPageWebsite) {
+    return {
+      status: "reject",
+      url: normalizedUrl,
+      score: 0,
+      matchedOn: ""
+    };
+  }
+
   const semanticEvidence = scoreBusinessSemanticEvidence({
     url: normalizedUrl,
     title: normalizeText(candidate.title),
@@ -2971,7 +3090,15 @@ function evaluateFacebookSearchCandidate(candidateInput, row, semanticContextInp
   score += Math.min(0.08, titleSimilarity * 0.08);
   const boundedScore = Math.min(0.99, Math.max(0, score));
 
-  if ((phoneMatched && (semanticEvidence.score >= 0.28 || titleSimilarity >= 0.45)) || addressMatch.matched) {
+  const strongNameMatch =
+    titleSimilarity >= 0.72 ||
+    semanticEvidence.signals.organizationSimilarity >= 0.72 ||
+    semanticEvidence.signals.nameOverlap >= 0.66 ||
+    semanticEvidence.signals.hostNameOverlap >= 0.66;
+  const hardIdentityMatch = phoneMatched || addressMatch.matched;
+  const hardMatchThreshold = addressMatch.matched ? 0.64 : 0.58;
+
+  if (hardIdentityMatch && strongNameMatch && semanticEvidence.score >= hardMatchThreshold) {
     return {
       status: "confirmed",
       url: normalizedUrl,
@@ -2980,7 +3107,7 @@ function evaluateFacebookSearchCandidate(candidateInput, row, semanticContextInp
     };
   }
 
-  if (semanticEvidence.score >= 0.78 && titleSimilarity >= 0.56) {
+  if (!hasCanonicalWebsite && semanticEvidence.score >= 0.82 && titleSimilarity >= 0.7) {
     return {
       status: "probable",
       url: normalizedUrl,
@@ -4244,7 +4371,7 @@ async function scanWebsite(startUrl, options) {
           await updateTabUrl(tab.id, normalizedTarget);
           await waitForTabComplete(tab.id, options.timeoutMs);
           assertNotStopped();
-          await sleep(isFacebookTarget ? 1100 : 700);
+          await sleep(isFacebookTarget ? 1400 : 700);
 
           const aggregateEmails = new Set();
           const aggregatePhones = new Set();
@@ -4253,15 +4380,19 @@ async function scanWebsite(startUrl, options) {
           let hasExtractionPayload = false;
           let lastExtractionError = null;
           const maxExtractAttempts = isFacebookTarget
-            ? options.visibleTabs === true ? 1 : 2
+            ? options.visibleTabs === true ? 2 : 3
             : 1;
 
           for (let attempt = 0; attempt < maxExtractAttempts; attempt += 1) {
             assertNotStopped();
             let extracted = null;
             try {
+              const shouldParseSourceHtml =
+                isFacebookTarget &&
+                needsEmailNow &&
+                attempt === maxExtractAttempts - 1;
               extracted = await executeExtraction(tab.id, options.timeoutMs, {
-                parseSourceHtml: false
+                parseSourceHtml: shouldParseSourceHtml
               });
               lastExtractionError = null;
             } catch (extractionError) {
@@ -4293,7 +4424,9 @@ async function scanWebsite(startUrl, options) {
                 aggregateOwnerCandidates.push(candidate);
               }
 
-              if (aggregateEmails.size > 0 || aggregatePhones.size > 0) {
+              const hasEmailSignal = aggregateEmails.size > 0;
+              const hasPhoneSignal = aggregatePhones.size > 0;
+              if (hasEmailSignal || (hasPhoneSignal && !needsEmailNow)) {
                 break;
               }
             }
@@ -5673,25 +5806,89 @@ function isPlaceholderEmailParts(localPart, domainPart) {
 function normalizeEmail(email) {
   const value = normalizeText(email).toLowerCase();
   if (!value.includes("@")) return "";
-  if (value.length < 6 || value.length > 120) return "";
-  if (/\.(png|jpg|jpeg|svg|gif|webp|js|css)$/i.test(value)) return "";
-  if (/\s/.test(value)) return "";
-  const parts = value.split("@");
-  if (parts.length !== 2) return "";
-  const localPart = parts[0];
-  const domainPart = parts[1];
-  if (!localPart || !domainPart) return "";
-  if (!/^[a-z0-9._%+-]+$/.test(localPart)) return "";
-  if (!/^[a-z0-9.-]+$/.test(domainPart)) return "";
-  if (!domainPart.includes(".") || domainPart.startsWith(".") || domainPart.endsWith(".") || domainPart.includes("..")) return "";
-  const labels = domainPart.split(".");
-  if (labels.some((label) => !label || label.startsWith("-") || label.endsWith("-") || !/^[a-z0-9-]+$/.test(label))) return "";
-  const topLevel = labels[labels.length - 1] || "";
-  if (!/^(?:[a-z]{2,24}|xn--[a-z0-9-]{2,59})$/.test(topLevel)) return "";
-  if (isPlaceholderEmailParts(localPart, domainPart)) return "";
-  if (/^(example|test)@/i.test(value)) return "";
-  if (/(noreply|do-not-reply|donotreply)/i.test(value)) return "";
-  return value;
+
+  const isPhoneContaminatedLocalPart = (localPart) => {
+    const local = normalizeText(localPart).toLowerCase();
+    if (!local) return true;
+    if (!/[a-z]/.test(local)) return true;
+    return /^\+?\d[\d().-]{5,}[a-z]/i.test(local);
+  };
+
+  const isContaminatedDomainPart = (domainPart) => {
+    const domain = normalizeText(domainPart).toLowerCase();
+    if (!domain) return true;
+    if (
+      /\.(?:com|net|org|io|co|us|ca|uk|biz|info|edu|gov|mil|ai|me)[a-z0-9-]{2,}\.(?:com|net|org|io|co|us|ca|uk|biz|info|edu|gov|mil|ai|me)/i.test(domain)
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  const isExactNormalizedEmailCandidate = (candidateInput) => {
+    const candidate = normalizeText(candidateInput).toLowerCase();
+    if (!candidate.includes("@")) return "";
+    if (candidate.length < 6 || candidate.length > 120) return "";
+    if (/\.(png|jpg|jpeg|svg|gif|webp|js|css)$/i.test(candidate)) return "";
+    if (/\s/.test(candidate)) return "";
+    const parts = candidate.split("@");
+    if (parts.length !== 2) return "";
+    const localPart = parts[0];
+    const domainPart = parts[1];
+    if (!localPart || !domainPart) return "";
+    if (!/^[a-z0-9._%+-]+$/.test(localPart)) return "";
+    if (!/^[a-z0-9.-]+$/.test(domainPart)) return "";
+    if (!domainPart.includes(".") || domainPart.startsWith(".") || domainPart.endsWith(".") || domainPart.includes("..")) return "";
+    const labels = domainPart.split(".");
+    if (labels.some((label) => !label || label.startsWith("-") || label.endsWith("-") || !/^[a-z0-9-]+$/.test(label))) return "";
+    const topLevel = labels[labels.length - 1] || "";
+    if (!/^(?:[a-z]{2,24}|xn--[a-z0-9-]{2,59})$/.test(topLevel)) return "";
+    if (isPlaceholderEmailParts(localPart, domainPart)) return "";
+    if (/^(example|test)@/i.test(candidate)) return "";
+    if (/(noreply|do-not-reply|donotreply)/i.test(candidate)) return "";
+    if (isPhoneContaminatedLocalPart(localPart)) return "";
+    if (isContaminatedDomainPart(domainPart)) return "";
+    return candidate;
+  };
+
+  const embeddedCandidates = [];
+  const pushEmbedded = (candidateInput) => {
+    const candidate = normalizeText(candidateInput).toLowerCase();
+    if (!candidate || embeddedCandidates.includes(candidate)) return;
+    embeddedCandidates.push(candidate);
+  };
+
+  const preferredPatterns = [
+    /[a-z][a-z0-9._%+-]{0,63}@[a-z0-9-]{1,63}\.(?:com|net|org|io|co|us|ca|uk|biz|info|edu|gov|mil|ai|me|app|dev|pro|services?|plumbing|construction|contractors?|company|clinic|dental|law|legal|finance|financial|realty|realtor|homes?)/gi,
+    /[a-z][a-z0-9._%+-]{0,63}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,2}?\.(?:com|net|org|io|co|us|ca|uk|biz|info|edu|gov|mil|ai|me|app|dev|pro|co\.uk|services?|plumbing|construction|contractors?|company|clinic|dental|law|legal|finance|financial|realty|realtor|homes?)/gi,
+    /[a-z][a-z0-9._%+-]{0,63}@(gmail|outlook|hotmail|live|yahoo|ymail|icloud|me|aol|proton(?:mail)?)\.(com|me)/gi
+  ];
+  for (const pattern of preferredPatterns) {
+    pattern.lastIndex = 0;
+    let match = pattern.exec(value);
+    while (match) {
+      pushEmbedded(match[0]);
+      match = pattern.exec(value);
+    }
+  }
+
+  const genericPattern = /[a-z][a-z0-9._%+-]{0,63}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,4}/gi;
+  genericPattern.lastIndex = 0;
+  let genericMatch = genericPattern.exec(value);
+  while (genericMatch) {
+    pushEmbedded(genericMatch[0]);
+    genericMatch = genericPattern.exec(value);
+  }
+
+  const rankedCandidates = embeddedCandidates
+    .map((candidate) => isExactNormalizedEmailCandidate(candidate))
+    .filter(Boolean)
+    .sort((a, b) => a.length - b.length);
+  if (rankedCandidates.length > 0) {
+    return rankedCandidates[0];
+  }
+
+  return isExactNormalizedEmailCandidate(value);
 }
 
 function sanitizePhoneText(value) {
@@ -6772,13 +6969,73 @@ async function extractPageDataScript(extractionOptionsInput) {
 
   const looksLikeFacebookLoginWall = (node) => {
     if (!node) return false;
+    const matchesKnownLoginForm = (() => {
+      if (!node) return false;
+      const loginFormSelector = "form#login_popup_cta_form, form#login_form, form[action*='/login/device-based/regular/login']";
+      const loginForm =
+        typeof node.matches === "function" && node.matches(loginFormSelector)
+          ? node
+          : typeof node.querySelector === "function"
+            ? node.querySelector(loginFormSelector)
+            : null;
+      if (!loginForm || typeof loginForm.querySelector !== "function") return false;
+      const hasEmailField = Boolean(
+        loginForm.querySelector("input[name='email'], input[type='email'], input[type='text']")
+      );
+      const hasPasswordField = Boolean(
+        loginForm.querySelector("input[name='pass'], input[type='password']")
+      );
+      return hasEmailField && hasPasswordField;
+    })();
+    if (matchesKnownLoginForm) return true;
     const text = normalize((node.innerText || node.textContent || "")).toLowerCase();
     if (!text) return false;
     if (text.includes("see more on facebook")) return true;
     const hasLogin = text.includes("log in") || text.includes("login");
     const hasCreate = text.includes("create new account") || text.includes("sign up");
     const hasForgot = text.includes("forgotten password") || text.includes("forgot password");
-    return hasLogin && (hasCreate || hasForgot);
+    const hasLoggedOutBannerCopy = text.includes("log in or sign up for facebook to connect with friends");
+    const hasCredentialPrompt =
+      text.includes("email address or phone number") &&
+      text.includes("password");
+    const hasSeeMoreFrom = text.includes("see more from");
+    return hasLoggedOutBannerCopy || (hasLogin && (hasCreate || hasForgot || hasCredentialPrompt || hasSeeMoreFrom));
+  };
+
+  const promoteFacebookWallNode = (node) => {
+    if (!node) return node;
+    let best = node;
+    let current = node;
+    for (let depth = 0; depth < 6 && current; depth += 1) {
+      const rect = typeof current.getBoundingClientRect === "function"
+        ? current.getBoundingClientRect()
+        : null;
+      let style = null;
+      try {
+        style = window.getComputedStyle(current);
+      } catch (_error) {
+        style = null;
+      }
+      const zIndex = style ? Number.parseInt(style.zIndex, 10) : Number.NaN;
+      const coversViewport = Boolean(
+        rect &&
+        rect.width >= window.innerWidth * 0.55 &&
+        rect.height >= window.innerHeight * 0.35
+      );
+      const overlayLike = Boolean(
+        style &&
+        (
+          style.position === "fixed" ||
+          style.position === "sticky" ||
+          (Number.isFinite(zIndex) && zIndex >= 100)
+        )
+      );
+      if (coversViewport || overlayLike) {
+        best = current;
+      }
+      current = current.parentElement;
+    }
+    return best;
   };
 
   const hideNodeHard = (node) => {
@@ -6811,22 +7068,48 @@ async function extractPageDataScript(extractionOptionsInput) {
     const selectors = [
       "div[role='dialog']",
       "div[aria-modal='true']",
+      "div[role='banner']",
       "div[role='complementary']",
       "aside",
-      "footer"
+      "footer",
+      "form#login_popup_cta_form",
+      "form#login_form",
+      "form[action*='/login/device-based/regular/login']"
     ];
     const walls = [];
     const seen = new Set();
     for (const selector of selectors) {
       const nodes = Array.from(document.querySelectorAll(selector)).slice(0, 60);
       for (const node of nodes) {
-        if (!node || seen.has(node)) continue;
-        seen.add(node);
-        if (!isElementVisible(node)) continue;
-        if (!looksLikeFacebookLoginWall(node)) continue;
-        walls.push(node);
+        if (!node) continue;
+        const candidate = promoteFacebookWallNode(node) || node;
+        if (!candidate || seen.has(candidate)) continue;
+        seen.add(candidate);
+        if (!isElementVisible(node) && !isElementVisible(candidate)) continue;
+        if (!looksLikeFacebookLoginWall(node) && !looksLikeFacebookLoginWall(candidate)) continue;
+        walls.push(candidate);
       }
     }
+
+    const edgeCandidates = Array.from(document.querySelectorAll("header, footer, aside, section, form, div")).slice(0, 900);
+    for (const node of edgeCandidates) {
+      if (!node || seen.has(node)) continue;
+      const rect = typeof node.getBoundingClientRect === "function" ? node.getBoundingClientRect() : null;
+      if (!rect) continue;
+      const wideEnough = rect.width >= window.innerWidth * 0.55;
+      const bannerSized = rect.height >= 48 && rect.height <= window.innerHeight * 0.45;
+      const nearViewportEdge =
+        rect.top <= Math.max(180, window.innerHeight * 0.2) ||
+        rect.bottom >= window.innerHeight - Math.max(36, window.innerHeight * 0.12);
+      if (!wideEnough || !bannerSized || !nearViewportEdge) continue;
+      const candidate = promoteFacebookWallNode(node) || node;
+      if (!candidate || seen.has(candidate)) continue;
+      if (!isElementVisible(node) && !isElementVisible(candidate)) continue;
+      if (!looksLikeFacebookLoginWall(node) && !looksLikeFacebookLoginWall(candidate)) continue;
+      seen.add(candidate);
+      walls.push(candidate);
+    }
+
     return walls;
   };
 
@@ -7025,13 +7308,43 @@ async function extractPageDataScript(extractionOptionsInput) {
     return expanded;
   };
 
+  const revealFacebookPageSections = async () => {
+    const maxPasses = 5;
+    const stepSize = Math.max(420, Math.floor(window.innerHeight * 0.85));
+    let lastKnownHeight = 0;
+    for (let pass = 0; pass < maxPasses; pass += 1) {
+      const scrollHeight = Math.max(
+        document.documentElement ? document.documentElement.scrollHeight : 0,
+        document.body ? document.body.scrollHeight : 0,
+        window.innerHeight
+      );
+      const maxScrollTop = Math.max(0, scrollHeight - window.innerHeight);
+      const nextY = Math.min(maxScrollTop, pass * stepSize);
+      window.scrollTo(0, nextY);
+      await wait(pass === 0 ? 180 : 260);
+      await dismissFacebookLoginWallsStably();
+      expandFacebookSections();
+      await wait(140);
+      const nextHeight = Math.max(
+        document.documentElement ? document.documentElement.scrollHeight : 0,
+        document.body ? document.body.scrollHeight : 0,
+        window.innerHeight
+      );
+      if (nextY >= maxScrollTop && nextHeight <= lastKnownHeight + 12) {
+        break;
+      }
+      lastKnownHeight = Math.max(lastKnownHeight, nextHeight);
+    }
+  };
+
   const prepareFacebookPage = async () => {
     await dismissFacebookLoginWallsStably();
     expandFacebookSections();
-    window.scrollTo(0, 0);
-    await wait(220);
+    await wait(180);
+    await revealFacebookPageSections();
     await dismissFacebookLoginWallsStably();
     expandFacebookSections();
+    await wait(180);
   };
 
   const hostname = normalize(window.location.hostname || "").toLowerCase();
@@ -7330,6 +7643,7 @@ async function extractPageDataScript(extractionOptionsInput) {
   const relatedLinkSet = new Set();
   const internalLinkSet = new Set();
   const socialLinkSet = new Set();
+  const websiteLinkSet = new Set();
   const focusedLinkMap = new Map();
   const relatedKeywords = /(about|contact|get\s+in\s+touch|reach\s+us|call\s+us|team|leadership|management|staff|company|our-story|who-we-are|founder|owner|careers?|jobs?|join\s+us|work\s+with\s+us|vacanc(?:y|ies))/i;
   const pageOrigin = window.location.origin;
@@ -7383,6 +7697,69 @@ async function extractPageDataScript(extractionOptionsInput) {
     } catch (_error) {
       // Ignore malformed wrapper URLs.
     }
+  };
+
+  const isIgnoredWebsiteHost = (hostValue) => {
+    const host = normalize(hostValue).toLowerCase().replace(/^www\./, "");
+    if (!host) return true;
+    return (
+      host === normalize(window.location.hostname || "").toLowerCase().replace(/^www\./, "") ||
+      isKnownSocialHost(host) ||
+      host.includes("facebook.com") ||
+      /(^|\.)google\./i.test(host) ||
+      host.includes("googleadservices.com") ||
+      host.includes("g.doubleclick.net") ||
+      host.includes("gstatic.com")
+    );
+  };
+
+  const normalizeExternalWebsiteUrl = (value) => {
+    let candidate = decodeEscapedText(decodeHtmlEntities(value));
+    candidate = normalize(candidate)
+      .replace(/^[('"\\\s]+|[)'"\\\s]+$/g, "")
+      .replace(/[),.;]+$/, "");
+    if (!candidate) return "";
+
+    if (/^\/\//.test(candidate)) {
+      candidate = `https:${candidate}`;
+    } else if (/^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(candidate) && !/^https?:\/\//i.test(candidate)) {
+      candidate = `https://${candidate}`;
+    }
+
+    const redirectKeys = ["u", "url", "target", "href", "dest", "redirect", "to", "link", "q", "continue", "out"];
+    let current = candidate;
+    for (let depth = 0; depth < 4; depth += 1) {
+      let parsed = null;
+      try {
+        parsed = new URL(current, window.location.href);
+      } catch (_error) {
+        return "";
+      }
+
+      const host = normalize(parsed.hostname || "").toLowerCase().replace(/^www\./, "");
+      if (
+        host &&
+        !host.includes("facebook.com") &&
+        !/(^|\.)google\./i.test(host) &&
+        !host.includes("googleadservices.com") &&
+        !host.includes("g.doubleclick.net")
+      ) {
+        parsed.hash = "";
+        return isIgnoredWebsiteHost(host) ? "" : normalize(parsed.toString()).replace(/[),.;]+$/, "");
+      }
+
+      let next = "";
+      for (const key of redirectKeys) {
+        const value = normalize(parsed.searchParams.get(key) || "");
+        if (!value) continue;
+        next = value;
+        break;
+      }
+      if (!next) return "";
+      current = next;
+    }
+
+    return "";
   };
 
   const isCrawlableInternal = (absoluteUrl) => {
@@ -7454,6 +7831,10 @@ async function extractPageDataScript(extractionOptionsInput) {
         }
       }
       continue;
+    }
+    const externalWebsite = normalizeExternalWebsiteUrl(absolute);
+    if (externalWebsite) {
+      websiteLinkSet.add(externalWebsite);
     }
     collectSocialFromWrappedUrl(absolute);
 
@@ -7584,6 +7965,7 @@ async function extractPageDataScript(extractionOptionsInput) {
     focusedLinks: Array.from(focusedLinkMap.values()).slice(0, 40),
     internalLinks: Array.from(internalLinkSet).slice(0, 260),
     socialLinks: Array.from(socialLinkSet).slice(0, 12),
+    websiteLinks: Array.from(websiteLinkSet).slice(0, 16),
     hasFooterFacebookLink,
     blocked,
     platform,

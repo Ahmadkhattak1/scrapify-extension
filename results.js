@@ -138,7 +138,7 @@
     }
     el.exportBtn.disabled = allRows.length === 0 || columns.length === 0;
     el.metaText.textContent = buildMetaText(statusInfo.rawStatus);
-    el.emptyState.textContent = isImportedView() ? "Imported file has no rows." : "No rows yet. Run a scrape first.";
+    el.emptyState.textContent = buildEmptyStateMessage(statusInfo.rawStatus);
 
     if (!hasRows) {
       el.emptyState.classList.remove("hidden");
@@ -374,6 +374,56 @@
     ].filter(Boolean);
 
     return parts.join(" | ") || "Waiting for data...";
+  }
+
+  function buildEmptyStateMessage(status) {
+    if (isImportedView()) {
+      return "Imported file has no rows.";
+    }
+
+    const liveStatus = normalizeText(status).toLowerCase();
+    const filters = scrapeSession && typeof scrapeSession.filters === "object" ? scrapeSession.filters : {};
+    const storedRowCount = Number(scrapeSession && scrapeSession.rows_count);
+    const hasPersistedRunRows = Number.isFinite(storedRowCount) && storedRowCount > 0;
+    const completedRun =
+      liveStatus === "done" ||
+      liveStatus === "stopped" ||
+      liveStatus === "error" ||
+      liveStatus === "enriched";
+
+    if (hasPersistedRunRows) {
+      return "Run metadata is available, but the viewer could not restore the row payload. Refresh the viewer and, if this keeps happening on large runs, rerun after reloading the extension.";
+    }
+
+    if (filters.hasEmail === true && completedRun) {
+      const enrichStatus = normalizeText(enrichSession && enrichSession.status).toLowerCase();
+      if (!enrichStatus || enrichStatus === "idle") {
+        return "No rows matched the final output filters. 'Keep only leads with email' is enabled. Enable website enrichment or turn that filter off.";
+      }
+      return "No rows matched the final output filters. 'Keep only leads with email' is enabled for this run.";
+    }
+
+    if (hasAnyConfiguredFilter(filters) && completedRun) {
+      return "No rows matched the current filters for this run.";
+    }
+
+    return "No rows yet. Run a scrape first.";
+  }
+
+  function hasAnyConfiguredFilter(filtersInput) {
+    const filters = filtersInput && typeof filtersInput === "object" ? filtersInput : {};
+    return (
+      filters.minRating !== "" && filters.minRating != null ||
+      filters.maxRating !== "" && filters.maxRating != null ||
+      filters.minReviews !== "" && filters.minReviews != null ||
+      filters.maxReviews !== "" && filters.maxReviews != null ||
+      normalizeText(filters.nameKeyword) !== "" ||
+      normalizeText(filters.categoryInclude) !== "" ||
+      normalizeText(filters.categoryExclude) !== "" ||
+      filters.hasWebsite === true ||
+      filters.hasPhone === true ||
+      filters.hasEmail === true
+    );
   }
 
   function selectSessionForRun(sessionValue, sessionKind) {

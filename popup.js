@@ -282,7 +282,16 @@
       const payloadConfig = {
         ...config,
         runId,
-        runTabId: tab.id
+        runTabId: tab.id,
+        enrichment: {
+          enabled: el.enableEnrichment.checked === true,
+          visibleTabs: el.enableEnrichment.checked === true && el.showEnrichmentTabs.checked === true,
+          leadDiscoveryEnabled: shouldEnableLeadDiscoveryForSelection(),
+          contactGoals: {
+            email: el.contactGoalEmail && el.contactGoalEmail.checked === true,
+            phone: el.contactGoalPhone && el.contactGoalPhone.checked === true
+          }
+        }
       };
 
       let response;
@@ -957,8 +966,44 @@
   function persistRows(rows) {
     const normalizedRows = applyUnifiedOutputToRows(rows);
     lastRows = normalizedRows;
-    storageSet({ lastRows: normalizedRows }).catch(() => {});
+    storageSet({ lastRows: normalizedRows }).catch((error) => {
+      console.warn("[popup:rows] failed to persist rows", error && error.message ? error.message : error);
+    });
     setRunningState(isBusy());
+  }
+
+  function shouldApplyOutputFiltersImmediately(summaryInput) {
+    const summary = summaryInput && typeof summaryInput === "object" ? summaryInput : {};
+    if (summary.output_filters_applied === true) {
+      return true;
+    }
+    const enrichmentEnabledNow = Boolean(el.enableEnrichment && el.enableEnrichment.checked === true);
+    return summary.stopped === true || !enrichmentEnabledNow;
+  }
+
+  function buildNoRowsAfterScrapeMessage(filtersInput, optionsInput) {
+    const filters = filtersInput && typeof filtersInput === "object" ? filtersInput : {};
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const outputFiltersApplied = options.outputFiltersApplied === true;
+    const enrichmentEnabled = options.enrichmentEnabled === true;
+    const inlineEnrichmentCompleted = options.inlineEnrichmentCompleted === true;
+    const stopped = options.stopped === true;
+
+    if (outputFiltersApplied && filters.hasEmail === true) {
+      if (!enrichmentEnabled) {
+        return "No rows matched the final output filters. 'Keep only leads with email' is enabled while website enrichment is off.";
+      }
+      if (stopped && !inlineEnrichmentCompleted) {
+        return "No rows matched the final output filters. 'Keep only leads with email' is enabled, but enrichment did not run after the scrape stopped.";
+      }
+      return "No rows matched the final output filters. 'Keep only leads with email' is enabled.";
+    }
+
+    if (outputFiltersApplied && hasAnyActiveFilter(filters)) {
+      return "No rows matched the final output filters. Try relaxing the active filters and run again.";
+    }
+
+    return "No rows extracted. Try disabling strict filters or run again with fewer active constraints.";
   }
 
   function finalizeScrapeResult(rowsInput, summaryInput) {
@@ -978,9 +1023,10 @@
       hasPhone: el.hasPhone.checked,
       hasEmail: !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false
     });
-    const scrapeStageFilters = toScrapeStageFilters(activeFilters);
-    const rows = hasAnyActiveFilter(scrapeStageFilters)
-      ? incomingRows.filter((row) => applyFilters(row, scrapeStageFilters))
+    const outputFiltersApplied = shouldApplyOutputFiltersImmediately(summary);
+    const effectiveFilters = outputFiltersApplied ? activeFilters : toScrapeStageFilters(activeFilters);
+    const rows = hasAnyActiveFilter(effectiveFilters)
+      ? incomingRows.filter((row) => applyFilters(row, effectiveFilters))
       : incomingRows;
 
     persistRows(rows);
@@ -990,14 +1036,20 @@
 
     const status = summary.stopped ? "Stopped" : "Completed";
     const fastSkipped = Number(summary.fast_skipped || 0);
-    setState(`${status}: ${rows.length} unique row(s), ${summary.duplicates || 0} duplicates, ${fastSkipped} fast-skipped`);
+    const rowsLabel = outputFiltersApplied ? "row(s) after output filters" : "unique row(s)";
+    setState(`${status}: ${rows.length} ${rowsLabel}, ${summary.duplicates || 0} duplicates, ${fastSkipped} fast-skipped`);
     setLeadSignal(summary.stopped ? "Scrape stopped by user" : "Scrape finished and saved", summary.stopped ? "warn" : "success");
 
     if (rows.length === 0 && Number(summary.processed || 0) > 0) {
-      setError("No rows extracted. Try disabling strict filters or run again with fewer active constraints.");
+      setError(buildNoRowsAfterScrapeMessage(activeFilters, {
+        outputFiltersApplied,
+        enrichmentEnabled: Boolean(el.enableEnrichment && el.enableEnrichment.checked === true),
+        inlineEnrichmentCompleted: summary.inline_enrichment_completed === true,
+        stopped: summary.stopped === true
+      }));
     }
 
-    if (!summary.stopped && el.enableEnrichment.checked && rows.length > 0) {
+    if (!summary.stopped && el.enableEnrichment.checked && rows.length > 0 && summary.output_filters_applied !== true) {
       setLeadSignal("Website enrichment queued in background", "info");
     }
   }
@@ -1531,7 +1583,8 @@
 
   function shouldEnableLeadDiscoveryForSelection() {
     const selected = new Set(selectedColumns);
-    return selected.has("owner_name") || selected.has("owner_title") || selected.has("owner_email");
+    const wantsEmailCollection = Boolean(el.contactGoalEmail && el.contactGoalEmail.checked === true);
+    return wantsEmailCollection || selected.has("owner_name") || selected.has("owner_title") || selected.has("owner_email");
   }
 
   async function persistRunSettingsForBackground() {
