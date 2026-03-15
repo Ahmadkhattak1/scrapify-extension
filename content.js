@@ -20,6 +20,11 @@
   } = shared;
   const SCRAPE_SESSION_KEY = "scrapeSession";
   const ROW_SNAPSHOT_INTERVAL = 8;
+  const RESULT_STALL_SCROLL_LIMIT = 60;
+  const RESULT_BOTTOM_STALL_LIMIT = 10;
+  const AGGRESSIVE_RESULT_SCROLL_THRESHOLD = 3;
+  const DETAIL_ROW_MAX_ATTEMPTS = 8;
+  const DETAIL_WEBSITE_WAIT_FLOOR = 4;
 
   const state = {
     isRunning: false,
@@ -83,7 +88,6 @@
 
     if (message.type === MSG.STOP_SCRAPE) {
       state.stopRequested = true;
-      requestInlineEnrichmentStopBestEffort();
       persistScrapeSession({ status: "stopping", force: true });
       sendResponse({ ok: true });
       return false;
@@ -113,7 +117,6 @@
     state.runInfiniteScroll = infiniteScroll;
     const filters = normalizeRuntimeFilters(config.filters || {});
     const scrapeStageFilters = toScrapeStageFilters(filters);
-    const enrichmentConfig = normalizeRuntimeEnrichment(config.enrichment || {});
     state.activeFilters = { ...filters };
     const sourceQuery = getCurrentQuery();
     const sourceUrl = window.location.href;
@@ -145,6 +148,7 @@
       }
 
       let noNewCardsScrolls = 0;
+      let bottomStallScrolls = 0;
 
       while (!state.stopRequested) {
         const resolvedFeed = await ensureResultsFeedReady(feed, 2600, { attemptBack: true });
@@ -164,28 +168,26 @@
         }
 
         if (unseenCards.length === 0) {
-          await scrollResults(feed);
-          await sleep(700);
-
-          const scrolledFeed = await ensureResultsFeedReady(feed, 1200, { attemptBack: false });
-          if (scrolledFeed) {
-            feed = scrolledFeed;
+          const advanceResult = await advanceResultsFeed(feed, noNewCardsScrolls);
+          if (advanceResult.feed) {
+            feed = advanceResult.feed;
           }
 
-          const hasAnyNewCards = getResultCards(feed).some((card) => {
-            const cardKey = getCardIdentity(card);
-            return cardKey && !state.seenCardKeys.has(cardKey);
-          });
-
-          if (hasAnyNewCards) {
+          if (advanceResult.hasNewCards) {
             noNewCardsScrolls = 0;
+            bottomStallScrolls = 0;
           } else {
-            noNewCardsScrolls += 1;
+            noNewCardsScrolls = advanceResult.progressed === true ? 0 : noNewCardsScrolls + 1;
+            bottomStallScrolls = advanceResult.reachedBottom === true ? bottomStallScrolls + 1 : 0;
           }
 
           sendProgress({ force: true });
 
-          if (noNewCardsScrolls >= 10) {
+          if (
+            advanceResult.atEnd === true ||
+            bottomStallScrolls >= RESULT_BOTTOM_STALL_LIMIT ||
+            noNewCardsScrolls >= RESULT_STALL_SCROLL_LIMIT
+          ) {
             break;
           }
           continue;
@@ -226,18 +228,8 @@
                 }
               }
 
-              let outputRow = guardedRow;
-              if (enrichmentConfig.enabled) {
-                const enrichmentResult = await enrichRowInline(guardedRow, enrichmentConfig);
-                if (enrichmentResult && enrichmentResult.stopped === true) {
-                  sendProgress({ force: true });
-                  break;
-                }
-                outputRow = enrichmentResult ? enrichmentResult.row : null;
-              }
-
-              if (outputRow) {
-                state.rows.push(outputRow);
+              if (guardedRow) {
+                state.rows.push(guardedRow);
                 state.matched += 1;
               }
             }
@@ -280,8 +272,8 @@
         ...getPerformanceStats(),
         errors: state.errors,
         stopped: state.stopRequested,
-        inline_enrichment_completed: enrichmentConfig.enabled === true,
-        output_filters_applied: enrichmentConfig.enabled === true,
+        inline_enrichment_completed: false,
+        output_filters_applied: false,
         ...state.enrichmentStats
       };
 
@@ -367,9 +359,10 @@
   }
 
   async function extractBusinessRowStable(sourceQuery, sourceUrl, expectedIdentity, fallbackRow) {
-    const maxAttempts = 6;
+    const maxAttempts = DETAIL_ROW_MAX_ATTEMPTS;
     let lastRow = null;
     let previousWebsite = "";
+    let sawWebsiteSignals = false;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const row = extractBusinessRow(sourceQuery, sourceUrl);
@@ -385,16 +378,19 @@
 
       lastRow = row;
       const website = normalizeBusinessWebsiteUrl(row.website);
+      sawWebsiteSignals = sawWebsiteSignals || hasDetailPanelWebsiteSignals();
       const hasSocialFallback = Boolean(normalizeFacebookProfileUrl(row.listing_facebook));
       const hasContactSignals =
         Boolean(normalizeText(row.address)) ||
         Boolean(sanitizePhoneText(row.phone)) ||
         hasSocialFallback;
       if (!website) {
-        if (attempt >= maxAttempts - 1 || (attempt >= 2 && hasContactSignals)) {
+        const attemptFloorReached = attempt >= DETAIL_WEBSITE_WAIT_FLOOR;
+        const safeToReturnWithoutWebsite = attemptFloorReached && hasContactSignals && !sawWebsiteSignals;
+        if (attempt >= maxAttempts - 1 || safeToReturnWithoutWebsite) {
           return row;
         }
-        await sleep(320 + attempt * 80);
+        await sleep(360 + attempt * 120);
         continue;
       }
 
@@ -779,6 +775,11 @@
       }
     }
 
+    const fallbackMatch = extractWebsiteFromGenericDetailNodes(roots, detailName);
+    if (fallbackMatch) {
+      return fallbackMatch;
+    }
+
     return "";
   }
 
@@ -892,10 +893,91 @@
     return rect.width > 0 && rect.height > 0;
   }
 
+  function extractWebsiteFromGenericDetailNodes(rootsInput, detailName) {
+    const roots = Array.isArray(rootsInput) ? rootsInput : [];
+    const focusedRoots = roots.filter((node) => {
+      return node && node !== document.body && node !== document.documentElement;
+    });
+    const candidates = collectPromisingDetailWebsiteNodes(focusedRoots.length > 0 ? focusedRoots : roots);
+    for (const node of candidates) {
+      const match = extractWebsiteCandidateFromNode(node, {
+        matchBusinessName: detailName,
+        trustWebsiteAction: nodeLooksLikeWebsiteAction(node)
+      });
+      if (match) {
+        return match;
+      }
+    }
+    return "";
+  }
+
+  function collectPromisingDetailWebsiteNodes(rootsInput) {
+    const roots = Array.isArray(rootsInput) ? rootsInput : [];
+    const out = [];
+    const seen = new Set();
+    const selectors = [
+      "a[href]",
+      "button",
+      "[role='link']",
+      "[role='button']",
+      "[data-href]",
+      "[data-url]",
+      "[data-value]"
+    ];
+
+    const push = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      out.push(node);
+    };
+
+    for (const root of roots) {
+      if (!root || typeof root.querySelectorAll !== "function") continue;
+      for (const selector of selectors) {
+        const nodes = Array.from(root.querySelectorAll(selector)).slice(0, 160);
+        for (const node of nodes) {
+          if (isNodeInsideResultsList(node)) continue;
+          if (!isRenderedElement(node)) continue;
+          const textBlob = buildNodeTextBlob(node);
+          const looksPromising =
+            nodeLooksLikeWebsiteAction(node) ||
+            Boolean(findWebsiteInText(textBlob));
+          if (looksPromising) {
+            push(node);
+          }
+        }
+      }
+    }
+
+    return out;
+  }
+
+  function nodeLooksLikeWebsiteAction(node) {
+    if (!node || typeof node !== "object") return false;
+    const dataItemId = readNodeAttribute(node, "data-item-id").toLowerCase();
+    const ariaLabel = readNodeAttribute(node, "aria-label").toLowerCase();
+    const title = readNodeAttribute(node, "title").toLowerCase();
+    const tooltip = readNodeAttribute(node, "data-tooltip").toLowerCase();
+    const text = normalizeText(`${ariaLabel} ${title} ${tooltip} ${normalizeText(node.textContent || "")}`).toLowerCase();
+
+    if (dataItemId.includes("authority") || dataItemId.includes("website")) {
+      return true;
+    }
+    if (ariaLabel.includes("website") || ariaLabel.includes("open website")) {
+      return true;
+    }
+    if (title.includes("website") || tooltip.includes("website")) {
+      return true;
+    }
+    return /\bwebsite\b/i.test(text);
+  }
+
   function extractWebsiteCandidateFromNode(node, optionsInput) {
     const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
     const matchBusinessName = normalizeText(options.matchBusinessName);
     const matchCard = options.matchCard || null;
+    const trustWebsiteAction = options.trustWebsiteAction === true || nodeLooksLikeWebsiteAction(node);
     const candidates = collectUrlCarrierNodes(node);
 
     for (const candidateNode of candidates) {
@@ -916,12 +998,33 @@
         }
         continue;
       }
+      if (trustWebsiteAction || nodeLooksLikeWebsiteAction(candidateNode)) {
+        return textHit;
+      }
       if (!matchBusinessName || isWebsiteLikelyForBusinessName(textHit, matchBusinessName)) {
         return textHit;
       }
     }
 
     return "";
+  }
+
+  function hasDetailPanelWebsiteSignals() {
+    const root = resolveActiveDetailPanelRoot();
+    const roots = collectDetailPanelRoots(root);
+    if (extractWebsiteFromGenericDetailNodes(roots, normalizeText(textFromWithin(root, "h1.DUwDvf") || textFromWithin(root, "h1")))) {
+      return true;
+    }
+
+    return roots.some((candidateRoot) => {
+      if (!candidateRoot || typeof candidateRoot.querySelectorAll !== "function") return false;
+      const nodes = Array.from(
+        candidateRoot.querySelectorAll(
+          "a[data-item-id*='authority'], a[data-item-id*='website'], button[data-item-id*='authority'], button[data-item-id*='website'], [aria-label*='website' i], [data-tooltip*='website' i]"
+        )
+      ).slice(0, 80);
+      return nodes.some((node) => !isNodeInsideResultsList(node) && isRenderedElement(node));
+    });
   }
 
   function collectUrlCarrierNodes(node) {
@@ -1724,34 +1827,250 @@
     return rect.width > 0 && rect.height > 0;
   }
 
-  async function scrollResults(feed) {
+  async function advanceResultsFeed(feed, stallCount) {
+    if (!feed) {
+      return { feed: null, hasNewCards: false, atEnd: false, progressed: false, reachedBottom: false };
+    }
+
+    let currentFeed = feed;
+    const visibleCardKeysBefore = collectCardIdentitySet(currentFeed);
+    const cards = getResultCards(currentFeed);
+    const lastCard = cards.length > 0 ? cards[cards.length - 1] : null;
+    const targets = collectScrollTargets(currentFeed, lastCard);
+    const beforeSnapshot = targets.map((node) => [node, readScrollTop(node)]);
+    const primaryTarget = resolvePrimaryScrollTarget(currentFeed, lastCard, targets);
+    const beforeScrollState = captureScrollState(primaryTarget);
+    const aggressive = Number(stallCount || 0) >= AGGRESSIVE_RESULT_SCROLL_THRESHOLD;
+
+    await scrollResults(currentFeed, { aggressive, primaryTarget });
+
+    const waitBudgetMs = aggressive ? 1800 : 1000;
+    const deadline = Date.now() + waitBudgetMs;
+
+    while (Date.now() < deadline) {
+      const resolvedFeed = resolveFeedWithCards(currentFeed);
+      if (resolvedFeed) {
+        currentFeed = resolvedFeed;
+      }
+
+      const currentKeys = collectCardIdentitySet(currentFeed);
+      const hasNewCards = Array.from(currentKeys).some((cardKey) => {
+        return cardKey && !state.seenCardKeys.has(cardKey) && !visibleCardKeysBefore.has(cardKey);
+      });
+      if (hasNewCards) {
+        return {
+          feed: currentFeed,
+          hasNewCards: true,
+          atEnd: false,
+          progressed: true,
+          reachedBottom: false
+        };
+      }
+
+      if (isResultsEndMarkerVisible(currentFeed)) {
+        const currentCardsAfterMarker = getResultCards(currentFeed);
+        const currentLastCardAfterMarker = currentCardsAfterMarker.length > 0 ? currentCardsAfterMarker[currentCardsAfterMarker.length - 1] : null;
+        const currentPrimaryAfterMarker = resolvePrimaryScrollTarget(currentFeed, currentLastCardAfterMarker);
+        const afterMarkerState = captureScrollState(currentPrimaryAfterMarker);
+        return {
+          feed: currentFeed,
+          hasNewCards: false,
+          atEnd: true,
+          progressed: hasScrollStateProgressed(beforeScrollState, afterMarkerState) || didScrollTargetsMove(beforeSnapshot),
+          reachedBottom: isScrollStateAtBottom(afterMarkerState)
+        };
+      }
+
+      await sleep(150);
+    }
+
+    const currentCardsAfterScroll = getResultCards(currentFeed);
+    const currentLastCardAfterScroll = currentCardsAfterScroll.length > 0 ? currentCardsAfterScroll[currentCardsAfterScroll.length - 1] : null;
+    const currentPrimaryTarget = resolvePrimaryScrollTarget(currentFeed, currentLastCardAfterScroll);
+    const afterScrollState = captureScrollState(currentPrimaryTarget);
+    const progressed = hasScrollStateProgressed(beforeScrollState, afterScrollState) || didScrollTargetsMove(beforeSnapshot);
+    return {
+      feed: currentFeed,
+      hasNewCards: false,
+      atEnd: false,
+      progressed,
+      reachedBottom: isScrollStateAtBottom(afterScrollState)
+    };
+  }
+
+  function collectCardIdentitySet(feed) {
+    const keys = new Set();
+    for (const card of getResultCards(feed)) {
+      const key = getCardIdentity(card);
+      if (key) {
+        keys.add(key);
+      }
+    }
+    return keys;
+  }
+
+  function didScrollTargetsMove(snapshot) {
+    if (!Array.isArray(snapshot)) return false;
+    return snapshot.some(([node, before]) => Math.abs(readScrollTop(node) - Number(before || 0)) > 4);
+  }
+
+  function resolvePrimaryScrollTarget(feed, lastCard, targetsInput) {
+    const targets = Array.isArray(targetsInput) && targetsInput.length > 0
+      ? targetsInput
+      : collectScrollTargets(feed, lastCard);
+    let best = null;
+    let bestScore = -Infinity;
+
+    for (const node of targets) {
+      if (!node) continue;
+      const scrollRange = readMaxScrollTop(node);
+      if (scrollRange <= 0) continue;
+
+      const isDocumentNode =
+        node === document.documentElement ||
+        node === document.body ||
+        node === document.scrollingElement;
+      const role = normalizeText(node.getAttribute && node.getAttribute("role")).toLowerCase();
+      const className = normalizeText(node.className || "").toLowerCase();
+
+      let score = Math.min(scrollRange, 2500);
+      if (!isDocumentNode) score += 120;
+      if (node === feed) score += 160;
+      if (role === "feed") score += 220;
+      if (className.includes("m6qerb")) score += 40;
+      if (lastCard && typeof node.contains === "function" && node.contains(lastCard)) score += 80;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = node;
+      }
+    }
+
+    return best || feed || null;
+  }
+
+  function captureScrollState(node) {
+    return {
+      node: node || null,
+      top: readScrollTop(node),
+      maxTop: readMaxScrollTop(node)
+    };
+  }
+
+  function hasScrollStateProgressed(beforeState, afterState) {
+    const before = beforeState && typeof beforeState === "object" ? beforeState : null;
+    const after = afterState && typeof afterState === "object" ? afterState : null;
+    if (!before || !after) return false;
+    if (Math.abs(Number(after.top || 0) - Number(before.top || 0)) > 8) return true;
+    if (Math.abs(Number(after.maxTop || 0) - Number(before.maxTop || 0)) > 12) return true;
+    return false;
+  }
+
+  function isScrollStateAtBottom(stateInput) {
+    const state = stateInput && typeof stateInput === "object" ? stateInput : null;
+    if (!state) return false;
+    const maxTop = Number(state.maxTop || 0);
+    if (maxTop <= 0) return false;
+    return Number(state.top || 0) >= maxTop - 16;
+  }
+
+  function readMaxScrollTop(node) {
+    if (!node) return 0;
+    if (node === document.documentElement || node === document.body || node === document.scrollingElement) {
+      const doc = document.documentElement || {};
+      const body = document.body || {};
+      const scrollHeight = Math.max(
+        Number(doc.scrollHeight || 0),
+        Number(body.scrollHeight || 0),
+        Number(document.scrollingElement && document.scrollingElement.scrollHeight || 0)
+      );
+      const viewportHeight = Math.max(
+        Number(window.innerHeight || 0),
+        Number(doc.clientHeight || 0),
+        Number(body.clientHeight || 0)
+      );
+      return Math.max(0, scrollHeight - viewportHeight);
+    }
+    return Math.max(0, Number(node.scrollHeight || 0) - Number(node.clientHeight || 0));
+  }
+
+  function isResultsEndMarkerVisible(feed) {
+    const markers = [
+      "you've reached the end",
+      "you reached the end",
+      "end of the list",
+      "end of results",
+      "no more results"
+    ];
+    const roots = [];
+    const seen = new Set();
+    const push = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      roots.push(node);
+    };
+
+    push(feed);
+    push(feed && typeof feed.closest === "function" ? feed.closest("[role='main']") : null);
+    push(feed && feed.parentElement ? feed.parentElement : null);
+
+    return roots.some((root) => {
+      const text = normalizeText(root.textContent || "").toLowerCase();
+      if (!text) return false;
+      return markers.some((marker) => text.includes(marker));
+    });
+  }
+
+  async function scrollResults(feed, options) {
     if (!feed) return;
+    const opts = options && typeof options === "object" ? options : {};
+    const aggressive = opts.aggressive === true;
     const cards = getResultCards(feed);
     const lastCard = cards.length > 0 ? cards[cards.length - 1] : null;
     const targets = collectScrollTargets(feed, lastCard);
-    const beforeSnapshot = targets.map((node) => [node, readScrollTop(node)]);
+    const preferredTarget = opts.primaryTarget || resolvePrimaryScrollTarget(feed, lastCard, targets);
+    const orderedTargets = preferredTarget
+      ? [preferredTarget, ...targets.filter((node) => node !== preferredTarget)]
+      : targets;
+    const beforeSnapshot = orderedTargets.map((node) => [node, readScrollTop(node)]);
 
-    const maxViewport = targets.reduce((acc, node) => {
+    const maxViewport = orderedTargets.reduce((acc, node) => {
       const height = Number(node && node.clientHeight ? node.clientHeight : 0);
       return Math.max(acc, height);
     }, Math.max(window.innerHeight || 0, feed.clientHeight || 0));
-    const step = Math.max(720, Math.floor(maxViewport * 0.85));
+    const step = aggressive
+      ? Math.max(1200, Math.floor(maxViewport * 1.15))
+      : Math.max(720, Math.floor(maxViewport * 0.85));
 
     if (lastCard && typeof lastCard.scrollIntoView === "function") {
       lastCard.scrollIntoView({ block: "end", behavior: "auto" });
     }
-    for (const node of targets) {
-      writeScrollTop(node, readScrollTop(node) + step);
+    for (const node of orderedTargets) {
+      const currentTop = readScrollTop(node);
+      const maxTop = readMaxScrollTop(node);
+      const nextTop = aggressive
+        ? Math.min(maxTop, Math.max(currentTop + step, maxTop - Math.max(320, Math.floor(step * 0.35))))
+        : currentTop + step;
+      writeScrollTop(node, nextTop);
     }
     await sleep(120);
-    const moved = beforeSnapshot.some(([node, before]) => readScrollTop(node) !== before);
+    let moved = didScrollTargetsMove(beforeSnapshot);
     if (!moved) {
       const deltaY = Math.max(1000, step);
-      for (const node of targets.slice(0, 4)) {
+      for (const node of orderedTargets.slice(0, 4)) {
         dispatchScrollWheel(node, deltaY);
       }
       window.scrollBy(0, deltaY);
       await sleep(120);
+      moved = didScrollTargetsMove(beforeSnapshot);
+    }
+
+    if (aggressive && !moved) {
+      for (const node of orderedTargets) {
+        writeScrollTop(node, readMaxScrollTop(node));
+      }
+      await sleep(180);
     }
   }
 
@@ -2279,134 +2598,6 @@
       discovery_website_recovered: 0,
       discovery_email_recovered: 0
     };
-  }
-
-  function mergeEnrichmentStats(summaryInput) {
-    const summary = summaryInput && typeof summaryInput === "object" ? summaryInput : {};
-    state.enrichmentStats.enriched += Number(summary.enriched || 0);
-    state.enrichmentStats.skipped += Number(summary.skipped || 0);
-    state.enrichmentStats.blocked += Number(summary.blocked || 0);
-    state.enrichmentStats.pages_visited += Number(summary.pages_visited || summary.site_pages_visited || 0);
-    state.enrichmentStats.pages_discovered += Number(summary.pages_discovered || summary.site_pages_discovered || 0);
-    state.enrichmentStats.social_scanned += Number(summary.social_scanned || 0);
-    state.enrichmentStats.personal_email_found += Number(summary.personal_email_found || 0);
-    state.enrichmentStats.company_email_found += Number(summary.company_email_found || 0);
-    state.enrichmentStats.discovery_attempted += Number(summary.discovery_attempted || 0);
-    state.enrichmentStats.discovery_website_recovered += Number(summary.discovery_website_recovered || 0);
-    state.enrichmentStats.discovery_email_recovered += Number(summary.discovery_email_recovered || 0);
-  }
-
-  function normalizeRuntimeEnrichment(input) {
-    const source = input && typeof input === "object" ? input : {};
-    return {
-      enabled: source.enabled === true,
-      visibleTabs: source.visibleTabs === true,
-      leadDiscoveryEnabled: source.leadDiscoveryEnabled === true,
-      contactGoals: {
-        email: !(source.contactGoals && source.contactGoals.email === false),
-        phone: !(source.contactGoals && source.contactGoals.phone === false)
-      }
-    };
-  }
-
-  async function enrichRowInline(row, enrichmentConfig) {
-    if (!row || typeof row !== "object") {
-      return { row: null, stopped: false };
-    }
-    if (!enrichmentConfig || enrichmentConfig.enabled !== true) {
-      return { row, stopped: false };
-    }
-    if (state.stopRequested) {
-      return { row: null, stopped: true };
-    }
-
-    state.inlineEnrichmentActive = true;
-    sendProgress({ force: true });
-
-    try {
-      const response = await sendRuntimeMessage({
-        type: MSG.ENRICH_ROWS,
-        rows: [row],
-        source_run_id: state.runId,
-        options: {
-          timeoutMs: 10000,
-          visibleTabs: enrichmentConfig.visibleTabs === true,
-          filters: state.activeFilters,
-          requireEmail: state.activeFilters.hasEmail === true,
-          contactGoals: enrichmentConfig.contactGoals,
-          maxSocialPages: 4,
-          leadDiscoveryEnabled: enrichmentConfig.leadDiscoveryEnabled === true,
-          discoverySources: {
-            google: enrichmentConfig.leadDiscoveryEnabled === true,
-            linkedin: false,
-            yelp: false
-          },
-          discoveryTrigger: "missing_website_or_missing_email",
-          discoveryBudget: {
-            googleQueries: 2,
-            googlePages: 3,
-            linkedinPages: 0,
-            yelpPages: 0
-          }
-        },
-        meta: {
-          reason: "inline_during_scrape",
-          persistSession: false,
-          sharedRegistryKey: state.runId
-        }
-      });
-
-      if (!response || response.type !== MSG.ENRICH_DONE) {
-        throw new Error((response && response.error) || "Website enrichment failed");
-      }
-
-      const enrichSummary = response.summary || {};
-      mergeEnrichmentStats(enrichSummary);
-
-      if (enrichSummary.stopped === true || state.stopRequested) {
-        return { row: null, stopped: true };
-      }
-
-      const outputRows = Array.isArray(response.rows) ? response.rows : [];
-      return {
-        row: outputRows.length > 0 ? outputRows[0] : null,
-        stopped: false
-      };
-    } catch (error) {
-      if (isInlineEnrichStopError(error) || state.stopRequested) {
-        return { row: null, stopped: true };
-      }
-      throw error;
-    } finally {
-      state.inlineEnrichmentActive = false;
-      sendProgress({ force: true });
-    }
-  }
-
-  function requestInlineEnrichmentStopBestEffort() {
-    if (state.inlineEnrichmentActive !== true) {
-      return;
-    }
-    chrome.runtime.sendMessage({ type: MSG.STOP_ENRICH }, () => {
-      void chrome.runtime.lastError;
-    });
-  }
-
-  function isInlineEnrichStopError(error) {
-    const message = normalizeText(error && error.message).toLowerCase();
-    return message.includes("stopped by user") || message.includes("no enrichment run is active");
-  }
-
-  function sendRuntimeMessage(message) {
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(message, (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message || "Runtime message failed"));
-          return;
-        }
-        resolve(response);
-      });
-    });
   }
 
   function normalizeRuntimeFilters(input) {

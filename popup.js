@@ -231,6 +231,11 @@
     el.columnsAllBtn.addEventListener("click", onSelectAllColumns);
     el.columnsNoneBtn.addEventListener("click", onClearColumns);
 
+    bindFilterNumericInput(el.minRating, { allowDecimal: true });
+    bindFilterNumericInput(el.maxRating, { allowDecimal: true });
+    bindFilterNumericInput(el.minReviews, { allowDecimal: false });
+    bindFilterNumericInput(el.maxReviews, { allowDecimal: false });
+
     const settingInputs = [
       el.maxRows,
       el.minRating,
@@ -476,6 +481,14 @@
 
     const minRating = parseOptionalNumber(el.minRating.value);
     const maxRating = parseOptionalNumber(el.maxRating.value);
+    if (minRating != null && (minRating < 0 || minRating > 5)) {
+      setError("Min rating must be between 0 and 5.");
+      return null;
+    }
+    if (maxRating != null && (maxRating < 0 || maxRating > 5)) {
+      setError("Max rating must be between 0 and 5.");
+      return null;
+    }
     if (minRating != null && maxRating != null && minRating > maxRating) {
       setError("Min rating cannot be greater than max rating.");
       return null;
@@ -483,6 +496,14 @@
 
     const minReviews = parseOptionalNumber(el.minReviews.value);
     const maxReviews = parseOptionalNumber(el.maxReviews.value);
+    if (minReviews != null && (minReviews < 0 || !Number.isInteger(minReviews))) {
+      setError("Min reviews must be a whole number.");
+      return null;
+    }
+    if (maxReviews != null && (maxReviews < 0 || !Number.isInteger(maxReviews))) {
+      setError("Max reviews must be a whole number.");
+      return null;
+    }
     if (minReviews != null && maxReviews != null && minReviews > maxReviews) {
       setError("Min reviews cannot be greater than max reviews.");
       return null;
@@ -669,11 +690,11 @@
     }
     showAdvancedFields = saved.showAdvancedFields === true;
 
-    el.maxRows.value = String(maxRowsValue);
-    el.minRating.value = sanitizeFormString(saved.minRating);
-    el.maxRating.value = sanitizeFormString(saved.maxRating);
-    el.minReviews.value = sanitizeFormString(saved.minReviews);
-    el.maxReviews.value = sanitizeFormString(saved.maxReviews);
+    setInputValueUnlessEditing(el.maxRows, String(maxRowsValue));
+    setInputValueUnlessEditing(el.minRating, saved.minRating, { allowDecimal: true });
+    setInputValueUnlessEditing(el.maxRating, saved.maxRating, { allowDecimal: true });
+    setInputValueUnlessEditing(el.minReviews, saved.minReviews, { allowDecimal: false });
+    setInputValueUnlessEditing(el.maxReviews, saved.maxReviews, { allowDecimal: false });
     el.hasWebsite.checked = saved.hasWebsite === true;
     el.hasPhone.checked = saved.hasPhone === true;
     if (el.contactGoalEmail) {
@@ -1235,6 +1256,82 @@
     if (value === "" || value == null) return null;
     const num = Number(value);
     return Number.isFinite(num) ? num : null;
+  }
+
+  function normalizeNumericFilterText(value, optionsInput, stateInput) {
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const state = stateInput && typeof stateInput === "object" ? stateInput : {};
+    const allowDecimal = options.allowDecimal === true;
+    const finalize = state.finalize === true;
+    const raw = value == null ? "" : String(value);
+    let normalized = "";
+    let hasDecimal = false;
+
+    for (const char of raw) {
+      if (char >= "0" && char <= "9") {
+        normalized += char;
+        continue;
+      }
+      if (allowDecimal && (char === "." || char === ",") && !hasDecimal) {
+        normalized += ".";
+        hasDecimal = true;
+      }
+    }
+
+    if (!allowDecimal || !finalize) {
+      return normalized;
+    }
+    if (normalized === ".") {
+      return "";
+    }
+    if (normalized.startsWith(".")) {
+      normalized = `0${normalized}`;
+    }
+    if (normalized.endsWith(".")) {
+      normalized = normalized.slice(0, -1);
+    }
+    return normalized;
+  }
+
+  function bindFilterNumericInput(input, optionsInput) {
+    if (!input) return;
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+
+    input.addEventListener("input", () => {
+      const rawValue = input.value;
+      const normalizedValue = normalizeNumericFilterText(rawValue, options);
+      if (rawValue === normalizedValue) {
+        return;
+      }
+
+      const caret = typeof input.selectionStart === "number" ? input.selectionStart : null;
+      input.value = normalizedValue;
+      if (caret == null || typeof input.setSelectionRange !== "function") {
+        return;
+      }
+
+      const normalizedPrefix = normalizeNumericFilterText(rawValue.slice(0, caret), options);
+      const nextCaret = Math.min(normalizedValue.length, normalizedPrefix.length);
+      input.setSelectionRange(nextCaret, nextCaret);
+    });
+
+    input.addEventListener("blur", () => {
+      const finalizedValue = normalizeNumericFilterText(input.value, options, { finalize: true });
+      if (input.value !== finalizedValue) {
+        input.value = finalizedValue;
+      }
+    });
+  }
+
+  function setInputValueUnlessEditing(input, value, optionsInput) {
+    if (!input || document.activeElement === input) return;
+    const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+    const nextValue = Object.prototype.hasOwnProperty.call(options, "allowDecimal")
+      ? normalizeNumericFilterText(value, options, { finalize: true })
+      : sanitizeFormString(value);
+    if (input.value !== nextValue) {
+      input.value = nextValue;
+    }
   }
 
   function hasAnyActiveFilter(filters) {
