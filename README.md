@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/brand/scrapify-logo.svg" alt="Scrapify logo" width="420" />
+  <strong style="font-size: 32px;">Scrapify</strong>
 </p>
 
 <p align="center">
