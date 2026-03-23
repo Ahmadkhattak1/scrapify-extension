@@ -347,6 +347,10 @@ function resolveEnrichChallenge(runControl, entryInput, nextStatus) {
   entry.status = normalizeText(nextStatus || "cleared") || "cleared";
   entry.updatedAt = new Date().toISOString();
   run.challenges.delete(entry.id);
+  const waitingChallenges = getRunChallengeEntries(run, "awaiting_user");
+  if (waitingChallenges.length === 0) {
+    run.pauseAllNewWork = false;
+  }
   const googlePaused = getRunChallengeEntries(run).some((item) => {
     const source = normalizeText(item && item.source).toLowerCase();
     const status = normalizeText(item && item.status).toLowerCase();
@@ -2867,11 +2871,20 @@ async function enrichRows(rows, options) {
     }
 
     while (nextIndex < rows.length) {
-      const runningLimit = Math.max(0, Number(runControl.pauseAllNewWork === true ? 0 : runControl.currentWorkerTarget || maxWorkers));
       const waitingCount = countRunWaitingChallenges(runControl);
+      const shouldPauseForChallenges = runControl.pauseAllNewWork === true && waitingCount > 0;
+      const runningLimit = Math.max(0, Number(shouldPauseForChallenges ? 0 : runControl.currentWorkerTarget || maxWorkers));
       const waitingAllowance = clampInt(runControl.challengeContinueWorkers, 0, ENRICH_CHALLENGE_CONTINUE_MAX, ENRICH_CHALLENGE_CONTINUE_DEFAULT);
       const totalBudget = Math.max(1, runningLimit + Math.min(waitingAllowance, waitingCount));
-      if (countRunActiveWorkers(runControl) >= totalBudget || countRunRunningWorkers(runControl) >= runningLimit) {
+      const activeWorkers = countRunActiveWorkers(runControl);
+      const runningWorkers = countRunRunningWorkers(runControl);
+      if (activeWorkers >= totalBudget) {
+        break;
+      }
+      if (runningLimit <= 0) {
+        break;
+      }
+      if (runningWorkers >= runningLimit) {
         break;
       }
       launchRow(nextIndex);

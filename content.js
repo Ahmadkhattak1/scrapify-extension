@@ -2033,24 +2033,47 @@
       "end of results",
       "no more results"
     ];
-    const roots = [];
-    const seen = new Set();
-    const push = (node) => {
-      if (!node || typeof node !== "object") return;
-      if (seen.has(node)) return;
-      seen.add(node);
-      roots.push(node);
-    };
+    if (!feed || typeof feed.querySelectorAll !== "function") return false;
 
-    push(feed);
-    push(feed && typeof feed.closest === "function" ? feed.closest("[role='main']") : null);
-    push(feed && feed.parentElement ? feed.parentElement : null);
+    const feedRect = typeof feed.getBoundingClientRect === "function"
+      ? feed.getBoundingClientRect()
+      : null;
+    const viewportTop = feedRect ? feedRect.top : 0;
+    const viewportBottom = feedRect ? feedRect.bottom : (window.innerHeight || 0);
+    const viewportHeight = Math.max(1, viewportBottom - viewportTop);
+    const lowerViewportCutoff = viewportTop + viewportHeight * 0.55;
+    const candidates = Array.from(feed.querySelectorAll("div, span, p, button")).slice(-220);
 
-    return roots.some((root) => {
-      const text = normalizeText(root.textContent || "").toLowerCase();
-      if (!text) return false;
-      return markers.some((marker) => text.includes(marker));
-    });
+    for (const node of candidates) {
+      if (!node || typeof node.getBoundingClientRect !== "function") continue;
+      const text = normalizeText(node.textContent || "").toLowerCase();
+      if (!text || text.length > 160) continue;
+      if (!markers.some((marker) => text.includes(marker))) continue;
+
+      const rect = node.getBoundingClientRect();
+      if (!rect || rect.width < 8 || rect.height < 8) continue;
+      if (rect.bottom < viewportTop || rect.top > viewportBottom) continue;
+
+      let style = null;
+      try {
+        style = window.getComputedStyle(node);
+      } catch (_error) {
+        style = null;
+      }
+      if (style) {
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+          continue;
+        }
+      }
+
+      if (rect.top < lowerViewportCutoff && rect.bottom < viewportBottom - 8) {
+        continue;
+      }
+
+      return true;
+    }
+
+    return false;
   }
 
   async function scrollResults(feed, options) {
