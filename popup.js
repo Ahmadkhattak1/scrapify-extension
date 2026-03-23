@@ -8,6 +8,9 @@
   const ACTIVE_SCRAPE_FILTERS_KEY = "activeScrapeFilters";
   const EXTENSION_PAGE_PREFIX = chrome.runtime.getURL("");
   const FOCUSED_CRAWL_MAX_PAGES = 4;
+  const ENRICH_WORKER_DEFAULT = 3;
+  const ENRICH_CHALLENGE_MODE_WAIT = "auto_then_wait";
+  const ENRICH_CHALLENGE_CONTINUE_DEFAULT = 1;
   const EMAIL_COLUMNS = ["email", "owner_name", "owner_title", "owner_email", "contact_email"];
   const RAW_EMAIL_COLUMNS = ["owner_name", "owner_title", "owner_email", "contact_email"];
   const PHONE_COLUMNS = ["phone", "listing_phone", "website_phone", "website_phone_source"];
@@ -127,6 +130,10 @@
     phoneColumnsHint: document.getElementById("phoneColumnsHint"),
     showEnrichmentTabsRow: document.getElementById("showEnrichmentTabsRow"),
     showEnrichmentTabs: document.getElementById("showEnrichmentTabs"),
+    enrichWorkerCount: document.getElementById("enrichWorkerCount"),
+    challengeHandlingMode: document.getElementById("challengeHandlingMode"),
+    challengeContinueWorkers: document.getElementById("challengeContinueWorkers"),
+    challengeSettingsHint: document.getElementById("challengeSettingsHint"),
     requireEmailForLeads: document.getElementById("requireEmailForLeads"),
     minRating: document.getElementById("minRating"),
     maxRating: document.getElementById("maxRating"),
@@ -157,7 +164,12 @@
     discoveryEmailsFoundStat: document.getElementById("discoveryEmailsFoundStat"),
     stateText: document.getElementById("stateText"),
     leadSignalText: document.getElementById("leadSignalText"),
-    errorText: document.getElementById("errorText")
+    errorText: document.getElementById("errorText"),
+    scrollableContent: document.querySelector(".scrollable-content"),
+    challengePanel: document.getElementById("challengePanel"),
+    challengeSummaryText: document.getElementById("challengeSummaryText"),
+    challengeMetaText: document.getElementById("challengeMetaText"),
+    challengeList: document.getElementById("challengeList")
   };
 
   let lastRows = null;
@@ -176,6 +188,9 @@
   let emailOutputModeValue = "unified_only";
   let phoneOutputModeValue = "unified_only";
   let showEnrichmentTabsEnabled = false;
+  let enrichWorkerCountValue = ENRICH_WORKER_DEFAULT;
+  let challengeHandlingModeValue = ENRICH_CHALLENGE_MODE_WAIT;
+  let challengeContinueWorkersValue = ENRICH_CHALLENGE_CONTINUE_DEFAULT;
   let requireEmailForLeadsEnabled = true;
   let scrapeRunTabId = null;
   let uiSettingsSaveTimer = null;
@@ -197,6 +212,15 @@
     el.emailOutputMode.value = emailOutputModeValue;
     el.phoneOutputMode.value = phoneOutputModeValue;
     el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
+    if (el.enrichWorkerCount) {
+      el.enrichWorkerCount.value = String(enrichWorkerCountValue);
+    }
+    if (el.challengeHandlingMode) {
+      el.challengeHandlingMode.value = challengeHandlingModeValue;
+    }
+    if (el.challengeContinueWorkers) {
+      el.challengeContinueWorkers.value = String(challengeContinueWorkersValue);
+    }
     syncEnrichmentModeUi({ persist: false });
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
@@ -206,6 +230,7 @@
 
     syncInfiniteScrollInput();
     syncContactGoalDependentUi({ persistColumns: false });
+    updateChallengeSettingsHint();
     ensureColumnSelectorRendered();
     setRunningState(isBusy());
 
@@ -224,12 +249,24 @@
     el.emailOutputMode.addEventListener("change", onEmailOutputModeChange);
     el.phoneOutputMode.addEventListener("change", onPhoneOutputModeChange);
     el.showEnrichmentTabs.addEventListener("change", onShowEnrichmentTabsToggle);
+    if (el.enrichWorkerCount) {
+      el.enrichWorkerCount.addEventListener("change", onEnrichWorkerCountChange);
+    }
+    if (el.challengeHandlingMode) {
+      el.challengeHandlingMode.addEventListener("change", onChallengeHandlingModeChange);
+    }
+    if (el.challengeContinueWorkers) {
+      el.challengeContinueWorkers.addEventListener("change", onChallengeContinueWorkersChange);
+    }
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.addEventListener("change", onRequireEmailForLeadsToggle);
     }
     el.toggleAdvancedBtn.addEventListener("click", onToggleAdvancedFields);
     el.columnsAllBtn.addEventListener("click", onSelectAllColumns);
     el.columnsNoneBtn.addEventListener("click", onClearColumns);
+    if (el.challengeList) {
+      el.challengeList.addEventListener("click", onChallengeListClick);
+    }
 
     bindFilterNumericInput(el.minRating, { allowDecimal: true });
     bindFilterNumericInput(el.maxRating, { allowDecimal: true });
@@ -281,6 +318,7 @@
     setState(runInfiniteCurrent ? "Scraping (infinite scroll)..." : "Scraping...");
     setLeadSignal("", "info");
     resetCounters();
+    focusStatusAreaForRun();
 
     try {
       await ensureContentScriptReady(tab.id);
@@ -535,6 +573,22 @@
     }
   }
 
+  function focusStatusAreaForRun() {
+    const configPanels = document.querySelectorAll("details.config-group");
+    for (const panel of configPanels) {
+      panel.open = false;
+    }
+
+    if (el.scrollableContent && typeof el.scrollableContent.scrollTo === "function") {
+      el.scrollableContent.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+
+    if (typeof window.scrollTo === "function") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }
+
   function resetCounters() {
     el.processed.textContent = "0";
     el.matched.textContent = "0";
@@ -574,6 +628,9 @@
         "infiniteScrollEnabled",
         "enrichmentEnabled",
         "showEnrichmentTabsEnabled",
+        "enrichWorkerCount",
+        "challengeHandlingMode",
+        "challengeContinueWorkers",
         "requireEmailForLeadsEnabled",
         "contactGoalEmailEnabled",
         "contactGoalPhoneEnabled"
@@ -587,6 +644,9 @@
       infiniteScrollEnabled = data.infiniteScrollEnabled === true;
       enrichmentEnabled = data.enrichmentEnabled === true;
       showEnrichmentTabsEnabled = data.showEnrichmentTabsEnabled === true;
+      enrichWorkerCountValue = clampInt(data.enrichWorkerCount, 1, 6, ENRICH_WORKER_DEFAULT);
+      challengeHandlingModeValue = normalizeChallengeHandlingMode(data.challengeHandlingMode);
+      challengeContinueWorkersValue = clampInt(data.challengeContinueWorkers, 0, 2, ENRICH_CHALLENGE_CONTINUE_DEFAULT);
       requireEmailForLeadsEnabled = data.requireEmailForLeadsEnabled !== false;
       contactGoalEmailEnabled = data.contactGoalEmailEnabled !== false;
       contactGoalPhoneEnabled = data.contactGoalPhoneEnabled !== false;
@@ -668,12 +728,34 @@
         el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled;
       }
     }
+    if (changes.enrichWorkerCount) {
+      enrichWorkerCountValue = clampInt(changes.enrichWorkerCount.newValue, 1, 6, ENRICH_WORKER_DEFAULT);
+      if (el.enrichWorkerCount) {
+        el.enrichWorkerCount.value = String(enrichWorkerCountValue);
+      }
+    }
+    if (changes.challengeHandlingMode) {
+      challengeHandlingModeValue = normalizeChallengeHandlingMode(changes.challengeHandlingMode.newValue);
+      if (el.challengeHandlingMode) {
+        el.challengeHandlingMode.value = challengeHandlingModeValue;
+      }
+    }
+    if (changes.challengeContinueWorkers) {
+      challengeContinueWorkersValue = clampInt(changes.challengeContinueWorkers.newValue, 0, 2, ENRICH_CHALLENGE_CONTINUE_DEFAULT);
+      if (el.challengeContinueWorkers) {
+        el.challengeContinueWorkers.value = String(challengeContinueWorkersValue);
+      }
+    }
+    if (changes.enableEnrichment || changes.challengeHandlingMode || changes.challengeContinueWorkers) {
+      syncEnrichmentModeUi({ persist: false });
+    }
     if (changes.requireEmailForLeadsEnabled) {
       requireEmailForLeadsEnabled = changes.requireEmailForLeadsEnabled.newValue !== false;
       if (el.requireEmailForLeads) {
         el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
       }
     }
+    updateChallengeSettingsHint();
   }
 
   function applySavedUiSettings(settings) {
@@ -712,6 +794,15 @@
     if (el.requireEmailForLeads) {
       el.requireEmailForLeads.checked = requireEmailForLeadsEnabled;
     }
+    if (el.enrichWorkerCount) {
+      el.enrichWorkerCount.value = String(enrichWorkerCountValue);
+    }
+    if (el.challengeHandlingMode) {
+      el.challengeHandlingMode.value = challengeHandlingModeValue;
+    }
+    if (el.challengeContinueWorkers) {
+      el.challengeContinueWorkers.value = String(challengeContinueWorkersValue);
+    }
     if (!showAdvancedFields && Array.isArray(selectedColumns)) {
       selectedColumns = normalizeSelectedColumnsForContactGoals(selectedColumns.filter((column) => !ADVANCED_COLUMNS.has(column)));
     }
@@ -720,6 +811,7 @@
     if (Array.isArray(lastRows) && lastRows.length > 0) {
       lastRows = applyUnifiedOutputToRows(lastRows);
     }
+    updateChallengeSettingsHint();
     if (el.columnList && el.columnList.childElementCount === 0) {
       renderColumnSelector();
       updateColumnsTitle();
@@ -760,12 +852,154 @@
     setRunningState(isBusy());
   }
 
+  function formatChallengeLabel(value) {
+    const normalized = normalizeText(value).replace(/[_-]+/g, " ").trim().toLowerCase();
+    if (!normalized) return "";
+    if (normalized === "site" || normalized === "site page") return "Site crawl";
+    if (normalized === "google") return "Google";
+    if (normalized === "directory") return "Directory";
+    if (normalized === "facebook") return "Facebook";
+    if (normalized === "provider search") return "Provider search";
+    if (normalized === "challenge waiting") return "Waiting for clearance";
+    if (normalized === "challenge cleared") return "Challenge cleared";
+    if (normalized === "challenge skipped") return "Challenge skipped";
+    return normalized.replace(/\b[a-z]/g, (match) => match.toUpperCase());
+  }
+
+  function formatChallengeDetectedAt(value) {
+    const timestamp = Date.parse(normalizeText(value));
+    if (!Number.isFinite(timestamp)) return "";
+    const detectedAt = new Date(timestamp);
+    const now = new Date();
+    const sameDay = detectedAt.toDateString() === now.toDateString();
+    const label = sameDay
+      ? detectedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+      : detectedAt.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    return `Seen ${label}`;
+  }
+
+  function renderChallengePanel(session) {
+    if (!el.challengePanel || !el.challengeSummaryText || !el.challengeMetaText || !el.challengeList) return;
+
+    const snapshot = session && typeof session === "object" ? session : {};
+    const challenges = Array.isArray(snapshot.challenge_tabs)
+      ? snapshot.challenge_tabs.filter((item) => item && typeof item === "object")
+      : [];
+    const waitingCount = Math.max(0, Number(snapshot.challenge_waiting_count || challenges.length || 0));
+    const activeWorkers = Math.max(0, Number(snapshot.active_workers || 0));
+    const runningWorkers = Math.max(
+      0,
+      Number(snapshot.running_workers != null ? snapshot.running_workers : Math.max(0, activeWorkers - waitingCount))
+    );
+    const workerTarget = Math.max(0, Number(snapshot.worker_target || 0));
+
+    if (waitingCount <= 0 && challenges.length === 0) {
+      el.challengePanel.classList.add("is-hidden");
+      el.challengeSummaryText.textContent = "Challenge waiting";
+      el.challengeMetaText.textContent = "";
+      el.challengeList.textContent = "";
+      return;
+    }
+
+    el.challengePanel.classList.remove("is-hidden");
+    const summaryCount = waitingCount > 0 ? waitingCount : challenges.length;
+    el.challengeSummaryText.textContent = summaryCount === 1
+      ? "1 challenged tab needs attention"
+      : `${summaryCount} challenged tabs need attention`;
+
+    const metaParts = [];
+    if (runningWorkers > 0) {
+      metaParts.push(`${runningWorkers}${workerTarget > 0 ? `/${workerTarget}` : ""} worker${runningWorkers === 1 ? "" : "s"} still running`);
+    } else {
+      metaParts.push("Run is waiting for you");
+    }
+    if (summaryCount > challenges.length && challenges.length > 0) {
+      metaParts.push(`showing ${challenges.length} of ${summaryCount}`);
+    }
+    metaParts.push("Focus a tab to continue");
+    el.challengeMetaText.textContent = metaParts.join(" | ");
+
+    el.challengeList.textContent = "";
+    for (const challenge of challenges) {
+      const challengeTabId = Number(challenge.tab_id);
+      const current = normalizeText(challenge.current);
+      const host = normalizeText(challenge.host) || shortHost(challenge.url || "");
+      const sourceLabel = formatChallengeLabel(challenge.source);
+      const phaseLabel = formatChallengeLabel(challenge.phase);
+      const detectedLabel = formatChallengeDetectedAt(challenge.detected_at);
+      const titleText = current || host || `${sourceLabel || "Challenge"} waiting`;
+
+      const item = document.createElement("div");
+      item.className = "challenge-item";
+
+      const copy = document.createElement("div");
+      copy.className = "challenge-copy";
+
+      const title = document.createElement("div");
+      title.className = "challenge-title";
+      title.textContent = titleText;
+
+      const meta = document.createElement("div");
+      meta.className = "challenge-meta";
+      const metaPartsForItem = [];
+      if (current && host) metaPartsForItem.push(host);
+      if (sourceLabel) metaPartsForItem.push(sourceLabel);
+      if (phaseLabel && phaseLabel !== sourceLabel) metaPartsForItem.push(phaseLabel);
+      if (detectedLabel) metaPartsForItem.push(detectedLabel);
+      meta.textContent = metaPartsForItem.join(" | ");
+
+      copy.appendChild(title);
+      copy.appendChild(meta);
+
+      const actions = document.createElement("div");
+      actions.className = "challenge-actions";
+
+      const focusButton = document.createElement("button");
+      focusButton.type = "button";
+      focusButton.className = "btn btn-outline challenge-action-btn";
+      focusButton.textContent = "Focus";
+      focusButton.dataset.action = "focus-challenge";
+      if (Number.isFinite(challengeTabId)) {
+        focusButton.dataset.tabId = String(challengeTabId);
+      } else {
+        focusButton.disabled = true;
+      }
+
+      const skipButton = document.createElement("button");
+      skipButton.type = "button";
+      skipButton.className = "btn btn-outline challenge-action-btn";
+      skipButton.textContent = "Skip";
+      skipButton.dataset.action = "skip-challenge";
+      if (Number.isFinite(challengeTabId)) {
+        skipButton.dataset.tabId = String(challengeTabId);
+      } else {
+        skipButton.disabled = true;
+      }
+
+      actions.appendChild(focusButton);
+      actions.appendChild(skipButton);
+      item.appendChild(copy);
+      item.appendChild(actions);
+      el.challengeList.appendChild(item);
+    }
+  }
+
   function applyEnrichSession(session) {
     if (!session || typeof session !== "object") return;
     lastEnrichSession = session;
 
     const status = normalizeText(session.status).toLowerCase();
-    enrichRunning = status === "queued" || status === "running" || status === "stopping";
+    const challengeWaitingCount = Math.max(
+      0,
+      Number(session.challenge_waiting_count || (Array.isArray(session.challenge_tabs) ? session.challenge_tabs.length : 0))
+    );
+    const activeWorkers = Math.max(0, Number(session.active_workers || 0));
+    const runningWorkers = Math.max(
+      0,
+      Number(session.running_workers != null ? session.running_workers : Math.max(0, activeWorkers - challengeWaitingCount))
+    );
+    const workerTarget = Math.max(0, Number(session.worker_target || 0));
+    enrichRunning = status === "queued" || status === "running" || status === "waiting" || status === "stopping";
 
     const siteVisited = Number(session.site_pages_visited != null ? session.site_pages_visited : session.pages_visited || 0);
     const siteDiscovered = Number(session.site_pages_discovered != null ? session.site_pages_discovered : session.pages_discovered || 0);
@@ -784,6 +1018,7 @@
     if (signalText) {
       setLeadSignal(signalText, signalTone);
     }
+    renderChallengePanel(session);
 
     if (status === "queued") {
       const total = Number(session.total || 0);
@@ -798,7 +1033,18 @@
       const phaseSuffix = phase ? ` (${phase})` : "";
       const hostSuffix = host ? ` @ ${host}` : "";
       const currentSuffix = current ? ` ${current}` : "";
-      setState(`Enriching websites ${processed}/${total}${phaseSuffix}${hostSuffix} pages ${siteVisited}/${siteDiscovered}...${currentSuffix}`);
+      const challengeSuffix = challengeWaitingCount > 0
+        ? ` | ${challengeWaitingCount} challenge${challengeWaitingCount === 1 ? "" : "s"} waiting`
+        : "";
+      const workerSuffix = runningWorkers > 0
+        ? ` | ${runningWorkers}${workerTarget > 0 ? `/${workerTarget}` : ""} worker${runningWorkers === 1 ? "" : "s"} ${challengeWaitingCount > 0 ? "still running" : "active"}`
+        : "";
+      setState(`Enriching websites ${processed}/${total}${phaseSuffix}${hostSuffix} pages ${siteVisited}/${siteDiscovered}...${currentSuffix}${challengeSuffix}${workerSuffix}`);
+    } else if (status === "waiting") {
+      const total = Number(session.total || 0);
+      const processed = Number(session.processed || 0);
+      setState(`Paused: solve ${challengeWaitingCount || 1} challenge${challengeWaitingCount === 1 ? "" : "s"} to continue (${processed}/${total})`);
+      setLeadSignal("CAPTCHA needs your attention", "warn");
     } else if (status === "stopping") {
       setState("Stopping enrichment...");
       setLeadSignal("Stop requested", "warn");
@@ -824,6 +1070,7 @@
       setError(normalizeText(session.error) || "Website enrichment failed");
       setState("Enrichment failed");
       setLeadSignal("Enrichment failed", "warn");
+      renderChallengePanel(null);
     }
 
     setRunningState(isBusy());
@@ -904,16 +1151,39 @@
 
     if (runtimeState) {
       enrichRunning = true;
+      const runtimeStatus = normalizeText(runtimeState.status).toLowerCase() || "running";
+      const patchedSession = {
+        ...(lastEnrichSession && typeof lastEnrichSession === "object" ? lastEnrichSession : {}),
+        run_id: normalizeText(runtimeState.run_id) || normalizeText(lastEnrichSession && lastEnrichSession.run_id),
+        source_run_id: normalizeText(runtimeState.source_run_id) || normalizeText(lastEnrichSession && lastEnrichSession.source_run_id),
+        status: runtimeStatus,
+        active_workers: Math.max(0, Number(runtimeState.active_workers || 0)),
+        running_workers: Math.max(
+          0,
+          Number(runtimeState.running_workers != null ? runtimeState.running_workers : runtimeState.active_workers || 0)
+        ),
+        worker_target: Math.max(0, Number(runtimeState.worker_target || 0)),
+        challenge_waiting_count: Math.max(0, Number(runtimeState.challenge_waiting_count || 0)),
+        challenge_tabs: Array.isArray(runtimeState.challenge_tabs) ? runtimeState.challenge_tabs : [],
+        current: normalizeText(runtimeState.current || (lastEnrichSession && lastEnrichSession.current)),
+        current_url: normalizeText(runtimeState.current_url || (lastEnrichSession && lastEnrichSession.current_url)),
+        phase: normalizeText(runtimeState.phase || (lastEnrichSession && lastEnrichSession.phase) || runtimeStatus),
+        updated_at: new Date().toISOString(),
+        lead_signal_text: runtimeStatus === "waiting"
+          ? "CAPTCHA needs your attention"
+          : normalizeText(lastEnrichSession && lastEnrichSession.lead_signal_text) || "Website enrichment is still running",
+        lead_signal_tone: runtimeStatus === "waiting"
+          ? "warn"
+          : normalizeText(lastEnrichSession && lastEnrichSession.lead_signal_tone) || "info"
+      };
+      lastEnrichSession = patchedSession;
+      applyEnrichSession(patchedSession);
       setRunningState(isBusy());
-      const currentStateText = normalizeText(el.stateText && el.stateText.textContent);
-      if (!currentStateText || /^idle$/i.test(currentStateText)) {
-        setState("Enriching websites...");
-      }
       return true;
     }
 
     const staleStatus = normalizeText(lastEnrichSession && lastEnrichSession.status).toLowerCase();
-    if (staleStatus === "running" || staleStatus === "stopping") {
+    if (staleStatus === "queued" || staleStatus === "running" || staleStatus === "waiting" || staleStatus === "stopping") {
       const patchedSession = {
         ...(lastEnrichSession || {}),
         status: "stopped",
@@ -1366,6 +1636,14 @@
     return "unified_only";
   }
 
+  function normalizeChallengeHandlingMode(value) {
+    const normalized = normalizeText(value).toLowerCase();
+    if (normalized === "skip_immediately" || normalized === "auto_then_skip" || normalized === "auto_then_wait") {
+      return normalized;
+    }
+    return ENRICH_CHALLENGE_MODE_WAIT;
+  }
+
   function getDisabledGoalColumnsSet() {
     const blocked = new Set();
     if (!contactGoalEmailEnabled) {
@@ -1656,6 +1934,86 @@
     schedulePersistUiSettings();
   }
 
+  function onEnrichWorkerCountChange() {
+    enrichWorkerCountValue = clampInt(el.enrichWorkerCount && el.enrichWorkerCount.value, 1, 6, ENRICH_WORKER_DEFAULT);
+    storageSet({ enrichWorkerCount: enrichWorkerCountValue }).catch(() => {});
+    updateChallengeSettingsHint();
+  }
+
+  function onChallengeHandlingModeChange() {
+    challengeHandlingModeValue = normalizeChallengeHandlingMode(el.challengeHandlingMode && el.challengeHandlingMode.value);
+    storageSet({ challengeHandlingMode: challengeHandlingModeValue }).catch(() => {});
+    updateChallengeSettingsHint();
+  }
+
+  function onChallengeContinueWorkersChange() {
+    challengeContinueWorkersValue = clampInt(el.challengeContinueWorkers && el.challengeContinueWorkers.value, 0, 2, ENRICH_CHALLENGE_CONTINUE_DEFAULT);
+    storageSet({ challengeContinueWorkers: challengeContinueWorkersValue }).catch(() => {});
+    updateChallengeSettingsHint();
+  }
+
+  function updateChallengeSettingsHint() {
+    if (!el.challengeSettingsHint) return;
+    if (challengeHandlingModeValue === "skip_immediately") {
+      el.challengeSettingsHint.textContent = "Challenges are skipped immediately. The run stays fully automatic.";
+      return;
+    }
+    if (challengeHandlingModeValue === "auto_then_skip") {
+      el.challengeSettingsHint.textContent = "Scrapify will try the checkbox once, then skip challenged tabs automatically.";
+      return;
+    }
+    el.challengeSettingsHint.textContent = `Scrapify will try once, then wait for you. While waiting it may keep ${challengeContinueWorkersValue} more worker${challengeContinueWorkersValue === 1 ? "" : "s"} running.`;
+  }
+
+  async function onChallengeListClick(event) {
+    const target = event && event.target && typeof event.target.closest === "function"
+      ? event.target.closest("button[data-action]")
+      : null;
+    if (!target) return;
+
+    const action = normalizeText(target.dataset.action);
+    const tabId = Number(target.dataset.tabId);
+    const actionGroup = typeof target.closest === "function" ? target.closest(".challenge-actions") : null;
+    const peerButtons = actionGroup ? Array.from(actionGroup.querySelectorAll("button[data-action]")) : [target];
+
+    clearError();
+    for (const button of peerButtons) {
+      button.disabled = true;
+    }
+
+    try {
+      if (!Number.isFinite(tabId)) {
+        throw new Error("Challenge tab is no longer available");
+      }
+
+      if (action === "focus-challenge") {
+        const response = await sendRuntimeMessage({
+          type: MSG.FOCUS_ENRICH_CHALLENGE_TAB,
+          tabId
+        });
+        if (!response || response.ok !== true) {
+          throw new Error((response && response.error) || "Could not focus challenge tab");
+        }
+        setLeadSignal("Challenge tab focused", "info");
+      } else if (action === "skip-challenge") {
+        const response = await sendRuntimeMessage({
+          type: MSG.SKIP_ENRICH_CHALLENGE,
+          tabId
+        });
+        if (!response || response.ok !== true) {
+          throw new Error((response && response.error) || "Could not skip challenged tab");
+        }
+        setLeadSignal("Challenge skipped", "warn");
+      }
+    } catch (error) {
+      setError(error && error.message ? error.message : "Challenge action failed");
+    } finally {
+      for (const button of peerButtons) {
+        button.disabled = false;
+      }
+    }
+  }
+
   function onRequireEmailForLeadsToggle() {
     requireEmailForLeadsEnabled = !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false;
     storageSet({ requireEmailForLeadsEnabled }).catch(() => {});
@@ -1687,6 +2045,9 @@
   async function persistRunSettingsForBackground() {
     enrichmentEnabled = el.enableEnrichment.checked === true;
     showEnrichmentTabsEnabled = enrichmentEnabled && el.showEnrichmentTabs.checked === true;
+    enrichWorkerCountValue = clampInt(el.enrichWorkerCount && el.enrichWorkerCount.value, 1, 6, ENRICH_WORKER_DEFAULT);
+    challengeHandlingModeValue = normalizeChallengeHandlingMode(el.challengeHandlingMode && el.challengeHandlingMode.value);
+    challengeContinueWorkersValue = clampInt(el.challengeContinueWorkers && el.challengeContinueWorkers.value, 0, 2, ENRICH_CHALLENGE_CONTINUE_DEFAULT);
     requireEmailForLeadsEnabled = !el.requireEmailForLeads || el.requireEmailForLeads.checked !== false;
     const leadDiscoveryEnabled = shouldEnableLeadDiscoveryForSelection();
     contactGoalEmailEnabled = el.contactGoalEmail && el.contactGoalEmail.checked === true;
@@ -1705,6 +2066,9 @@
     await storageSet({
       enrichmentEnabled,
       showEnrichmentTabsEnabled,
+      enrichWorkerCount: enrichWorkerCountValue,
+      challengeHandlingMode: challengeHandlingModeValue,
+      challengeContinueWorkers: challengeContinueWorkersValue,
       requireEmailForLeadsEnabled,
       leadDiscoveryEnabled,
       contactGoalEmailEnabled,
@@ -1724,6 +2088,15 @@
     if (el.showEnrichmentTabs) {
       el.showEnrichmentTabs.disabled = !enabled;
     }
+    if (el.enrichWorkerCount) {
+      el.enrichWorkerCount.disabled = !enabled;
+    }
+    if (el.challengeHandlingMode) {
+      el.challengeHandlingMode.disabled = !enabled;
+    }
+    if (el.challengeContinueWorkers) {
+      el.challengeContinueWorkers.disabled = !enabled || challengeHandlingModeValue !== ENRICH_CHALLENGE_MODE_WAIT;
+    }
 
     if (!enabled) {
       showEnrichmentTabsEnabled = false;
@@ -1739,6 +2112,7 @@
     if (el.showEnrichmentTabs) {
       el.showEnrichmentTabs.checked = showEnrichmentTabsEnabled === true;
     }
+    updateChallengeSettingsHint();
   }
 
   function syncInfiniteScrollInput() {
@@ -2164,6 +2538,7 @@
     enrichRunning = true;
     setRunningState(isBusy());
     setState("Enriching websites...");
+    focusStatusAreaForRun();
 
     try {
       const enrichResponse = await sendRuntimeMessage({
@@ -2199,7 +2574,10 @@
             googlePages: 3,
             linkedinPages: 0,
             yelpPages: 0
-          }
+          },
+          maxConcurrentWorkers: clampInt(el.enrichWorkerCount && el.enrichWorkerCount.value, 1, 6, ENRICH_WORKER_DEFAULT),
+          challengeHandlingMode: normalizeChallengeHandlingMode(el.challengeHandlingMode && el.challengeHandlingMode.value),
+          challengeContinueWorkers: clampInt(el.challengeContinueWorkers && el.challengeContinueWorkers.value, 0, 2, ENRICH_CHALLENGE_CONTINUE_DEFAULT)
         }
       });
 

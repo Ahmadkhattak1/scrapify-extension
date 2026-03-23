@@ -20,7 +20,10 @@ const ENRICHMENT_SETTINGS_KEYS = [
   "showEnrichmentTabsEnabled",
   "leadDiscoveryEnabled",
   "contactGoalEmailEnabled",
-  "contactGoalPhoneEnabled"
+  "contactGoalPhoneEnabled",
+  "enrichWorkerCount",
+  "challengeHandlingMode",
+  "challengeContinueWorkers"
 ];
 const RESULTS_PAGE_PATH = "results.html";
 const CONTROL_PANEL_PATH = "popup.html";
@@ -39,6 +42,13 @@ const ACTION_RUNNING_COLOR = "#127a3e";
 const ACTION_STOPPING_COLOR = "#b54708";
 const FOCUSED_CRAWL_MAX_PAGES = 8;
 const FOCUSED_CRAWL_MAX_PATHS_PER_TYPE = 2;
+const ENRICH_WORKER_DEFAULT = 3;
+const ENRICH_WORKER_MAX = 6;
+const ENRICH_CHALLENGE_CONTINUE_DEFAULT = 1;
+const ENRICH_CHALLENGE_CONTINUE_MAX = 2;
+const ENRICH_CHALLENGE_MODE_WAIT = "auto_then_wait";
+const ENRICH_CHALLENGE_MODE_SKIP = "auto_then_skip";
+const ENRICH_CHALLENGE_MODE_SKIP_IMMEDIATE = "skip_immediately";
 const FOCUSED_CRAWL_SEED_PATHS = [
   "/contact",
   "/about",
@@ -121,6 +131,396 @@ function safeSendResponse(sendResponse, payload) {
   }
 }
 
+function normalizeChallengeMode(value) {
+  const mode = normalizeText(value).toLowerCase();
+  if (mode === ENRICH_CHALLENGE_MODE_SKIP_IMMEDIATE) return ENRICH_CHALLENGE_MODE_SKIP_IMMEDIATE;
+  if (mode === ENRICH_CHALLENGE_MODE_SKIP) return ENRICH_CHALLENGE_MODE_SKIP;
+  return ENRICH_CHALLENGE_MODE_WAIT;
+}
+
+function serializeChallengeEntry(entry) {
+  const challenge = entry && typeof entry === "object" ? entry : {};
+  return {
+    id: normalizeText(challenge.id),
+    tab_id: Number.isFinite(Number(challenge.tabId)) ? Number(challenge.tabId) : null,
+    worker_id: normalizeText(challenge.workerId),
+    host: normalizeText(challenge.host),
+    url: normalizeText(challenge.url),
+    phase: normalizeText(challenge.phase),
+    source: normalizeText(challenge.source),
+    current: normalizeText(challenge.currentName),
+    status: normalizeText(challenge.status || "awaiting_user"),
+    scope: normalizeText(challenge.scope),
+    detected_at: normalizeText(challenge.detectedAt),
+    updated_at: normalizeText(challenge.updatedAt || challenge.detectedAt)
+  };
+}
+
+function getRunChallengeEntries(runControl, statusFilter) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  if (!run || !(run.challenges instanceof Map)) return [];
+  const filter = normalizeText(statusFilter).toLowerCase();
+  return Array.from(run.challenges.values())
+    .filter((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      if (!filter) return true;
+      return normalizeText(entry.status).toLowerCase() === filter;
+    })
+    .sort((left, right) => {
+      const leftAt = normalizeText(left && left.detectedAt);
+      const rightAt = normalizeText(right && right.detectedAt);
+      return leftAt.localeCompare(rightAt);
+    });
+}
+
+function countRunWaitingChallenges(runControl) {
+  return getRunChallengeEntries(runControl, "awaiting_user").length;
+}
+
+function countRunRunningWorkers(runControl) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  if (!run || !(run.workerStates instanceof Map)) return 0;
+  let count = 0;
+  for (const state of run.workerStates.values()) {
+    if (!state || normalizeText(state.status).toLowerCase() === "waiting") continue;
+    count += 1;
+  }
+  return count;
+}
+
+function countRunActiveWorkers(runControl) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  return run && run.workerStates instanceof Map ? run.workerStates.size : 0;
+}
+
+function serializeRunChallenges(runControl) {
+  return getRunChallengeEntries(runControl, "awaiting_user")
+    .slice(0, 4)
+    .map(serializeChallengeEntry);
+}
+
+function getPrimaryWorkerState(runControl) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  if (!run || !(run.workerStates instanceof Map)) return null;
+  const running = Array.from(run.workerStates.values()).find((state) => normalizeText(state && state.status).toLowerCase() !== "waiting");
+  if (running) return running;
+  const waiting = Array.from(run.workerStates.values()).find(Boolean);
+  return waiting || null;
+}
+
+function updateEnrichWorkerState(runControl, workerId, patchInput) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  const id = normalizeText(workerId);
+  if (!run || !id || !(run.workerStates instanceof Map)) return null;
+  const patch = patchInput && typeof patchInput === "object" ? patchInput : {};
+  const existing = run.workerStates.get(id) || { workerId: id, status: "running" };
+  const next = {
+    ...existing,
+    ...patch,
+    workerId: id,
+    status: normalizeText(patch.status || existing.status || "running") || "running",
+    tabId: patch.tabId != null
+      ? (Number.isFinite(Number(patch.tabId)) ? Number(patch.tabId) : null)
+      : (Number.isFinite(Number(existing.tabId)) ? Number(existing.tabId) : null),
+    currentName: patch.currentName != null ? normalizeText(patch.currentName) : normalizeText(existing.currentName),
+    currentUrl: patch.currentUrl != null ? normalizeText(patch.currentUrl) : normalizeText(existing.currentUrl),
+    phase: patch.phase != null ? normalizeText(patch.phase) : normalizeText(existing.phase),
+    sitePagesVisited: Number.isFinite(Number(patch.sitePagesVisited)) ? Number(patch.sitePagesVisited) : Number(existing.sitePagesVisited || 0),
+    sitePagesDiscovered: Number.isFinite(Number(patch.sitePagesDiscovered)) ? Number(patch.sitePagesDiscovered) : Number(existing.sitePagesDiscovered || 0),
+    socialScanned: Number.isFinite(Number(patch.socialScanned)) ? Number(patch.socialScanned) : Number(existing.socialScanned || 0)
+  };
+  run.workerStates.set(id, next);
+  return next;
+}
+
+function removeEnrichWorkerState(runControl, workerId) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  const id = normalizeText(workerId);
+  if (!run || !id || !(run.workerStates instanceof Map)) return;
+  run.workerStates.delete(id);
+}
+
+function focusTabById(tabId) {
+  return new Promise((resolve, reject) => {
+    const normalizedTabId = Number(tabId);
+    if (!Number.isFinite(normalizedTabId)) {
+      reject(new Error("Challenge tab was not found"));
+      return;
+    }
+
+    chrome.tabs.get(normalizedTabId, (tab) => {
+      if (chrome.runtime.lastError || !tab || !Number.isFinite(Number(tab.id))) {
+        reject(new Error(chrome.runtime.lastError && chrome.runtime.lastError.message
+          ? chrome.runtime.lastError.message
+          : "Challenge tab was not found"));
+        return;
+      }
+
+      const windowId = Number(tab.windowId);
+      const activateTab = () => {
+        chrome.tabs.update(normalizedTabId, { active: true }, () => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message || "Failed to focus challenge tab"));
+            return;
+          }
+          resolve({ ok: true, tabId: normalizedTabId, windowId });
+        });
+      };
+
+      if (Number.isFinite(windowId)) {
+        chrome.windows.update(windowId, { focused: true, state: "normal" }, () => {
+          activateTab();
+        });
+        return;
+      }
+
+      activateTab();
+    });
+  });
+}
+
+function recordEnrichChallenge(runControl, detailsInput) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  const details = detailsInput && typeof detailsInput === "object" ? detailsInput : {};
+  if (!run || !(run.challenges instanceof Map)) return null;
+
+  const tabId = Number.isFinite(Number(details.tabId)) ? Number(details.tabId) : null;
+  const existing = Array.from(run.challenges.values()).find((entry) => Number(entry && entry.tabId) === tabId);
+  const nowIso = new Date().toISOString();
+  if (existing) {
+    existing.status = "awaiting_user";
+    existing.updatedAt = nowIso;
+    existing.phase = normalizeText(details.phase || existing.phase);
+    existing.source = normalizeText(details.source || existing.source);
+    existing.currentName = normalizeText(details.currentName || existing.currentName);
+    existing.url = normalizeText(details.url || existing.url);
+    existing.host = normalizeText(details.host || existing.host);
+    existing.scope = normalizeText(details.scope || existing.scope);
+    return existing;
+  }
+
+  run.nextChallengeId = Number(run.nextChallengeId || 0) + 1;
+  const id = `challenge_${run.nextChallengeId}`;
+  const entry = {
+    id,
+    workerId: normalizeText(details.workerId),
+    tabId,
+    url: normalizeText(details.url),
+    host: normalizeText(details.host),
+    phase: normalizeText(details.phase),
+    source: normalizeText(details.source || "site"),
+    scope: normalizeText(details.scope || "host"),
+    currentName: normalizeText(details.currentName),
+    status: "awaiting_user",
+    detectedAt: nowIso,
+    updatedAt: nowIso,
+    skipRequested: false
+  };
+  run.challenges.set(id, entry);
+
+  if (!(run.challengeEvents instanceof Array)) {
+    run.challengeEvents = [];
+  }
+  const nowMs = Date.now();
+  run.challengeEvents.push(nowMs);
+  run.challengeEvents = run.challengeEvents.filter((value) => nowMs - Number(value) <= 180000);
+  if (run.challengeEvents.length >= 3) {
+    run.pauseAllNewWork = true;
+  } else if (run.challengeEvents.length >= 2) {
+    run.currentWorkerTarget = Math.min(Number(run.currentWorkerTarget || ENRICH_WORKER_DEFAULT), 1);
+  } else {
+    run.currentWorkerTarget = Math.min(Number(run.currentWorkerTarget || ENRICH_WORKER_DEFAULT), 2);
+  }
+  if (entry.source === "google" || entry.source === "directory") {
+    run.providerPause = {
+      ...(run.providerPause && typeof run.providerPause === "object" ? run.providerPause : {}),
+      google: true
+    };
+  }
+  return entry;
+}
+
+function resolveEnrichChallenge(runControl, entryInput, nextStatus) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  const entry = entryInput && typeof entryInput === "object" ? entryInput : null;
+  if (!run || !entry || !(run.challenges instanceof Map)) return;
+  entry.status = normalizeText(nextStatus || "cleared") || "cleared";
+  entry.updatedAt = new Date().toISOString();
+  run.challenges.delete(entry.id);
+  const googlePaused = getRunChallengeEntries(run).some((item) => {
+    const source = normalizeText(item && item.source).toLowerCase();
+    const status = normalizeText(item && item.status).toLowerCase();
+    return status === "awaiting_user" && (source === "google" || source === "directory");
+  });
+  run.providerPause = {
+    ...(run.providerPause && typeof run.providerPause === "object" ? run.providerPause : {}),
+    google: googlePaused
+  };
+}
+
+function selectChallengeEntry(runControl, tabIdInput) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  if (!run) return null;
+  const tabId = Number.isFinite(Number(tabIdInput)) ? Number(tabIdInput) : null;
+  const challenges = getRunChallengeEntries(run, "awaiting_user");
+  if (tabId == null) {
+    return challenges[0] || null;
+  }
+  return challenges.find((entry) => Number(entry && entry.tabId) === tabId) || null;
+}
+
+function selectProviderPauseChallenge(runControl, providerInput) {
+  const provider = normalizeText(providerInput).toLowerCase();
+  if (!provider) return null;
+  return getRunChallengeEntries(runControl, "awaiting_user").find((entry) => {
+    const source = normalizeText(entry && entry.source).toLowerCase();
+    return provider === "google" ? source === "google" || source === "directory" : source === provider;
+  }) || null;
+}
+
+function scheduleEnrichPump(runControl) {
+  const run = runControl && typeof runControl === "object" ? runControl : null;
+  if (!run || typeof run.pump !== "function" || run.pumpScheduled === true) return;
+  run.pumpScheduled = true;
+  Promise.resolve().then(() => {
+    run.pumpScheduled = false;
+    run.pump();
+  });
+}
+
+async function waitForPausedProvider(providerInput, optionsInput) {
+  const provider = normalizeText(providerInput).toLowerCase();
+  const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
+  const onProviderPause = typeof options.onProviderPause === "function" ? options.onProviderPause : null;
+  let notified = false;
+
+  while (true) {
+    const run = activeEnrichRun;
+    if (!run || !(run.providerPause && run.providerPause[provider] === true)) {
+      if (notified && onProviderPause) {
+        onProviderPause(null, false);
+      }
+      return;
+    }
+    if (isEnrichStopRequested(options)) {
+      throw createEnrichStopError();
+    }
+    const activeChallenge = selectProviderPauseChallenge(run, provider);
+    if (!activeChallenge) {
+      run.providerPause[provider] = false;
+      if (notified && onProviderPause) {
+        onProviderPause(null, false);
+      }
+      return;
+    }
+    if (!notified && onProviderPause) {
+      onProviderPause(activeChallenge, true);
+      notified = true;
+    }
+    await sleep(1200);
+  }
+}
+
+async function handleEnrichChallengeRequest(detailsInput) {
+  const details = detailsInput && typeof detailsInput === "object" ? detailsInput : {};
+  const run = activeEnrichRun;
+  const mode = normalizeChallengeMode(details.mode || (run && run.challengeMode));
+  if (!run || mode === ENRICH_CHALLENGE_MODE_SKIP_IMMEDIATE || mode === ENRICH_CHALLENGE_MODE_SKIP) {
+    return { action: "skip", entry: null };
+  }
+
+  const tabId = Number.isFinite(Number(details.tabId)) ? Number(details.tabId) : null;
+  if (!Number.isFinite(tabId)) {
+    return { action: "skip", entry: null };
+  }
+
+  const workerId = normalizeText(details.workerId);
+  const entry = recordEnrichChallenge(run, {
+    workerId,
+    tabId,
+    url: normalizeText(details.url),
+    host: normalizeText(details.host),
+    phase: normalizeText(details.phase || "challenge_waiting"),
+    source: normalizeText(details.source || "site"),
+    scope: normalizeText(details.scope || (/(google|directory)/i.test(normalizeText(details.source)) ? "provider" : "host")),
+    currentName: normalizeText(details.currentName)
+  });
+  if (!entry) {
+    return { action: "skip", entry: null };
+  }
+  if (countRunWaitingChallenges(run) === 1) {
+    void getControlPanelAnchorWindowId()
+      .catch(() => null)
+      .then((anchorWindowId) => {
+        openOrFocusControlPanel(anchorWindowId);
+      });
+  }
+
+  let action = "skip";
+  updateEnrichWorkerState(run, workerId, {
+    status: "waiting",
+    tabId,
+    currentName: normalizeText(details.currentName),
+    currentUrl: normalizeText(details.url),
+    phase: "challenge_waiting"
+  });
+  if (typeof details.onAwaiting === "function") {
+    try {
+      details.onAwaiting(entry);
+    } catch (_error) {
+      // Ignore progress hook failures.
+    }
+  }
+  scheduleEnrichPump(run);
+
+  try {
+    while (true) {
+      if (run.stopRequested === true || (typeof details.shouldStop === "function" && details.shouldStop() === true)) {
+        throw createEnrichStopError();
+      }
+      if (entry.skipRequested === true) {
+        action = "skip";
+        return { action, entry };
+      }
+
+      const tabExists = await new Promise((resolve) => {
+        chrome.tabs.get(tabId, (tab) => {
+          resolve(!(chrome.runtime.lastError || !tab));
+        });
+      });
+      if (!tabExists) {
+        action = "skip";
+        return { action, entry };
+      }
+
+      const probe = await executeExtractionOnce(tabId, {
+        currentUrl: normalizeText(details.url)
+      }).catch(() => null);
+      if (probe && probe.blocked !== true) {
+        action = "resume";
+        return { action, entry };
+      }
+
+      await sleep(clampInt(details.pollMs, 600, 4000, 1500));
+    }
+  } finally {
+    resolveEnrichChallenge(run, entry, action === "resume" ? "cleared" : "skipped");
+    updateEnrichWorkerState(run, workerId, {
+      status: "running",
+      phase: normalizeText(details.resumePhase || details.phase || "site_page"),
+      currentUrl: normalizeText(details.url)
+    });
+    if (typeof details.onResolved === "function") {
+      try {
+        details.onResolved(entry, action);
+      } catch (_error) {
+        // Ignore progress hook failures.
+      }
+    }
+    scheduleEnrichPump(run);
+  }
+}
+
 function normalizeSessionStatus(value) {
   const status = normalizeText(value).toLowerCase();
   if (!status) return "idle";
@@ -143,7 +543,7 @@ function tabMatchesCurrentContext(tab) {
 
 function isActiveStatus(status) {
   const value = normalizeSessionStatus(status);
-  return value === "running" || value === "stopping" || value === "queued";
+  return value === "running" || value === "waiting" || value === "stopping" || value === "queued";
 }
 
 function isStoppingStatus(status) {
@@ -427,6 +827,46 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === MSG.FOCUS_ENRICH_CHALLENGE_TAB) {
+    const run = activeEnrichRun;
+    const challenge = selectChallengeEntry(run, message.tabId);
+    if (!challenge || !Number.isFinite(Number(challenge.tabId))) {
+      safeSendResponse(sendResponse, {
+        ok: false,
+        error: "No challenged tab is waiting for attention"
+      });
+      return false;
+    }
+    focusTabById(challenge.tabId)
+      .then(() => {
+        safeSendResponse(sendResponse, { ok: true, tab_id: challenge.tabId });
+      })
+      .catch((error) => {
+        safeSendResponse(sendResponse, {
+          ok: false,
+          error: error && error.message ? error.message : "Failed to focus challenge tab"
+        });
+      });
+    return true;
+  }
+
+  if (message.type === MSG.SKIP_ENRICH_CHALLENGE) {
+    const run = activeEnrichRun;
+    const challenge = selectChallengeEntry(run, message.tabId);
+    if (!challenge) {
+      safeSendResponse(sendResponse, {
+        ok: false,
+        error: "No challenged tab is waiting for attention"
+      });
+      return false;
+    }
+    challenge.skipRequested = true;
+    challenge.updatedAt = new Date().toISOString();
+    scheduleEnrichPump(run);
+    safeSendResponse(sendResponse, { ok: true, tab_id: challenge.tabId });
+    return false;
+  }
+
   if (message.type === MSG.OPEN_RESULTS_VIEWER) {
     openOrFocusResultsPage(normalizeText(message.runId));
     safeSendResponse(sendResponse, { ok: true });
@@ -572,17 +1012,44 @@ function getEnrichRuntimeState() {
       status: "idle",
       stop_requested: false,
       scan_tab_id: null,
-      source_run_id: ""
+      scan_tab_ids: [],
+      source_run_id: "",
+      active_workers: 0,
+      running_workers: 0,
+      worker_target: 0,
+      challenge_waiting_count: 0,
+      challenge_tabs: [],
+      current: "",
+      current_url: "",
+      phase: ""
     };
   }
+
+  const waitingChallenges = serializeRunChallenges(activeEnrichRun);
+  const primaryWorker = getPrimaryWorkerState(activeEnrichRun);
 
   return {
     is_running: true,
     run_id: normalizeText(activeEnrichRun.runId),
-    status: activeEnrichRun.stopRequested === true ? "stopping" : "running",
+    status: activeEnrichRun.stopRequested === true
+      ? "stopping"
+      : waitingChallenges.length > 0 && countRunRunningWorkers(activeEnrichRun) === 0 ? "waiting" : "running",
     stop_requested: activeEnrichRun.stopRequested === true,
-    scan_tab_id: Number.isFinite(Number(activeEnrichRun.scanTabId)) ? Number(activeEnrichRun.scanTabId) : null,
-    source_run_id: normalizeText(activeEnrichRun.sourceRunId)
+    scan_tab_id: Number.isFinite(Number(primaryWorker && primaryWorker.tabId))
+      ? Number(primaryWorker.tabId)
+      : Number.isFinite(Number(activeEnrichRun.scanTabId)) ? Number(activeEnrichRun.scanTabId) : null,
+    scan_tab_ids: Array.from(activeEnrichRun.workerStates instanceof Map ? activeEnrichRun.workerStates.values() : [])
+      .map((state) => Number(state && state.tabId))
+      .filter((tabId) => Number.isFinite(tabId)),
+    source_run_id: normalizeText(activeEnrichRun.sourceRunId),
+    active_workers: countRunActiveWorkers(activeEnrichRun),
+    running_workers: countRunRunningWorkers(activeEnrichRun),
+    worker_target: Number(activeEnrichRun.currentWorkerTarget || activeEnrichRun.maxWorkerTarget || ENRICH_WORKER_DEFAULT),
+    challenge_waiting_count: waitingChallenges.length,
+    challenge_tabs: waitingChallenges,
+    current: normalizeText(primaryWorker && primaryWorker.currentName),
+    current_url: normalizeText(primaryWorker && primaryWorker.currentUrl),
+    phase: normalizeText(primaryWorker && primaryWorker.phase)
   };
 }
 
@@ -603,6 +1070,14 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
   const persistSession = meta.persistSession !== false;
   const sharedRegistryKey = normalizeText(meta.sharedRegistryKey);
   const shouldAutoOpenOnTerminal = reason === "auto_after_scrape";
+  const maxWorkerTarget = clampInt(options.maxConcurrentWorkers, 1, ENRICH_WORKER_MAX, ENRICH_WORKER_DEFAULT);
+  const challengeMode = normalizeChallengeMode(options.challengeHandlingMode);
+  const challengeContinueWorkers = clampInt(
+    options.challengeContinueWorkers,
+    0,
+    ENRICH_CHALLENGE_CONTINUE_MAX,
+    ENRICH_CHALLENGE_CONTINUE_DEFAULT
+  );
   const runControl = {
     runId,
     sourceRunId,
@@ -610,7 +1085,20 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
     startedAt,
     stopRequested: false,
     scanTabId: null,
-    persistSession
+    persistSession,
+    workerStates: new Map(),
+    challenges: new Map(),
+    nextChallengeId: 0,
+    challengeEvents: [],
+    maxWorkerTarget,
+    currentWorkerTarget: maxWorkerTarget,
+    challengeMode,
+    challengeContinueWorkers,
+    pauseAllNewWork: false,
+    providerPause: { google: false },
+    latestRows: rows.map((row) => (row && typeof row === "object" ? { ...row } : row)),
+    pump: null,
+    pumpScheduled: false
   };
 
   activeEnrichRun = runControl;
@@ -643,6 +1131,11 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
         discovery_attempted: 0,
         discovery_website_recovered: 0,
         discovery_email_recovered: 0,
+        active_workers: 0,
+        running_workers: 0,
+        worker_target: maxWorkerTarget,
+        challenge_waiting_count: 0,
+        challenge_tabs: [],
         current: "",
         current_url: "",
         phase: "init",
@@ -669,6 +1162,9 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
       contactGoals,
       leadDiscoveryEnabled,
       discoverySources,
+      maxConcurrentWorkers: maxWorkerTarget,
+      challengeHandlingMode: challengeMode,
+      challengeContinueWorkers,
       websiteHostOwners: sharedRegistryKey ? getSharedInlineWebsiteOwnerRegistry(sharedRegistryKey) : null,
       shouldStop: () => runControl.stopRequested === true,
       onScanTabChange: (tabId) => {
@@ -702,6 +1198,11 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
           started_at: startedAt,
           completed_at: new Date().toISOString(),
           ...result.summary,
+          active_workers: 0,
+          running_workers: 0,
+          worker_target: maxWorkerTarget,
+          challenge_waiting_count: 0,
+          challenge_tabs: [],
           phase: stopped ? "stopped" : "done",
           lead_signal_text: stopped ? "Enrichment stopped by user" : "Website enrichment completed",
           lead_signal_tone: stopped ? "warn" : "success"
@@ -727,6 +1228,11 @@ async function startEnrichRun(rowsInput, optionsInput, metaInput) {
           started_at: startedAt,
           completed_at: new Date().toISOString(),
           error: error && error.message ? error.message : "Website enrichment failed",
+          active_workers: 0,
+          running_workers: 0,
+          worker_target: maxWorkerTarget,
+          challenge_waiting_count: 0,
+          challenge_tabs: [],
           phase: "error"
         },
         false
@@ -761,25 +1267,46 @@ function handleStopEnrich(sendResponse) {
     anyStopping: true,
     title: `${ACTION_DEFAULT_TITLE} (enrichment stopping)`
   });
+  const tabIds = new Set();
   const runningTabId = Number(run.scanTabId);
   if (Number.isFinite(runningTabId)) {
-    closeTab(runningTabId).catch(() => {});
+    tabIds.add(runningTabId);
+  }
+  if (run.workerStates instanceof Map) {
+    for (const state of run.workerStates.values()) {
+      const tabId = Number(state && state.tabId);
+      if (Number.isFinite(tabId)) {
+        tabIds.add(tabId);
+      }
+    }
+  }
+  for (const tabId of tabIds) {
+    closeTab(tabId).catch(() => {});
   }
 
   if (run.persistSession !== false) {
-    saveEnrichSession(
+    const latestRows = Array.isArray(run.latestRows) ? run.latestRows : null;
+    const persistStopSnapshot = saveEnrichSession(
       {
         run_id: run.runId,
         status: "stopping",
         phase: "stopping",
+        active_workers: countRunActiveWorkers(run),
+        running_workers: countRunRunningWorkers(run),
+        worker_target: Number(run.currentWorkerTarget || run.maxWorkerTarget || ENRICH_WORKER_DEFAULT),
+        challenge_waiting_count: countRunWaitingChallenges(run),
+        challenge_tabs: serializeRunChallenges(run),
         lead_signal_text: "Stop requested",
         lead_signal_tone: "warn"
       },
-      false
+      Array.isArray(latestRows),
+      latestRows
     ).catch(() => {});
 
     // User stop should surface partial results immediately.
-    maybeAutoOpenResultsForRun(normalizeText(run.sourceRunId) || normalizeText(run.runId), { force: true });
+    persistStopSnapshot.finally(() => {
+      maybeAutoOpenResultsForRun(normalizeText(run.sourceRunId) || normalizeText(run.runId), { force: true });
+    });
   }
 
   safeSendResponse(sendResponse, {
@@ -950,6 +1477,14 @@ async function readEnrichmentSettings() {
     maxPagesPerSite: FOCUSED_CRAWL_MAX_PAGES,
     visibleTabs: data.showEnrichmentTabsEnabled === true,
     leadDiscoveryEnabled,
+    maxConcurrentWorkers: clampInt(data.enrichWorkerCount, 1, ENRICH_WORKER_MAX, ENRICH_WORKER_DEFAULT),
+    challengeHandlingMode: normalizeChallengeMode(data.challengeHandlingMode),
+    challengeContinueWorkers: clampInt(
+      data.challengeContinueWorkers,
+      0,
+      ENRICH_CHALLENGE_CONTINUE_MAX,
+      ENRICH_CHALLENGE_CONTINUE_DEFAULT
+    ),
     contactGoals,
     discoverySources: {
       google: leadDiscoveryEnabled,
@@ -1566,8 +2101,9 @@ function mergeStoredSocialLinks(existingValue, additionsInput) {
   return Array.from(merged).join(" | ");
 }
 
-async function enrichRows(rows, options) {
+async function enrichRowsSerial(rows, options) {
   const config = options && typeof options === "object" ? options : {};
+  const progressReporter = typeof config.progressReporter === "function" ? config.progressReporter : emitEnrichProgress;
   const maxPagesPerSite = FOCUSED_CRAWL_MAX_PAGES;
   const timeoutMs = clampInt(config.timeoutMs, 5000, 30000, 12000);
   const visibleTabs = config.visibleTabs === true;
@@ -1575,6 +2111,10 @@ async function enrichRows(rows, options) {
   const maxSocialPages = clampInt(config.maxSocialPages, 0, 8, 4);
   const maxDiscoveredPages = clampInt(config.maxDiscoveredPages, maxPagesPerSite, 240, Math.max(80, maxPagesPerSite * 5));
   const discovery = normalizeDiscoveryOptions(config);
+  const rowOffset = Number.isFinite(Number(config.rowOffset)) && Number(config.rowOffset) >= 0
+    ? Number(config.rowOffset)
+    : 0;
+  const runControl = activeEnrichRun;
 
   const summary = {
     total: rows.length,
@@ -1594,6 +2134,12 @@ async function enrichRows(rows, options) {
     stopped: false
   };
   const websiteHostOwners = config.websiteHostOwners instanceof Map ? config.websiteHostOwners : new Map();
+  const persistPartialRow = (index, row) => {
+    if (!runControl || !Array.isArray(runControl.latestRows)) return;
+    const targetIndex = rowOffset + index;
+    if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= runControl.latestRows.length) return;
+    runControl.latestRows[targetIndex] = row && typeof row === "object" ? { ...row } : row;
+  };
 
   const outputRows = [];
   let resumeIndex = rows.length;
@@ -1602,7 +2148,7 @@ async function enrichRows(rows, options) {
     if (isEnrichStopRequested(config)) {
       summary.stopped = true;
       resumeIndex = index;
-      emitEnrichProgress(summary, {
+      progressReporter(summary, {
         phase: "stopping",
         leadSignalText: "Stop requested",
         leadSignalTone: "warn",
@@ -1646,7 +2192,8 @@ async function enrichRows(rows, options) {
       summary.enriched += 1;
       summary.processed += 1;
       outputRows.push(enrichedRow);
-      emitEnrichProgress(summary, {
+      persistPartialRow(index, enrichedRow);
+      progressReporter(summary, {
         currentName: sourceRow.name,
         currentUrl: rowCurrentUrl,
         phase: "skip",
@@ -1662,7 +2209,7 @@ async function enrichRows(rows, options) {
       const overrides = overridesInput && typeof overridesInput === "object" ? overridesInput : {};
       const rowIntent = deriveGoalScanIntent(enrichedRow, contactGoals);
       const phaseInit = phasePrefix === "discovery" ? "discovery_site_init" : "site_init";
-      emitEnrichProgress(summary, {
+      progressReporter(summary, {
         currentName: sourceRow.name,
         currentUrl: targetUrl,
         phase: phaseInit,
@@ -1690,11 +2237,13 @@ async function enrichRows(rows, options) {
         seedSocialLinks: Array.isArray(overrides.seedSocialLinks) ? overrides.seedSocialLinks : sourceSocialLinks,
         shouldStop: config.shouldStop,
         onTabChange: config.onScanTabChange,
+        onChallenge: config.onChallenge,
+        onProviderPause: config.onProviderPause,
         onProgress: (scanProgress) => {
           const progress = scanProgress || {};
           const rawPhase = normalizeText(progress.phase || "site_scan");
           const nextPhase = phasePrefix === "discovery" ? `discovery_${rawPhase}` : rawPhase;
-          emitEnrichProgress(summary, {
+          progressReporter(summary, {
             currentName: sourceRow.name,
             currentUrl: progress.currentUrl || targetUrl,
             phase: nextPhase,
@@ -1766,7 +2315,9 @@ async function enrichRows(rows, options) {
           timeoutMs,
           visibleTabs,
           shouldStop: config.shouldStop,
-          onScanTabChange: config.onScanTabChange
+          onScanTabChange: config.onScanTabChange,
+          onChallenge: config.onChallenge,
+          onProviderPause: config.onProviderPause
         });
         if (discoveryResult.attempted) {
           summary.discovery_attempted += 1;
@@ -1806,7 +2357,8 @@ async function enrichRows(rows, options) {
         summary.skipped += 1;
         summary.processed += 1;
         outputRows.push(enrichedRow);
-        emitEnrichProgress(summary, {
+        persistPartialRow(index, enrichedRow);
+        progressReporter(summary, {
           currentName: sourceRow.name,
           currentUrl: rowCurrentUrl,
           phase: "skip",
@@ -1873,7 +2425,7 @@ async function enrichRows(rows, options) {
         contactGoals.email === true &&
         normalizeText(enrichedRow.primary_email_source).toLowerCase() !== "facebook";
       if (shouldLookupFacebookOutsideWebsite) {
-        emitEnrichProgress(summary, {
+        progressReporter(summary, {
           currentName: sourceRow.name,
           currentUrl: rowCurrentUrl,
           phase: "facebook_lookup",
@@ -1886,7 +2438,9 @@ async function enrichRows(rows, options) {
           timeoutMs,
           visibleTabs,
           shouldStop: config.shouldStop,
-          onScanTabChange: config.onScanTabChange
+          onScanTabChange: config.onScanTabChange,
+          onChallenge: config.onChallenge,
+          onProviderPause: config.onProviderPause
         });
         const confirmedFacebook = normalizeFacebookProfileUrl(facebookLookup.confirmedUrl);
         const possibleFacebook = normalizeFacebookProfileUrl(facebookLookup.possibleUrl);
@@ -1935,6 +2489,8 @@ async function enrichRows(rows, options) {
           visibleTabs,
           shouldStop: config.shouldStop,
           onScanTabChange: config.onScanTabChange,
+          onChallenge: config.onChallenge,
+          onProviderPause: config.onProviderPause,
           existingWebsite: website
         });
         if (discoveryResult.attempted) {
@@ -1974,7 +2530,7 @@ async function enrichRows(rows, options) {
 
       const shouldLookupOwner = discovery.enabled === true && !normalizeText(enrichedRow.owner_name);
       if (shouldLookupOwner) {
-        emitEnrichProgress(summary, {
+        progressReporter(summary, {
           currentName: sourceRow.name,
           currentUrl: rowCurrentUrl,
           phase: "owner_lookup",
@@ -1987,7 +2543,9 @@ async function enrichRows(rows, options) {
             timeoutMs,
             visibleTabs,
             shouldStop: config.shouldStop,
-            onScanTabChange: config.onScanTabChange
+            onScanTabChange: config.onScanTabChange,
+            onChallenge: config.onChallenge,
+            onProviderPause: config.onProviderPause
           });
           if (ownerRecovery && ownerRecovery.found) {
             enrichedRow.owner_name = normalizeText(ownerRecovery.ownerName);
@@ -2039,7 +2597,8 @@ async function enrichRows(rows, options) {
         summary.stopped = true;
         resumeIndex = index + 1;
         outputRows.push(enrichedRow);
-        emitEnrichProgress(summary, {
+        persistPartialRow(index, enrichedRow);
+        progressReporter(summary, {
           currentName: sourceRow.name,
           currentUrl: rowCurrentUrl,
           phase: "stopped",
@@ -2071,8 +2630,9 @@ async function enrichRows(rows, options) {
 
     summary.processed += 1;
     outputRows.push(enrichedRow);
+    persistPartialRow(index, enrichedRow);
     const leadSignal = buildLeadSignal(enrichedRow);
-    emitEnrichProgress(summary, {
+    progressReporter(summary, {
       currentName: sourceRow.name,
       currentUrl: rowCurrentUrl,
       phase: "done",
@@ -2086,6 +2646,252 @@ async function enrichRows(rows, options) {
   if (summary.stopped && resumeIndex < rows.length) {
     for (const remaining of rows.slice(resumeIndex)) {
       outputRows.push(remaining || {});
+    }
+  }
+
+  return {
+    rows: outputRows,
+    summary
+  };
+}
+
+async function enrichRows(rows, options) {
+  const config = options && typeof options === "object" ? options : {};
+  const summary = {
+    total: rows.length,
+    processed: 0,
+    enriched: 0,
+    skipped: 0,
+    blocked: 0,
+    errors: 0,
+    social_scanned: 0,
+    pages_visited: 0,
+    pages_discovered: 0,
+    personal_email_found: 0,
+    company_email_found: 0,
+    discovery_attempted: 0,
+    discovery_website_recovered: 0,
+    discovery_email_recovered: 0,
+    stopped: false
+  };
+  const outputRows = new Array(rows.length);
+  const runControl = activeEnrichRun;
+  const maxWorkers = clampInt(config.maxConcurrentWorkers, 1, ENRICH_WORKER_MAX, ENRICH_WORKER_DEFAULT);
+  if (!runControl || maxWorkers <= 1 || rows.length <= 1) {
+    return await enrichRowsSerial(rows, config);
+  }
+
+  runControl.maxWorkerTarget = maxWorkers;
+  runControl.currentWorkerTarget = Math.min(Number(runControl.currentWorkerTarget || maxWorkers), maxWorkers);
+
+  const mergeSummary = (rowSummaryInput) => {
+    const rowSummary = rowSummaryInput && typeof rowSummaryInput === "object" ? rowSummaryInput : {};
+    summary.processed += Number(rowSummary.processed || 0);
+    summary.enriched += Number(rowSummary.enriched || 0);
+    summary.skipped += Number(rowSummary.skipped || 0);
+    summary.blocked += Number(rowSummary.blocked || 0);
+    summary.errors += Number(rowSummary.errors || 0);
+    summary.social_scanned += Number(rowSummary.social_scanned || 0);
+    summary.pages_visited += Number(rowSummary.pages_visited || 0);
+    summary.pages_discovered += Number(rowSummary.pages_discovered || 0);
+    summary.personal_email_found += Number(rowSummary.personal_email_found || 0);
+    summary.company_email_found += Number(rowSummary.company_email_found || 0);
+    summary.discovery_attempted += Number(rowSummary.discovery_attempted || 0);
+    summary.discovery_website_recovered += Number(rowSummary.discovery_website_recovered || 0);
+    summary.discovery_email_recovered += Number(rowSummary.discovery_email_recovered || 0);
+    summary.stopped = summary.stopped || rowSummary.stopped === true;
+  };
+
+  const sumWorkerMetric = (key) => {
+    if (!(runControl.workerStates instanceof Map)) return 0;
+    let total = 0;
+    for (const state of runControl.workerStates.values()) {
+      total += Number(state && state[key] || 0);
+    }
+    return total;
+  };
+
+  let nextIndex = 0;
+  let pendingError = null;
+  let resolveDone = null;
+  let rejectDone = null;
+  const donePromise = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+
+  const maybeFinish = () => {
+    if (pendingError) return;
+    if (countRunActiveWorkers(runControl) !== 0) return;
+    if (!summary.stopped && nextIndex < rows.length) return;
+    resolveDone();
+  };
+
+  const launchRow = (index) => {
+    const sourceRow = rows[index] || {};
+    const workerId = `worker_${index}_${Math.random().toString(36).slice(2, 7)}`;
+    const progressReporter = (rowSummaryInput, contextInput) => {
+      const rowSummary = rowSummaryInput && typeof rowSummaryInput === "object" ? rowSummaryInput : {};
+      const context = contextInput && typeof contextInput === "object" ? contextInput : {};
+      const nextStatus = normalizeText(context.phase).toLowerCase() === "challenge_waiting" ? "waiting" : "running";
+      updateEnrichWorkerState(runControl, workerId, {
+        status: nextStatus,
+        currentName: sourceRow.name,
+        currentUrl: normalizeText(context.currentUrl || sourceRow.website || sourceRow.listing_facebook),
+        phase: normalizeText(context.phase),
+        sitePagesVisited: Number(rowSummary.pages_visited || 0),
+        sitePagesDiscovered: Number(rowSummary.pages_discovered || 0),
+        socialScanned: Number(rowSummary.social_scanned || 0)
+      });
+      emitEnrichProgress(summary, {
+        currentName: sourceRow.name,
+        currentUrl: normalizeText(context.currentUrl || sourceRow.website || sourceRow.listing_facebook),
+        phase: normalizeText(context.phase),
+        leadSignalText: normalizeText(context.leadSignalText),
+        leadSignalTone: normalizeText(context.leadSignalTone),
+        sitePagesVisited: summary.pages_visited + sumWorkerMetric("sitePagesVisited"),
+        sitePagesDiscovered: summary.pages_discovered + sumWorkerMetric("sitePagesDiscovered"),
+        socialScanned: summary.social_scanned + sumWorkerMetric("socialScanned")
+      });
+    };
+    const handleRowChallenge = async (detailsInput) => {
+      const details = detailsInput && typeof detailsInput === "object" ? detailsInput : {};
+      const challengeUrl = normalizeText(details.currentUrl || sourceRow.website || sourceRow.listing_facebook);
+      return await handleEnrichChallengeRequest({
+        ...details,
+        workerId,
+        currentName: sourceRow.name,
+        currentUrl: challengeUrl,
+        shouldStop: config.shouldStop,
+        onAwaiting: () => {
+          emitEnrichProgress(summary, {
+            currentName: sourceRow.name,
+            currentUrl: challengeUrl,
+            phase: "challenge_waiting",
+            leadSignalText: "CAPTCHA needs your attention",
+            leadSignalTone: "warn",
+            sitePagesVisited: summary.pages_visited + sumWorkerMetric("sitePagesVisited"),
+            sitePagesDiscovered: summary.pages_discovered + sumWorkerMetric("sitePagesDiscovered"),
+            socialScanned: summary.social_scanned + sumWorkerMetric("socialScanned")
+          });
+        },
+        onResolved: (_entry, action) => {
+          emitEnrichProgress(summary, {
+            currentName: sourceRow.name,
+            currentUrl: challengeUrl,
+            phase: action === "resume" ? "challenge_cleared" : "challenge_skipped",
+            leadSignalText: action === "resume" ? "Challenge cleared, resuming" : "Challenge skipped",
+            leadSignalTone: action === "resume" ? "info" : "warn",
+            sitePagesVisited: summary.pages_visited + sumWorkerMetric("sitePagesVisited"),
+            sitePagesDiscovered: summary.pages_discovered + sumWorkerMetric("sitePagesDiscovered"),
+            socialScanned: summary.social_scanned + sumWorkerMetric("socialScanned")
+          });
+        }
+      });
+    };
+    const handleProviderPause = (challengeEntry, waiting) => {
+      updateEnrichWorkerState(runControl, workerId, {
+        status: waiting === true ? "waiting" : "running",
+        currentName: sourceRow.name,
+        currentUrl: normalizeText(challengeEntry && challengeEntry.url) || normalizeText(sourceRow.website),
+        phase: waiting === true ? "challenge_waiting" : "provider_resumed"
+      });
+    };
+
+    updateEnrichWorkerState(runControl, workerId, {
+      status: "running",
+      currentName: sourceRow.name,
+      currentUrl: normalizeText(sourceRow.website || sourceRow.listing_facebook),
+      phase: "queued",
+      tabId: null,
+      sitePagesVisited: 0,
+      sitePagesDiscovered: 0,
+      socialScanned: 0
+    });
+
+    enrichRowsSerial([sourceRow], {
+      ...config,
+      rowOffset: index,
+      progressReporter,
+      onScanTabChange: (tabId) => {
+        updateEnrichWorkerState(runControl, workerId, {
+          tabId,
+          currentName: sourceRow.name,
+          currentUrl: normalizeText(sourceRow.website || sourceRow.listing_facebook),
+          phase: "site_open",
+          status: "running"
+        });
+        if (typeof config.onScanTabChange === "function") {
+          config.onScanTabChange(tabId);
+        }
+      },
+      onChallenge: handleRowChallenge,
+      onProviderPause: handleProviderPause
+    })
+      .then((result) => {
+        const rowResult = result && Array.isArray(result.rows) && result.rows.length > 0 ? result.rows[0] : sourceRow;
+        outputRows[index] = rowResult || {};
+        mergeSummary(result && result.summary);
+        const leadSignal = buildLeadSignal(rowResult || {});
+        emitEnrichProgress(summary, {
+          currentName: sourceRow.name,
+          currentUrl: normalizeText((rowResult && rowResult.website) || sourceRow.website || sourceRow.listing_facebook),
+          phase: summary.stopped ? "stopped" : "done",
+          leadSignalText: leadSignal.text,
+          leadSignalTone: leadSignal.tone,
+          sitePagesVisited: summary.pages_visited + sumWorkerMetric("sitePagesVisited"),
+          sitePagesDiscovered: summary.pages_discovered + sumWorkerMetric("sitePagesDiscovered"),
+          socialScanned: summary.social_scanned + sumWorkerMetric("socialScanned")
+        });
+      })
+      .catch((error) => {
+        pendingError = error;
+        rejectDone(error);
+      })
+      .finally(() => {
+        removeEnrichWorkerState(runControl, workerId);
+        if (summary.stopped || isEnrichStopRequested(config)) {
+          summary.stopped = true;
+        }
+        scheduleEnrichPump(runControl);
+        maybeFinish();
+      });
+  };
+
+  const pump = () => {
+    if (pendingError) return;
+    if (summary.stopped || isEnrichStopRequested(config)) {
+      summary.stopped = true;
+      maybeFinish();
+      return;
+    }
+
+    while (nextIndex < rows.length) {
+      const runningLimit = Math.max(0, Number(runControl.pauseAllNewWork === true ? 0 : runControl.currentWorkerTarget || maxWorkers));
+      const waitingCount = countRunWaitingChallenges(runControl);
+      const waitingAllowance = clampInt(runControl.challengeContinueWorkers, 0, ENRICH_CHALLENGE_CONTINUE_MAX, ENRICH_CHALLENGE_CONTINUE_DEFAULT);
+      const totalBudget = Math.max(1, runningLimit + Math.min(waitingAllowance, waitingCount));
+      if (countRunActiveWorkers(runControl) >= totalBudget || countRunRunningWorkers(runControl) >= runningLimit) {
+        break;
+      }
+      launchRow(nextIndex);
+      nextIndex += 1;
+    }
+
+    if (nextIndex >= rows.length) {
+      maybeFinish();
+    }
+  };
+
+  runControl.pump = pump;
+  pump();
+  await donePromise;
+
+  if (summary.stopped) {
+    for (let index = 0; index < rows.length; index += 1) {
+      if (outputRows[index] == null) {
+        outputRows[index] = rows[index] || {};
+      }
     }
   }
 
@@ -2118,6 +2924,11 @@ function emitEnrichProgress(summary, context) {
   if (!activeRun || activeRun.persistSession === false) {
     return;
   }
+  const waitingChallenges = serializeRunChallenges(activeRun);
+  const primaryWorker = getPrimaryWorkerState(activeRun);
+  const currentName = normalizeText(ctx.currentName || (primaryWorker && primaryWorker.currentName));
+  const currentUrl = normalizeText(ctx.currentUrl || (primaryWorker && primaryWorker.currentUrl));
+  const currentPhase = normalizeText(ctx.phase || (primaryWorker && primaryWorker.phase));
   const payload = {
     type: MSG.ENRICH_PROGRESS,
     run_id: normalizeText(activeRun && activeRun.runId),
@@ -2138,25 +2949,35 @@ function emitEnrichProgress(summary, context) {
     discovery_attempted: Number(summary.discovery_attempted || 0),
     discovery_website_recovered: Number(summary.discovery_website_recovered || 0),
     discovery_email_recovered: Number(summary.discovery_email_recovered || 0),
-    current: normalizeText(ctx.currentName),
-    current_url: normalizeText(ctx.currentUrl),
-    phase: normalizeText(ctx.phase),
+    active_workers: countRunActiveWorkers(activeRun),
+    running_workers: countRunRunningWorkers(activeRun),
+    worker_target: Number(activeRun.currentWorkerTarget || activeRun.maxWorkerTarget || ENRICH_WORKER_DEFAULT),
+    challenge_waiting_count: waitingChallenges.length,
+    challenge_tabs: waitingChallenges,
+    current: currentName,
+    current_url: currentUrl,
+    phase: currentPhase,
     lead_signal_text: normalizeText(ctx.leadSignalText),
     lead_signal_tone: normalizeText(ctx.leadSignalTone)
   };
 
   const now = Date.now();
-  const phase = normalizeText(ctx.phase).toLowerCase();
+  const phase = currentPhase.toLowerCase();
   const forcePersist = /^(done|skip|error|stopping|stopped)$/.test(phase);
-  const progressStatus = phase === "stopping" || phase === "stopped" ? "stopping" : "running";
+  const runningWorkers = countRunRunningWorkers(activeRun);
+  const progressStatus = phase === "stopping" || phase === "stopped"
+    ? "stopping"
+    : waitingChallenges.length > 0 && runningWorkers === 0 ? "waiting" : "running";
   if (forcePersist || now - lastEnrichPersistAtMs >= 350) {
     lastEnrichPersistAtMs = now;
+    const latestRows = Array.isArray(activeRun.latestRows) ? activeRun.latestRows : null;
     saveEnrichSession(
       {
         status: progressStatus,
         ...payload
       },
-      false
+      forcePersist && Array.isArray(latestRows),
+      latestRows
     );
   }
 }
@@ -2299,7 +3120,9 @@ async function runLeadDiscovery(row, optionsInput) {
     visibleTabs,
     maxResults: clampInt(budget.googlePages, 1, 3, 3),
     shouldStop: options.shouldStop,
-    onScanTabChange: options.onScanTabChange
+    onScanTabChange: options.onScanTabChange,
+    onChallenge: options.onChallenge,
+    onProviderPause: options.onProviderPause
   };
 
   try {
@@ -2336,6 +3159,8 @@ async function runLeadDiscovery(row, optionsInput) {
           maxPages: clampInt(budget.linkedinPages, 0, 8, 2),
           shouldStop: options.shouldStop,
           onScanTabChange: options.onScanTabChange,
+          onChallenge: options.onChallenge,
+          onProviderPause: options.onProviderPause,
           excludedHost: existingHost
         });
         if (linkedInWebsite) {
@@ -2356,6 +3181,8 @@ async function runLeadDiscovery(row, optionsInput) {
           maxPages: clampInt(budget.yelpPages, 0, 8, 2),
           shouldStop: options.shouldStop,
           onScanTabChange: options.onScanTabChange,
+          onChallenge: options.onChallenge,
+          onProviderPause: options.onProviderPause,
           excludedHost: existingHost
         });
         if (yelpWebsite) {
@@ -3156,7 +3983,9 @@ async function discoverFacebookViaGoogleSearch(row, optionsInput) {
       siteFilter: "facebook.com",
       includeDirectoryHosts: true,
       shouldStop: options.shouldStop,
-      onScanTabChange: options.onScanTabChange
+      onScanTabChange: options.onScanTabChange,
+      onChallenge: options.onChallenge,
+      onProviderPause: options.onProviderPause
     });
 
     for (const candidate of googleCandidates) {
@@ -3170,10 +3999,17 @@ async function discoverFacebookViaGoogleSearch(row, optionsInput) {
           timeoutMs,
           visibleTabs,
           shouldStop: options.shouldStop,
-          onScanTabChange: options.onScanTabChange
+          onScanTabChange: options.onScanTabChange,
+          onChallenge: options.onChallenge,
+          challengeSource: "facebook",
+          challengePhase: "facebook_lookup_page"
         },
         (tabId, extractionTimeout) => executeExtraction(tabId, extractionTimeout, {
-          parseSourceHtml: false
+          parseSourceHtml: false,
+          currentUrl: normalizedUrl,
+          onChallenge: options.onChallenge,
+          challengeSource: "facebook",
+          challengePhase: "facebook_lookup_page"
         })
       ).catch(() => null);
       if (!pageData) continue;
@@ -3261,7 +4097,9 @@ async function recoverOwnerViaGoogle(row, optionsInput) {
     maxResults: 3,
     includeDirectoryHosts: true,
     shouldStop: options.shouldStop,
-    onScanTabChange: options.onScanTabChange
+    onScanTabChange: options.onScanTabChange,
+    onChallenge: options.onChallenge,
+    onProviderPause: options.onProviderPause
   });
 
   const rankedCandidates = googleCandidates
@@ -3295,8 +4133,16 @@ async function recoverOwnerViaGoogle(row, optionsInput) {
       timeoutMs,
       visibleTabs,
       shouldStop: options.shouldStop,
-      onScanTabChange: options.onScanTabChange
-    }, executeExtraction).catch(() => null);
+      onScanTabChange: options.onScanTabChange,
+      onChallenge: options.onChallenge,
+      challengeSource: "google",
+      challengePhase: "owner_lookup_page"
+    }, (tabId, extractionTimeout) => executeExtraction(tabId, extractionTimeout, {
+      currentUrl: candidate.url,
+      onChallenge: options.onChallenge,
+      challengeSource: "google",
+      challengePhase: "owner_lookup_page"
+    })).catch(() => null);
     if (!pageData || !Array.isArray(pageData.ownerCandidates)) continue;
 
     const pageSemanticScore = scoreBusinessSemanticEvidence({
@@ -3369,7 +4215,9 @@ async function verifyPersonalEmailViaGoogle(input, optionsInput) {
     maxResults: 3,
     includeDirectoryHosts: true,
     shouldStop: options.shouldStop,
-    onScanTabChange: options.onScanTabChange
+    onScanTabChange: options.onScanTabChange,
+    onChallenge: options.onChallenge,
+    onProviderPause: options.onProviderPause
   });
 
   const topCandidates = candidates
@@ -3392,9 +4240,17 @@ async function verifyPersonalEmailViaGoogle(input, optionsInput) {
         timeoutMs,
         visibleTabs,
         shouldStop: options.shouldStop,
-        onScanTabChange: options.onScanTabChange
+        onScanTabChange: options.onScanTabChange,
+        onChallenge: options.onChallenge,
+        challengeSource: "google",
+        challengePhase: "email_verify_page"
       },
-      executeExtraction
+      (tabId, extractionTimeout) => executeExtraction(tabId, extractionTimeout, {
+        currentUrl: candidate.url,
+        onChallenge: options.onChallenge,
+        challengeSource: "google",
+        challengePhase: "email_verify_page"
+      })
     ).catch(() => null);
 
     if (!pageData) continue;
@@ -3444,11 +4300,20 @@ async function searchGoogleCandidates(query, optionsInput) {
     throw createEnrichStopError();
   }
 
+  await waitForPausedProvider("google", {
+    shouldStop: options.shouldStop,
+    onProviderPause: options.onProviderPause
+  });
+
   const searchQuery = siteFilter ? `site:${siteFilter} ${query}` : query;
   const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&num=10&hl=en`;
   const rawLinks = await openTabAndExtractLinks(searchUrl, {
     timeoutMs,
     visibleTabs,
+    attemptCaptchaPassThrough: true,
+    onChallenge: options.onChallenge,
+    challengeSource: "google",
+    challengePhase: "provider_search",
     shouldStop: options.shouldStop,
     onScanTabChange: options.onScanTabChange
   }, (tabId) => executeGoogleResultsExtraction(tabId, maxResults));
@@ -3500,7 +4365,9 @@ async function discoverPointerWebsite(provider, query, row, optionsInput) {
     siteFilter: siteQuery,
     includeDirectoryHosts: true,
     shouldStop: options.shouldStop,
-    onScanTabChange: options.onScanTabChange
+    onScanTabChange: options.onScanTabChange,
+    onChallenge: options.onChallenge,
+    onProviderPause: options.onProviderPause
   });
 
   for (const page of directoryPages) {
@@ -3521,8 +4388,12 @@ async function discoverPointerWebsite(provider, query, row, optionsInput) {
     const extractedLinks = await openTabAndExtractLinks(pageUrl, {
       timeoutMs,
       visibleTabs,
+      attemptCaptchaPassThrough: true,
       shouldStop: options.shouldStop,
-      onScanTabChange: options.onScanTabChange
+      onScanTabChange: options.onScanTabChange,
+      onChallenge: options.onChallenge,
+      challengeSource: "directory",
+      challengePhase: "directory_lookup"
     }, executeDirectoryResultsExtraction);
 
     const candidates = [];
@@ -3700,6 +4571,10 @@ async function openTabAndExtractLinks(url, optionsInput, extractFn) {
   const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
   const timeoutMs = clampInt(options.timeoutMs, 5000, 30000, 12000);
   const visibleTabs = options.visibleTabs === true;
+  const attemptCaptchaPassThrough = options.attemptCaptchaPassThrough === true;
+  const onChallenge = typeof options.onChallenge === "function" ? options.onChallenge : null;
+  const challengeSource = normalizeText(options.challengeSource || "google") || "google";
+  const challengePhase = normalizeText(options.challengePhase || "provider_search") || "provider_search";
   let tab = null;
 
   try {
@@ -3716,11 +4591,53 @@ async function openTabAndExtractLinks(url, optionsInput, extractFn) {
       throw createEnrichStopError();
     }
     await sleep(700);
-    const links = await promiseWithTimeout(
+    const runExtract = () => promiseWithTimeout(
       Promise.resolve(extractFn(tab.id, timeoutMs)),
       timeoutMs,
       "Timed out while extracting links"
     );
+    const maybeWaitOnChallenge = async () => {
+      if (!onChallenge) return false;
+      const probe = await executeExtractionOnce(tab.id, { currentUrl: url }).catch(() => null);
+      if (!probe || probe.blocked !== true) return false;
+      const resolution = await onChallenge({
+        tabId: tab.id,
+        currentUrl: url,
+        source: challengeSource,
+        phase: challengePhase,
+        host: hostnameForUrl(url)
+      });
+      return Boolean(resolution && resolution.action === "resume");
+    };
+    let links = [];
+    try {
+      links = await runExtract();
+    } catch (extractError) {
+      if (!attemptCaptchaPassThrough) {
+        throw extractError;
+      }
+      const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
+      if (!captchaAttempt.clicked) {
+        const resumed = await maybeWaitOnChallenge();
+        if (resumed) {
+          links = await runExtract();
+          return Array.isArray(links) ? links : [];
+        }
+        throw extractError;
+      }
+      links = await runExtract();
+    }
+    if (attemptCaptchaPassThrough && (!Array.isArray(links) || links.length === 0)) {
+      const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
+      if (captchaAttempt.clicked) {
+        links = await runExtract();
+      } else {
+        const resumed = await maybeWaitOnChallenge();
+        if (resumed) {
+          links = await runExtract();
+        }
+      }
+    }
     return Array.isArray(links) ? links : [];
   } finally {
     if (typeof options.onScanTabChange === "function") {
@@ -3736,6 +4653,10 @@ async function openTabAndExtractData(url, optionsInput, extractFn) {
   const options = optionsInput && typeof optionsInput === "object" ? optionsInput : {};
   const timeoutMs = clampInt(options.timeoutMs, 5000, 30000, 12000);
   const visibleTabs = options.visibleTabs === true;
+  const attemptCaptchaPassThrough = options.attemptCaptchaPassThrough === true;
+  const onChallenge = typeof options.onChallenge === "function" ? options.onChallenge : null;
+  const challengeSource = normalizeText(options.challengeSource || "site") || "site";
+  const challengePhase = normalizeText(options.challengePhase || "page_extract") || "page_extract";
   let tab = null;
 
   try {
@@ -3751,11 +4672,53 @@ async function openTabAndExtractData(url, optionsInput, extractFn) {
       throw createEnrichStopError();
     }
     await sleep(700);
-    return await promiseWithTimeout(
+    const runExtract = () => promiseWithTimeout(
       Promise.resolve(extractFn(tab.id, timeoutMs)),
       timeoutMs,
       "Timed out while extracting page data"
     );
+    const maybeWaitOnChallenge = async () => {
+      if (!onChallenge) return false;
+      const probe = await executeExtractionOnce(tab.id, { currentUrl: url }).catch(() => null);
+      if (!probe || probe.blocked !== true) return false;
+      const resolution = await onChallenge({
+        tabId: tab.id,
+        currentUrl: url,
+        source: challengeSource,
+        phase: challengePhase,
+        host: hostnameForUrl(url)
+      });
+      return Boolean(resolution && resolution.action === "resume");
+    };
+    let data = null;
+    try {
+      data = await runExtract();
+    } catch (extractError) {
+      if (!attemptCaptchaPassThrough) {
+        throw extractError;
+      }
+      const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
+      if (!captchaAttempt.clicked) {
+        const resumed = await maybeWaitOnChallenge();
+        if (resumed) {
+          return await runExtract();
+        }
+        throw extractError;
+      }
+      return await runExtract();
+    }
+    if (attemptCaptchaPassThrough && !data) {
+      const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
+      if (captchaAttempt.clicked) {
+        data = await runExtract();
+      } else {
+        const resumed = await maybeWaitOnChallenge();
+        if (resumed) {
+          data = await runExtract();
+        }
+      }
+    }
+    return data;
   } finally {
     if (typeof options.onScanTabChange === "function") {
       options.onScanTabChange(null);
@@ -4392,7 +5355,8 @@ async function scanWebsite(startUrl, options) {
                 needsEmailNow &&
                 attempt === maxExtractAttempts - 1;
               extracted = await executeExtraction(tab.id, options.timeoutMs, {
-                parseSourceHtml: shouldParseSourceHtml
+                parseSourceHtml: shouldParseSourceHtml,
+                currentUrl: normalizedTarget
               });
               lastExtractionError = null;
             } catch (extractionError) {
@@ -4586,7 +5550,8 @@ async function scanWebsite(startUrl, options) {
         await sleep(800);
         const shouldParseSourceHtml = !socialRootScan && !searchRootScan && !directoryRootScan;
         pageData = await executeExtraction(tab.id, options.timeoutMs, {
-          parseSourceHtml: shouldParseSourceHtml
+          parseSourceHtml: shouldParseSourceHtml,
+          currentUrl: nextUrl
         });
       } catch (_sitePageError) {
         assertNotStopped();
@@ -6339,6 +7304,30 @@ function createHiddenScanTab(url) {
   });
 }
 
+const attemptedCaptchaClickKeys = new Set();
+
+function buildCaptchaAttemptKey(tabId, url) {
+  const tabKey = Number.isFinite(Number(tabId)) ? Number(tabId) : null;
+  const normalizedUrl = String(url || "").trim().replace(/#.*$/, "");
+  if (tabKey == null || !normalizedUrl) {
+    return "";
+  }
+  return `${tabKey}::${normalizedUrl}`;
+}
+
+function clearCaptchaAttemptKeysForTab(tabId) {
+  const tabKey = Number.isFinite(Number(tabId)) ? Number(tabId) : null;
+  if (tabKey == null || attemptedCaptchaClickKeys.size === 0) {
+    return;
+  }
+  const prefix = `${tabKey}::`;
+  for (const key of Array.from(attemptedCaptchaClickKeys)) {
+    if (key.startsWith(prefix)) {
+      attemptedCaptchaClickKeys.delete(key);
+    }
+  }
+}
+
 function updateTabUrl(tabId, url) {
   return new Promise((resolve, reject) => {
     chrome.tabs.update(tabId, { url }, (tab) => {
@@ -6354,6 +7343,7 @@ function updateTabUrl(tabId, url) {
 function closeTab(tabId) {
   return new Promise((resolve, reject) => {
     chrome.tabs.remove(tabId, () => {
+      clearCaptchaAttemptKeysForTab(tabId);
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message || "Failed to close tab"));
         return;
@@ -6431,40 +7421,477 @@ function promiseWithTimeout(promise, timeoutMs, message) {
   });
 }
 
+function executeTabScript(target, func, args, errorMessage) {
+  return new Promise((resolve, reject) => {
+    chrome.scripting.executeScript(
+      {
+        target,
+        func,
+        args: Array.isArray(args) ? args : []
+      },
+      (results) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || errorMessage || "Failed to execute page script"));
+          return;
+        }
+        resolve(Array.isArray(results) ? results : []);
+      }
+    );
+  });
+}
+
+async function executeExtractionOnce(tabId, scriptOptions) {
+  const results = await executeTabScript(
+    { tabId },
+    extractPageDataScript,
+    [scriptOptions],
+    "Failed to scan website page"
+  );
+  if (!Array.isArray(results) || !results[0]) {
+    return null;
+  }
+  return results[0].result || null;
+}
+
+async function attemptCaptchaCheckboxOnce(tabId, timeoutMs) {
+  const challengeTimeoutMs = Number.isFinite(Number(timeoutMs))
+    ? clampInt(Math.min(Number(timeoutMs), 8000), 750, 8000, 3000)
+    : null;
+  const inspectTask = executeTabScript(
+    { tabId, allFrames: true },
+    captchaCheckboxScript,
+    ["scan"],
+    "Failed to inspect captcha checkbox"
+  );
+  const inspectResults = challengeTimeoutMs == null
+    ? await inspectTask
+    : await promiseWithTimeout(inspectTask, challengeTimeoutMs, "Timed out while inspecting captcha checkbox");
+  const candidates = (Array.isArray(inspectResults) ? inspectResults : [])
+    .map((entry) => ({
+      frameId: entry && Number.isFinite(Number(entry.frameId)) ? Number(entry.frameId) : null,
+      result: entry && entry.result && typeof entry.result === "object" ? entry.result : null
+    }))
+    .filter((entry) => entry.frameId != null && entry.result && entry.result.found === true)
+    .sort((left, right) => Number(right.result.score || 0) - Number(left.result.score || 0));
+
+  if (candidates.length === 0) {
+    return { attempted: false, clicked: false };
+  }
+
+  const bestCandidate = candidates[0];
+  const clickTask = executeTabScript(
+    { tabId, frameIds: [bestCandidate.frameId] },
+    captchaCheckboxScript,
+    ["click"],
+    "Failed to click captcha checkbox"
+  );
+  const clickResults = challengeTimeoutMs == null
+    ? await clickTask
+    : await promiseWithTimeout(clickTask, challengeTimeoutMs, "Timed out while clicking captcha checkbox");
+  const clickResult = Array.isArray(clickResults) && clickResults[0] && clickResults[0].result && typeof clickResults[0].result === "object"
+    ? clickResults[0].result
+    : null;
+
+  return {
+    attempted: Boolean(clickResult && clickResult.found === true),
+    clicked: Boolean(clickResult && clickResult.clicked === true)
+  };
+}
+
+async function maybeAttemptCaptchaPassThrough(tabId, currentUrl, timeoutMs) {
+  const effectiveTimeoutMs = Number.isFinite(Number(timeoutMs))
+    ? clampInt(timeoutMs, 1500, 120000, 12000)
+    : null;
+  const attemptKey = buildCaptchaAttemptKey(tabId, currentUrl);
+  if (attemptKey && attemptedCaptchaClickKeys.has(attemptKey)) {
+    return { attempted: true, clicked: false };
+  }
+
+  let captchaAttempt = { attempted: false, clicked: false };
+  try {
+    captchaAttempt = await attemptCaptchaCheckboxOnce(tabId, effectiveTimeoutMs);
+  } catch (_captchaAttemptError) {
+    captchaAttempt = { attempted: false, clicked: false };
+  }
+
+  if (attemptKey && captchaAttempt.attempted) {
+    attemptedCaptchaClickKeys.add(attemptKey);
+  }
+  if (!captchaAttempt.clicked) {
+    return captchaAttempt;
+  }
+
+  await sleep(1800);
+  if (effectiveTimeoutMs != null) {
+    const postClickWaitMs = clampInt(Math.min(effectiveTimeoutMs, 4000), 1200, 4000, 2500);
+    await waitForTabComplete(tabId, postClickWaitMs).catch(() => null);
+  }
+  await sleep(450);
+  return captchaAttempt;
+}
+
 function executeExtraction(tabId, timeoutMs, extractionOptions) {
   const scriptOptions = extractionOptions && typeof extractionOptions === "object"
     ? extractionOptions
     : {};
-  const task = new Promise((resolve, reject) => {
-    chrome.scripting.executeScript(
-      {
-        target: { tabId },
-        func: extractPageDataScript,
-        args: [scriptOptions]
-      },
-      (results) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message || "Failed to scan website page"));
-          return;
-        }
+  const onChallenge = typeof scriptOptions.onChallenge === "function" ? scriptOptions.onChallenge : null;
+  const effectiveTimeoutMs = timeoutMs == null
+    ? null
+    : clampInt(timeoutMs, 1500, 120000, 12000);
+  const task = (async () => {
+    const firstResult = await executeExtractionOnce(tabId, scriptOptions);
+    const wasBlocked = Boolean(firstResult && typeof firstResult === "object" && firstResult.blocked === true);
+    if (!wasBlocked) {
+      return firstResult;
+    }
 
-        if (!Array.isArray(results) || !results[0]) {
-          resolve(null);
-          return;
-        }
-
-        resolve(results[0].result || null);
-      }
+    const captchaAttempt = await maybeAttemptCaptchaPassThrough(
+      tabId,
+      scriptOptions.currentUrl,
+      effectiveTimeoutMs
     );
-  });
-  if (timeoutMs == null) {
+    if (!captchaAttempt.clicked) {
+      if (onChallenge) {
+        const resolution = await onChallenge({
+          tabId,
+          currentUrl: normalizeText(scriptOptions.currentUrl),
+          source: normalizeText(scriptOptions.challengeSource || "site"),
+          phase: normalizeText(scriptOptions.challengePhase || "page_extract"),
+          host: hostnameForUrl(scriptOptions.currentUrl)
+        });
+        if (resolution && resolution.action === "resume") {
+          const resumedResult = await executeExtractionOnce(tabId, scriptOptions);
+          return resumedResult || firstResult;
+        }
+      }
+      return firstResult;
+    }
+
+    const secondResult = await executeExtractionOnce(tabId, scriptOptions);
+    if (secondResult && secondResult.blocked === true && onChallenge) {
+      const resolution = await onChallenge({
+        tabId,
+        currentUrl: normalizeText(scriptOptions.currentUrl),
+        source: normalizeText(scriptOptions.challengeSource || "site"),
+        phase: normalizeText(scriptOptions.challengePhase || "page_extract"),
+        host: hostnameForUrl(scriptOptions.currentUrl)
+      });
+      if (resolution && resolution.action === "resume") {
+        const resumedResult = await executeExtractionOnce(tabId, scriptOptions);
+        return resumedResult || secondResult || firstResult;
+      }
+    }
+    return secondResult || firstResult;
+  })();
+  if (effectiveTimeoutMs == null) {
     return task;
   }
   return promiseWithTimeout(
     task,
-    clampInt(timeoutMs, 1500, 120000, 12000),
+    effectiveTimeoutMs,
     "Timed out while scanning website page"
   );
+}
+
+function captchaCheckboxScript(modeInput) {
+  const mode = modeInput === "click" ? "click" : "scan";
+  const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const lower = (value) => normalize(value).toLowerCase();
+
+  try {
+    const host = lower(window.location.hostname || "");
+    const path = lower(window.location.pathname || "");
+    const bodyText = lower(document.body ? String(document.body.innerText || "").slice(0, 2600) : "");
+    const signalText = `${lower(document.title || "")} ${path} ${bodyText}`;
+    const isCloudflareChallenge =
+      host.includes("challenges.cloudflare.com") ||
+      host.includes("cloudflare") ||
+      path.includes("/cdn-cgi/challenge-platform/");
+    const challengeHost = (
+      (host.includes("google.com") && path.includes("recaptcha")) ||
+      host.includes("recaptcha.net") ||
+      host.includes("hcaptcha.com") ||
+      isCloudflareChallenge ||
+      host.includes("turnstile") ||
+      host.includes("captcha")
+    );
+    const challengeText = /(captcha|verify(?: that)? you(?:'re| are)? human|not a robot|security check|attention required|cloudflare|challenge)/i.test(signalText);
+
+    const isVisible = (node) => {
+      if (!node || typeof node.getBoundingClientRect !== "function") return false;
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 12 || rect.height < 12) return false;
+      let style = null;
+      try {
+        style = window.getComputedStyle(node);
+      } catch (_error) {
+        style = null;
+      }
+      if (style) {
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0" || style.pointerEvents === "none") {
+          return false;
+        }
+      }
+      return rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+    };
+
+    const getRoots = () => {
+      const roots = [];
+      const queue = [document];
+      const seen = new Set();
+      while (queue.length > 0 && roots.length < 24) {
+        const root = queue.shift();
+        if (!root || seen.has(root)) continue;
+        seen.add(root);
+        roots.push(root);
+        if (typeof root.querySelectorAll !== "function") continue;
+        const elements = Array.from(root.querySelectorAll("*")).slice(0, 1200);
+        for (const element of elements) {
+          if (element && element.shadowRoot && !seen.has(element.shadowRoot)) {
+            queue.push(element.shadowRoot);
+          }
+        }
+      }
+      return roots;
+    };
+
+    const getDescriptor = (node) => {
+      if (!node) return "";
+      const className = typeof node.className === "string"
+        ? node.className
+        : (typeof node.getAttribute === "function" ? node.getAttribute("class") : "");
+      return lower([
+        node.id,
+        className,
+        typeof node.getAttribute === "function" ? node.getAttribute("name") : "",
+        typeof node.getAttribute === "function" ? node.getAttribute("data-testid") : "",
+        typeof node.getAttribute === "function" ? node.getAttribute("data-sitekey") : "",
+        typeof node.getAttribute === "function" ? node.getAttribute("aria-label") : "",
+        typeof node.getAttribute === "function" ? node.getAttribute("title") : "",
+        typeof node.getAttribute === "function" ? node.getAttribute("role") : "",
+        node.textContent
+      ].filter(Boolean).join(" "));
+    };
+
+    const isChecked = (node) => Boolean(
+      node &&
+      (
+        node.checked === true ||
+        lower(typeof node.getAttribute === "function" ? node.getAttribute("aria-checked") : "") === "true" ||
+        lower(typeof node.getAttribute === "function" ? node.getAttribute("data-checked") : "") === "true"
+      )
+    );
+
+    const resolveTargets = (node) => {
+      const targets = [];
+      const push = (candidate) => {
+        if (!candidate || targets.includes(candidate)) return;
+        targets.push(candidate);
+      };
+      push(node);
+      if (node && node.labels) {
+        for (const label of Array.from(node.labels).slice(0, 2)) {
+          push(label);
+        }
+      }
+      if (node && typeof node.closest === "function") {
+        push(node.closest("#recaptcha-anchor"));
+        push(node.closest("[role='checkbox']"));
+        push(node.closest("[id*='cf-' i]"));
+        push(node.closest("[class*='cf-' i]"));
+        push(node.closest("[class*='ctp-' i]"));
+        push(node.closest("[id*='turnstile' i]"));
+        push(node.closest("[class*='turnstile' i]"));
+        push(node.closest("label"));
+        push(node.closest("button,[role='button']"));
+        push(node.closest("[tabindex]"));
+      }
+      if (node && node.parentElement) {
+        push(node.parentElement);
+      }
+      return targets.filter(Boolean);
+    };
+
+    const selectors = [
+      ["#recaptcha-anchor", 140],
+      [".recaptcha-checkbox-border", 130],
+      ["[name*='cf-turnstile' i]", 145],
+      ["[id*='cf-turnstile' i]", 145],
+      ["[class*='cf-turnstile' i]", 145],
+      ["[id*='challenge-stage' i]", 142],
+      ["[class*='challenge-stage' i]", 142],
+      ["[id*='cf-challenge' i]", 140],
+      ["[class*='cf-challenge' i]", 140],
+      ["[class*='ctp-checkbox' i]", 150],
+      ["[class*='ctp-checkbox-label' i]", 152],
+      ["[class*='ctp-' i]", 130],
+      ["[id*='recaptcha' i]", 125],
+      ["[name*='recaptcha' i]", 125],
+      ["[id*='hcaptcha' i]", 125],
+      ["[id*='turnstile' i]", 125],
+      ["[class*='turnstile' i]", 120],
+      ["[id*='captcha' i]", 120],
+      ["[class*='captcha' i]", 115],
+      ["[role='checkbox'][aria-label*='robot' i]", 140],
+      ["[role='checkbox'][aria-label*='human' i]", 135],
+      ["[role='checkbox'][aria-label*='captcha' i]", 135],
+      ["input[type='checkbox'][aria-label*='robot' i]", 140],
+      ["input[type='checkbox'][aria-label*='human' i]", 135],
+      ["input[type='checkbox'][aria-label*='captcha' i]", 135],
+      ["[role='checkbox']", 40],
+      ["input[type='checkbox']", 35]
+    ];
+    const positiveText = /(recaptcha|hcaptcha|turnstile|captcha|cloudflare|human|robot|security check|verify|cf-turnstile|cf-challenge|challenge-stage|checking your browser|just a moment|ctp-)/i;
+    const cloudflareWidgetText = /(cf-turnstile|cf-challenge|challenge-stage|turnstile|ctp-|cloudflare)/i;
+    const negativeText = /(cookie|privacy|newsletter|marketing|terms|conditions|remember me|subscribe|mailing list)/i;
+    const candidates = new Map();
+
+    const registerCandidate = (node, baseScore) => {
+      for (const target of resolveTargets(node)) {
+        if (!isVisible(target) && !isVisible(node)) continue;
+        const descriptor = `${getDescriptor(node)} ${getDescriptor(target)}`;
+        let score = baseScore;
+        if (challengeHost) score += 80;
+        if (isCloudflareChallenge) score += 35;
+        if (challengeText) score += 40;
+        if (positiveText.test(descriptor)) score += 50;
+        if (cloudflareWidgetText.test(descriptor)) score += 65;
+        if (negativeText.test(descriptor)) score -= 120;
+        if (isChecked(node) || isChecked(target)) score -= 140;
+
+        const rect = typeof target.getBoundingClientRect === "function" ? target.getBoundingClientRect() : null;
+        if (rect && rect.width <= 80 && rect.height <= 80) score += 12;
+        if (typeof target.matches === "function" && target.matches("#recaptcha-anchor, [role='checkbox'], input[type='checkbox'], label, button, [role='button']")) {
+          score += 15;
+        }
+
+        const existing = candidates.get(target);
+        if (!existing || score > existing.score) {
+          candidates.set(target, {
+            target,
+            score
+          });
+        }
+      }
+    };
+
+    const roots = getRoots();
+    for (const root of roots) {
+      if (!root || typeof root.querySelectorAll !== "function") continue;
+      for (const [selector, baseScore] of selectors) {
+        const nodes = Array.from(root.querySelectorAll(selector)).slice(0, 60);
+        for (const node of nodes) {
+          registerCandidate(node, baseScore);
+        }
+      }
+    }
+
+    const rankedCandidates = Array.from(candidates.values())
+      .filter((candidate) => Number(candidate.score || 0) >= 60)
+      .sort((left, right) => Number(right.score || 0) - Number(left.score || 0));
+
+    if (rankedCandidates.length === 0) {
+      return {
+        found: false,
+        clicked: false,
+        score: 0,
+        host,
+        challengeHost,
+        challengeText
+      };
+    }
+
+    const bestCandidate = rankedCandidates[0].target;
+    if (mode !== "click") {
+      return {
+        found: true,
+        clicked: false,
+        score: rankedCandidates[0].score,
+        host,
+        challengeHost,
+        challengeText
+      };
+    }
+
+    try {
+      if (typeof bestCandidate.scrollIntoView === "function") {
+        bestCandidate.scrollIntoView({ block: "center", inline: "center" });
+      }
+    } catch (_scrollError) {
+      // Ignore scroll failures.
+    }
+
+    if (typeof bestCandidate.focus === "function") {
+      try {
+        bestCandidate.focus({ preventScroll: true });
+      } catch (_focusError) {
+        try {
+          bestCandidate.focus();
+        } catch (_focusErrorAgain) {
+          // Ignore focus failures.
+        }
+      }
+    }
+
+    const rect = typeof bestCandidate.getBoundingClientRect === "function"
+      ? bestCandidate.getBoundingClientRect()
+      : { left: 0, top: 0, width: 0, height: 0 };
+    const clientX = rect.left + Math.max(1, rect.width / 2);
+    const clientY = rect.top + Math.max(1, rect.height / 2);
+    const mouseTypes = ["pointerover", "mouseover", "pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+    let dispatched = 0;
+
+    for (const type of mouseTypes) {
+      try {
+        if (/^pointer/.test(type) && typeof PointerEvent === "function") {
+          bestCandidate.dispatchEvent(new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            pointerType: "mouse",
+            clientX,
+            clientY
+          }));
+        } else {
+          bestCandidate.dispatchEvent(new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            clientX,
+            clientY
+          }));
+        }
+        dispatched += 1;
+      } catch (_dispatchError) {
+        // Ignore event dispatch failures.
+      }
+    }
+
+    try {
+      if (typeof bestCandidate.click === "function") {
+        bestCandidate.click();
+        dispatched += 1;
+      }
+    } catch (_clickError) {
+      // Ignore click failures.
+    }
+
+    return {
+      found: true,
+      clicked: dispatched > 0,
+      score: rankedCandidates[0].score,
+      host,
+      challengeHost,
+      challengeText
+    };
+  } catch (error) {
+    return {
+      found: false,
+      clicked: false,
+      score: 0,
+      error: normalize(error && error.message ? error.message : error)
+    };
+  }
 }
 
 function clampInt(value, min, max, fallback) {

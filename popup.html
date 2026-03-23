@@ -51,6 +51,13 @@
           <p id="leadSignalText" class="lead-signal"></p>
           <p id="errorText" class="error"></p>
         </div>
+        <div id="challengePanel" class="challenge-panel is-hidden">
+          <div class="challenge-panel-head">
+            <strong id="challengeSummaryText">Challenge waiting</strong>
+            <span id="challengeMetaText"></span>
+          </div>
+          <div id="challengeList" class="challenge-list"></div>
+        </div>
       </section>
 
       <!-- Configuration Sections -->
@@ -229,6 +236,43 @@
                     <div class="toggle-switch"></div>
                   </div>
                 </label>
+              </div>
+
+              <div class="form-row">
+                <label class="input-group">
+                  <span>Parallel workers</span>
+                  <select id="enrichWorkerCount">
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3 (rec.)</option>
+                    <option value="4">4</option>
+                    <option value="5">5</option>
+                    <option value="6">6</option>
+                  </select>
+                </label>
+                <label class="input-group">
+                  <span>Challenge handling</span>
+                  <select id="challengeHandlingMode">
+                    <option value="auto_then_wait">Try once, then wait (rec.)</option>
+                    <option value="auto_then_skip">Try once, then skip</option>
+                    <option value="skip_immediately">Skip immediately</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="form-row">
+                <label class="input-group">
+                  <span>Keep going while waiting</span>
+                  <select id="challengeContinueWorkers">
+                    <option value="0">Pause new work</option>
+                    <option value="1">1 more worker (rec.)</option>
+                    <option value="2">2 more workers</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="hints">
+                <p id="challengeSettingsHint" class="hint-text"></p>
               </div>
 
             </div>
