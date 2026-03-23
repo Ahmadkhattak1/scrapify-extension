@@ -1,0 +1,21 @@
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e5]:
+      - img "Scrapify logo" [ref=e6]
+      - generic [ref=e7]:
+        - generic [ref=e8]:
+          - paragraph [ref=e9]: Scrapify
+          - generic [ref=e10]: Viewer
+        - heading "Review, qualify, and export every run" [level=1] [ref=e11]
+        - paragraph [ref=e12]: Waiting for data...
+    - generic [ref=e13]:
+      - button "Import CSV" [ref=e14] [cursor=pointer]
+      - button "Refresh" [ref=e15] [cursor=pointer]
+      - button "Export CSV" [disabled] [ref=e16]
+  - generic [ref=e17]:
+    - generic [ref=e18]:
+      - generic [ref=e19]: Idle
+      - generic [ref=e20]: 0 rows
+      - generic [ref=e21]: 0 columns
+    - paragraph [ref=e22]: No rows yet. Run a scrape first.
+  - paragraph [ref=e23]: Cannot read properties of undefined (reading 'local')

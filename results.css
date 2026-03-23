@@ -1,21 +1,26 @@
 :root {
-  --bg: #eef2f7;
+  --bg: #f4f7fc;
   --panel: #ffffff;
-  --text: #12233a;
-  --muted: #51637c;
-  --border: #cfd7e3;
-  --header: #e9eff8;
-  --header-border: #bac8dc;
-  --row-alt: #f8fbff;
-  --row-hover: #eef6ff;
-  --primary: #1f6fff;
-  --danger: #b42318;
-  --good-bg: #e8f7ee;
-  --good-text: #13643a;
-  --warn-bg: #fff5e6;
-  --warn-text: #935d00;
-  --idle-bg: #edf1f7;
-  --idle-text: #3d4f68;
+  --text: #202124;
+  --muted: #5f6368;
+  --border: #e1e6ef;
+  --header: #eef4ff;
+  --header-border: #d7e3fa;
+  --row-alt: #fafcff;
+  --row-hover: #eef4ff;
+  --primary: #4285f4;
+  --primary-hover: #3367d6;
+  --danger: #d93025;
+  --good-bg: rgb(52 168 83 / 0.12);
+  --good-text: #1e7a3e;
+  --warn-bg: rgb(251 188 5 / 0.16);
+  --warn-text: #9a6700;
+  --idle-bg: #eef2f7;
+  --idle-text: #4f5965;
+  --brand-red: #ea4335;
+  --brand-blue: #4285f4;
+  --brand-yellow: #fbbc05;
+  --brand-green: #34a853;
 }
 
 * {
@@ -24,40 +29,112 @@
 
 body {
   margin: 0;
-  background: linear-gradient(180deg, #f4f7fc 0%, var(--bg) 100%);
+  background:
+    radial-gradient(circle at top left, rgb(66 133 244 / 0.08), transparent 30%),
+    radial-gradient(circle at top right, rgb(251 188 5 / 0.10), transparent 24%),
+    linear-gradient(180deg, #fbfcff 0%, var(--bg) 100%);
   color: var(--text);
-  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  font-family: "Segoe UI Variable", "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
 }
 
 .app {
   width: min(1700px, 96vw);
-  margin: 10px auto;
+  margin: 14px auto;
   display: grid;
-  gap: 8px;
+  gap: 12px;
 }
 
 .top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: start;
+}
+
+.hero {
+  position: relative;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 18px 20px;
+  box-shadow: 0 14px 34px rgb(60 64 67 / 0.10), 0 2px 6px rgb(60 64 67 / 0.06);
+  min-width: 0;
+}
+
+.hero::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 4px;
+  background: linear-gradient(90deg, var(--brand-red), var(--brand-blue), var(--brand-yellow), var(--brand-green));
 }
 
 .brand-block {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
 }
 
-.results-logo {
+.results-mark {
   display: block;
-  width: min(300px, 70vw);
-  height: auto;
+  width: 74px;
+  height: 74px;
+  flex-shrink: 0;
+}
+
+.brand-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.hero-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: rgb(66 133 244 / 0.12);
+  border: 1px solid rgb(66 133 244 / 0.18);
+  color: var(--primary-hover);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.brand-copy h1 {
+  margin: 0;
+  font-size: clamp(24px, 3vw, 34px);
+  line-height: 1.05;
+  letter-spacing: -0.04em;
 }
 
 .meta {
   margin: 0;
-  font-size: 13px;
+  font-size: 14px;
   color: var(--muted);
 }
 
@@ -66,23 +143,36 @@ body {
   gap: 8px;
   flex-wrap: wrap;
   justify-content: flex-end;
+  align-self: center;
 }
 
 button {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: #fff;
   color: var(--text);
-  padding: 8px 12px;
+  padding: 10px 14px;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
+  box-shadow: 0 1px 2px rgb(60 64 67 / 0.08);
+  transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
 }
 
 button.primary {
   background: var(--primary);
   border-color: var(--primary);
   color: #fff;
+}
+
+button:hover:not(:disabled) {
+  background: #f8fbff;
+  border-color: #ced9ef;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--primary-hover);
+  border-color: var(--primary-hover);
 }
 
 button:disabled {
@@ -93,18 +183,21 @@ button:disabled {
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 8px;
+  border-radius: 16px;
+  padding: 10px;
   display: grid;
-  gap: 8px;
+  gap: 10px;
+  box-shadow: 0 10px 26px rgb(60 64 67 / 0.08), 0 1px 3px rgb(60 64 67 / 0.05);
 }
 
 .summary {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   color: var(--muted);
   font-size: 13px;
+  padding: 2px 4px;
 }
 
 .status-chip {
@@ -143,7 +236,7 @@ button:disabled {
 
 .table-wrap {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 12px;
   overflow: auto;
   max-height: 78vh;
   background: #fff;
@@ -163,7 +256,7 @@ table {
 thead th {
   position: sticky;
   top: 0;
-  background: var(--header);
+  background: linear-gradient(180deg, #f4f8ff 0%, var(--header) 100%);
   z-index: 2;
   border-bottom: 1px solid var(--header-border);
 }
@@ -304,7 +397,7 @@ td.empty-cell {
 }
 
 a.cell-link {
-  color: #0c5fcb;
+  color: var(--primary-hover);
   text-decoration: none;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-size: 11px;
@@ -323,7 +416,7 @@ button.cell-copy {
   border: none;
   background: transparent;
   padding: 0;
-  color: #0c5fcb;
+  color: var(--primary-hover);
   text-decoration: none;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-size: 11px;
@@ -355,4 +448,26 @@ button.cell-copy.copied {
   min-height: 18px;
   color: var(--danger);
   font-size: 12px;
+}
+
+@media (max-width: 960px) {
+  .top {
+    grid-template-columns: 1fr;
+  }
+
+  .actions {
+    justify-content: flex-start;
+    align-self: start;
+  }
+}
+
+@media (max-width: 640px) {
+  .brand-block {
+    align-items: flex-start;
+  }
+
+  .results-mark {
+    width: 64px;
+    height: 64px;
+  }
 }

@@ -3,16 +3,26 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Scrapify Results</title>
-    <link rel="icon" type="image/png" href="assets/brand/icon-32.png" />
+    <title>Scrapify Viewer</title>
+    <link rel="icon" type="image/svg+xml" href="assets/brand/scrapify-mark.svg" />
+    <link rel="alternate icon" type="image/png" href="assets/brand/icon-32.png" />
     <link rel="stylesheet" href="results.css" />
   </head>
   <body>
     <main class="app">
       <header class="top">
-        <div class="brand-block">
-          <img class="results-logo" src="assets/brand/scrapify-logo.svg" alt="Scrapify logo" />
-          <p id="metaText" class="meta">Waiting for data...</p>
+        <div class="hero">
+          <div class="brand-block">
+            <img class="results-mark" src="assets/brand/scrapify-mark.svg" alt="Scrapify logo" />
+            <div class="brand-copy">
+              <div class="brand-row">
+                <p class="eyebrow">Scrapify</p>
+                <span class="hero-chip">Viewer</span>
+              </div>
+              <h1>Review, qualify, and export every run</h1>
+              <p id="metaText" class="meta">Waiting for data...</p>
+            </div>
+          </div>
         </div>
         <div class="actions">
           <input id="importFileInput" type="file" accept=".csv,text/csv" hidden />

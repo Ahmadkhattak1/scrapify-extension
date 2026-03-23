@@ -1,0 +1,119 @@
+- main [ref=e2]:
+  - generic [ref=e4]:
+    - img "Scrapify logo" [ref=e5]
+    - generic [ref=e6]:
+      - generic [ref=e7]:
+        - heading "Scrapify" [level=1] [ref=e8]
+        - generic [ref=e9]: Control Panel
+      - paragraph [ref=e10]: Google Maps lead workflow
+      - paragraph [ref=e11]: Scrape, enrich, resolve challenges, and export clean CSVs.
+  - generic [ref=e12]:
+    - generic [ref=e13]:
+      - generic [ref=e14]:
+        - generic [ref=e15]:
+          - generic [ref=e16]: Processed
+          - strong [ref=e17]: "0"
+        - generic [ref=e18]:
+          - generic [ref=e19]: Matched
+          - strong [ref=e20]: "0"
+        - generic [ref=e21]:
+          - generic [ref=e22]: Duplicates
+          - strong [ref=e23]: "0"
+        - generic [ref=e24]:
+          - generic [ref=e25]: Errors
+          - strong [ref=e26]: "0"
+      - group [ref=e27]:
+        - generic "View detailed metrics" [ref=e28] [cursor=pointer]
+      - generic [ref=e29]:
+        - paragraph [ref=e30]: Ready
+        - paragraph
+        - paragraph
+    - generic [ref=e31]:
+      - group [ref=e32]:
+        - generic "Core Filters" [ref=e33] [cursor=pointer]:
+          - generic [ref=e34]:
+            - img [ref=e35]
+            - text: Core Filters
+          - img [ref=e38]
+        - generic [ref=e40]:
+          - generic [ref=e41]:
+            - generic [ref=e42]:
+              - generic [ref=e43]: Max rows
+              - spinbutton "Max rows" [ref=e44]: "200"
+            - generic [ref=e45] [cursor=pointer]:
+              - generic [ref=e46]: Infinite (ignore max)
+              - generic [ref=e47]:
+                - checkbox "Infinite (ignore max)"
+          - generic [ref=e49]:
+            - generic [ref=e50]:
+              - generic [ref=e51]: Min rating
+              - textbox "Min rating" [ref=e52]:
+                - /placeholder: e.g. 4.2
+            - generic [ref=e53]:
+              - generic [ref=e54]: Max rating
+              - textbox "Max rating" [ref=e55]:
+                - /placeholder: e.g. 4.8
+          - generic [ref=e56]:
+            - generic [ref=e57]:
+              - generic [ref=e58]: Min reviews
+              - textbox "Min reviews" [ref=e59]:
+                - /placeholder: e.g. 50
+            - generic [ref=e60]:
+              - generic [ref=e61]: Max reviews
+              - textbox "Max reviews" [ref=e62]:
+                - /placeholder: e.g. 500
+          - generic [ref=e63]:
+            - generic [ref=e64] [cursor=pointer]:
+              - generic [ref=e65]: Has website
+              - generic [ref=e66]:
+                - checkbox "Has website"
+            - generic [ref=e68] [cursor=pointer]:
+              - generic [ref=e69]: Has phone
+              - generic [ref=e70]:
+                - checkbox "Has phone"
+          - generic [ref=e73] [cursor=pointer]:
+            - generic [ref=e74]: Keep only leads with email
+            - generic [ref=e75]:
+              - checkbox "Keep only leads with email" [checked]
+      - group [ref=e77]:
+        - generic "Enrichment Engine" [ref=e78] [cursor=pointer]:
+          - generic [ref=e79]:
+            - img [ref=e80]
+            - text: Enrichment Engine
+          - img [ref=e83]
+        - text: i
+        - option "Best only (rec.)" [selected]
+        - option "Best + raw"
+        - option "Raw only"
+        - text: i
+        - option "Best only (rec.)" [selected]
+        - option "Best + raw"
+        - option "Raw only"
+        - option "1" [selected]
+        - option "2"
+        - option "3 (rec.)"
+        - option "4"
+        - option "5"
+        - option "6"
+        - option "Try once, then wait (rec.)" [selected]
+        - option "Try once, then skip"
+        - option "Skip immediately"
+        - option "Pause new work" [selected]
+        - option "1 more worker (rec.)"
+        - option "2 more workers"
+      - group [ref=e85]:
+        - generic "Export Columns" [ref=e86] [cursor=pointer]:
+          - generic [ref=e87]:
+            - img [ref=e88]
+            - text: Export Columns
+          - img [ref=e92]
+  - generic [ref=e95]:
+    - button "Viewer" [ref=e96] [cursor=pointer]:
+      - img [ref=e97]
+      - generic [ref=e99]: Viewer
+    - button "Stop scraping" [disabled]:
+      - img
+      - generic: Stop
+    - button "Start Scrape" [ref=e100] [cursor=pointer]:
+      - img [ref=e101]
+      - generic [ref=e102]: Start Scrape
