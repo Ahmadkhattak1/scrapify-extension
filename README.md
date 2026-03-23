@@ -1,11 +1,19 @@
 # Scrapify
 
 <p align="center">
-  <img src="assets/brand/scrapify-logo.svg" alt="Scrapify logo" width="240" />
+  <img src="assets/brand/scrapify-mark.svg" alt="Scrapify mark" width="84" />
 </p>
 
 <p align="center">
-  Google Maps lead scraping plus focused website enrichment in a Manifest V3 Chrome extension.
+  <img src="assets/brand/scrapify-logo.svg" alt="Scrapify logo" width="420" />
+</p>
+
+<p align="center">
+  <strong>SCRAPE . ENRICH . EXPORT</strong>
+</p>
+
+<p align="center">
+  Google Maps lead workflow for focused data collection in a Manifest V3 Chrome extension.
 </p>
 
 <p align="center">
