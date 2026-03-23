@@ -4596,10 +4596,12 @@ async function openTabAndExtractLinks(url, optionsInput, extractFn) {
       timeoutMs,
       "Timed out while extracting links"
     );
-    const maybeWaitOnChallenge = async () => {
+    const maybeWaitOnChallenge = async (forcePrompt) => {
       if (!onChallenge) return false;
-      const probe = await executeExtractionOnce(tab.id, { currentUrl: url }).catch(() => null);
-      if (!probe || probe.blocked !== true) return false;
+      if (forcePrompt !== true) {
+        const probe = await executeExtractionOnce(tab.id, { currentUrl: url }).catch(() => null);
+        if (!probe || probe.blocked !== true) return false;
+      }
       const resolution = await onChallenge({
         tabId: tab.id,
         currentUrl: url,
@@ -4618,7 +4620,15 @@ async function openTabAndExtractLinks(url, optionsInput, extractFn) {
       }
       const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
       if (!captchaAttempt.clicked) {
-        const resumed = await maybeWaitOnChallenge();
+        const resumed = await maybeWaitOnChallenge(Boolean(extractError && extractError.challengeDetected === true));
+        if (resumed) {
+          links = await runExtract();
+          return Array.isArray(links) ? links : [];
+        }
+        throw extractError;
+      }
+      if (captchaAttempt.cleared !== true) {
+        const resumed = await maybeWaitOnChallenge(true);
         if (resumed) {
           links = await runExtract();
           return Array.isArray(links) ? links : [];
@@ -4629,10 +4639,10 @@ async function openTabAndExtractLinks(url, optionsInput, extractFn) {
     }
     if (attemptCaptchaPassThrough && (!Array.isArray(links) || links.length === 0)) {
       const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
-      if (captchaAttempt.clicked) {
+      if (captchaAttempt.clicked && captchaAttempt.cleared === true) {
         links = await runExtract();
       } else {
-        const resumed = await maybeWaitOnChallenge();
+        const resumed = await maybeWaitOnChallenge(captchaAttempt.clicked === true);
         if (resumed) {
           links = await runExtract();
         }
@@ -4677,10 +4687,12 @@ async function openTabAndExtractData(url, optionsInput, extractFn) {
       timeoutMs,
       "Timed out while extracting page data"
     );
-    const maybeWaitOnChallenge = async () => {
+    const maybeWaitOnChallenge = async (forcePrompt) => {
       if (!onChallenge) return false;
-      const probe = await executeExtractionOnce(tab.id, { currentUrl: url }).catch(() => null);
-      if (!probe || probe.blocked !== true) return false;
+      if (forcePrompt !== true) {
+        const probe = await executeExtractionOnce(tab.id, { currentUrl: url }).catch(() => null);
+        if (!probe || probe.blocked !== true) return false;
+      }
       const resolution = await onChallenge({
         tabId: tab.id,
         currentUrl: url,
@@ -4699,7 +4711,14 @@ async function openTabAndExtractData(url, optionsInput, extractFn) {
       }
       const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
       if (!captchaAttempt.clicked) {
-        const resumed = await maybeWaitOnChallenge();
+        const resumed = await maybeWaitOnChallenge(Boolean(extractError && extractError.challengeDetected === true));
+        if (resumed) {
+          return await runExtract();
+        }
+        throw extractError;
+      }
+      if (captchaAttempt.cleared !== true) {
+        const resumed = await maybeWaitOnChallenge(true);
         if (resumed) {
           return await runExtract();
         }
@@ -4709,10 +4728,10 @@ async function openTabAndExtractData(url, optionsInput, extractFn) {
     }
     if (attemptCaptchaPassThrough && !data) {
       const captchaAttempt = await maybeAttemptCaptchaPassThrough(tab.id, url, timeoutMs);
-      if (captchaAttempt.clicked) {
+      if (captchaAttempt.clicked && captchaAttempt.cleared === true) {
         data = await runExtract();
       } else {
-        const resumed = await maybeWaitOnChallenge();
+        const resumed = await maybeWaitOnChallenge(captchaAttempt.clicked === true);
         if (resumed) {
           data = await runExtract();
         }
@@ -4746,7 +4765,18 @@ function executeGoogleResultsExtraction(tabId, maxResults, timeoutMs) {
           resolve([]);
           return;
         }
-        resolve(Array.isArray(results[0].result) ? results[0].result : []);
+        const payload = results[0].result;
+        if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+          if (payload.blocked === true) {
+            const error = new Error(normalizeText(payload.reason) || "Google search challenge detected");
+            error.challengeDetected = true;
+            reject(error);
+            return;
+          }
+          resolve(Array.isArray(payload.links) ? payload.links : []);
+          return;
+        }
+        resolve(Array.isArray(payload) ? payload : []);
       }
     );
   });
@@ -4793,8 +4823,36 @@ function executeDirectoryResultsExtraction(tabId, timeoutMs) {
 function extractGoogleSearchResultLinksScript(maxResultsInput) {
   const maxResults = Math.max(1, Math.min(3, Number(maxResultsInput) || 3));
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const lower = (value) => normalize(value).toLowerCase();
   const out = [];
   const indexByUrl = new Map();
+  const bodyText = lower(document.body ? String(document.body.innerText || "").slice(0, 5000) : "");
+  const titleText = lower(document.title || "");
+  const pathname = lower(window.location.pathname || "");
+  const hostname = lower(window.location.hostname || "");
+  const signalText = `${titleText} ${pathname} ${bodyText}`;
+  const challengeDetected =
+    /(^|\.)google\./i.test(hostname) && (
+      pathname.includes("/sorry/") ||
+      pathname.includes("/sorry/index") ||
+      /our systems have detected unusual traffic|unusual traffic from your computer network|to continue, please type the characters below|verify that you(?:'re| are) not a robot|automated queries|detected unusual traffic|sorry/i.test(signalText) ||
+      Boolean(
+        document.querySelector("form#captcha-form") ||
+        document.querySelector("form[action*='sorry']") ||
+        document.querySelector("iframe[src*='recaptcha']") ||
+        document.querySelector("iframe[src*='sorry']") ||
+        document.querySelector("[id*='captcha' i]") ||
+        document.querySelector("[class*='captcha' i]") ||
+        document.querySelector("[aria-label*='captcha' i]")
+      )
+    );
+  if (challengeDetected) {
+    return {
+      blocked: true,
+      reason: "Google search challenge detected",
+      links: []
+    };
+  }
 
   const readSnippet = (anchor, heading) => {
     const baseNode = heading || anchor;
@@ -4859,7 +4917,10 @@ function extractGoogleSearchResultLinksScript(maxResultsInput) {
         snippet: readSnippet(anchor, heading)
       });
       if (out.length >= maxResults * 4) {
-        return out.slice(0, maxResults * 4);
+        return {
+          blocked: false,
+          links: out.slice(0, maxResults * 4)
+        };
       }
     }
   }
@@ -4875,7 +4936,10 @@ function extractGoogleSearchResultLinksScript(maxResultsInput) {
     if (out.length >= maxResults * 4) break;
   }
 
-  return out.slice(0, maxResults * 4);
+  return {
+    blocked: false,
+    links: out.slice(0, maxResults * 4)
+  };
 }
 
 function extractDirectoryWebsiteLinksScript() {
@@ -7498,6 +7562,37 @@ async function attemptCaptchaCheckboxOnce(tabId, timeoutMs) {
   };
 }
 
+async function waitForCaptchaClearance(tabId, currentUrl, timeoutMs) {
+  const effectiveTimeoutMs = Number.isFinite(Number(timeoutMs))
+    ? clampInt(timeoutMs, 1500, 120000, 12000)
+    : 12000;
+  const settleBudgetMs = clampInt(Math.min(effectiveTimeoutMs, 9000), 2500, 9000, 6500);
+  const deadline = Date.now() + settleBudgetMs;
+  let lastProbe = null;
+
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(600, deadline - Date.now());
+    const waitBudgetMs = clampInt(Math.min(remainingMs, 2200), 600, 2200, 1400);
+    await waitForTabComplete(tabId, waitBudgetMs).catch(() => null);
+    const probe = await executeExtractionOnce(tabId, {
+      currentUrl: normalizeText(currentUrl)
+    }).catch(() => null);
+    lastProbe = probe;
+    if (probe && probe.blocked !== true) {
+      return {
+        cleared: true,
+        probe
+      };
+    }
+    await sleep(650);
+  }
+
+  return {
+    cleared: false,
+    probe: lastProbe
+  };
+}
+
 async function maybeAttemptCaptchaPassThrough(tabId, currentUrl, timeoutMs) {
   const effectiveTimeoutMs = Number.isFinite(Number(timeoutMs))
     ? clampInt(timeoutMs, 1500, 120000, 12000)
@@ -7521,13 +7616,13 @@ async function maybeAttemptCaptchaPassThrough(tabId, currentUrl, timeoutMs) {
     return captchaAttempt;
   }
 
-  await sleep(1800);
-  if (effectiveTimeoutMs != null) {
-    const postClickWaitMs = clampInt(Math.min(effectiveTimeoutMs, 4000), 1200, 4000, 2500);
-    await waitForTabComplete(tabId, postClickWaitMs).catch(() => null);
-  }
-  await sleep(450);
-  return captchaAttempt;
+  await sleep(1200);
+  const clearance = await waitForCaptchaClearance(tabId, currentUrl, effectiveTimeoutMs);
+  return {
+    ...captchaAttempt,
+    cleared: clearance.cleared === true,
+    probe: clearance.probe || null
+  };
 }
 
 function executeExtraction(tabId, timeoutMs, extractionOptions) {
@@ -7535,6 +7630,16 @@ function executeExtraction(tabId, timeoutMs, extractionOptions) {
     ? extractionOptions
     : {};
   const onChallenge = typeof scriptOptions.onChallenge === "function" ? scriptOptions.onChallenge : null;
+  const requestChallengeResolution = async () => {
+    if (!onChallenge) return null;
+    return await onChallenge({
+      tabId,
+      currentUrl: normalizeText(scriptOptions.currentUrl),
+      source: normalizeText(scriptOptions.challengeSource || "site"),
+      phase: normalizeText(scriptOptions.challengePhase || "page_extract"),
+      host: hostnameForUrl(scriptOptions.currentUrl)
+    });
+  };
   const effectiveTimeoutMs = timeoutMs == null
     ? null
     : clampInt(timeoutMs, 1500, 120000, 12000);
@@ -7552,13 +7657,7 @@ function executeExtraction(tabId, timeoutMs, extractionOptions) {
     );
     if (!captchaAttempt.clicked) {
       if (onChallenge) {
-        const resolution = await onChallenge({
-          tabId,
-          currentUrl: normalizeText(scriptOptions.currentUrl),
-          source: normalizeText(scriptOptions.challengeSource || "site"),
-          phase: normalizeText(scriptOptions.challengePhase || "page_extract"),
-          host: hostnameForUrl(scriptOptions.currentUrl)
-        });
+        const resolution = await requestChallengeResolution();
         if (resolution && resolution.action === "resume") {
           const resumedResult = await executeExtractionOnce(tabId, scriptOptions);
           return resumedResult || firstResult;
@@ -7566,16 +7665,36 @@ function executeExtraction(tabId, timeoutMs, extractionOptions) {
       }
       return firstResult;
     }
+    if (captchaAttempt.cleared !== true && onChallenge) {
+      const resolution = await requestChallengeResolution();
+      if (resolution && resolution.action === "resume") {
+        const resumedResult = await executeExtractionOnce(tabId, scriptOptions);
+        return resumedResult || captchaAttempt.probe || firstResult;
+      }
+      return captchaAttempt.probe || firstResult;
+    }
 
-    const secondResult = await executeExtractionOnce(tabId, scriptOptions);
+    let secondResult = captchaAttempt && captchaAttempt.probe && typeof captchaAttempt.probe === "object"
+      ? captchaAttempt.probe
+      : await executeExtractionOnce(tabId, scriptOptions);
+    if (!secondResult || secondResult.blocked === true) {
+      const maxPostCaptchaRetries = effectiveTimeoutMs == null ? 2 : clampInt(Math.floor(Math.min(effectiveTimeoutMs, 9000) / 2200), 2, 4, 3);
+      for (let attempt = 0; attempt < maxPostCaptchaRetries; attempt += 1) {
+        await sleep(700 + (attempt * 200));
+        if (effectiveTimeoutMs != null) {
+          await waitForTabComplete(tabId, clampInt(Math.min(effectiveTimeoutMs, 2200), 800, 2200, 1400)).catch(() => null);
+        }
+        const retryResult = await executeExtractionOnce(tabId, scriptOptions).catch(() => null);
+        if (retryResult) {
+          secondResult = retryResult;
+        }
+        if (retryResult && retryResult.blocked !== true) {
+          break;
+        }
+      }
+    }
     if (secondResult && secondResult.blocked === true && onChallenge) {
-      const resolution = await onChallenge({
-        tabId,
-        currentUrl: normalizeText(scriptOptions.currentUrl),
-        source: normalizeText(scriptOptions.challengeSource || "site"),
-        phase: normalizeText(scriptOptions.challengePhase || "page_extract"),
-        host: hostnameForUrl(scriptOptions.currentUrl)
-      });
+      const resolution = await requestChallengeResolution();
       if (resolution && resolution.action === "resume") {
         const resumedResult = await executeExtractionOnce(tabId, scriptOptions);
         return resumedResult || secondResult || firstResult;

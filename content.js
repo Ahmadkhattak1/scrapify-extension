@@ -22,6 +22,8 @@
   const ROW_SNAPSHOT_INTERVAL = 8;
   const RESULT_STALL_SCROLL_LIMIT = 60;
   const RESULT_BOTTOM_STALL_LIMIT = 10;
+  const INFINITE_RESULT_IDLE_TIMEOUT_MS = 90000;
+  const INFINITE_BOTTOM_STALL_TIMEOUT_MS = 45000;
   const AGGRESSIVE_RESULT_SCROLL_THRESHOLD = 3;
   const DETAIL_ROW_MAX_ATTEMPTS = 8;
   const DETAIL_WEBSITE_WAIT_FLOOR = 4;
@@ -149,6 +151,8 @@
 
       let noNewCardsScrolls = 0;
       let bottomStallScrolls = 0;
+      let lastFeedActivityAtMs = Date.now();
+      let bottomStallStartedAtMs = 0;
 
       while (!state.stopRequested) {
         const resolvedFeed = await ensureResultsFeedReady(feed, 2600, { attemptBack: true });
@@ -169,6 +173,7 @@
 
         if (unseenCards.length === 0) {
           const advanceResult = await advanceResultsFeed(feed, noNewCardsScrolls);
+          const now = Date.now();
           if (advanceResult.feed) {
             feed = advanceResult.feed;
           }
@@ -176,17 +181,37 @@
           if (advanceResult.hasNewCards) {
             noNewCardsScrolls = 0;
             bottomStallScrolls = 0;
+            lastFeedActivityAtMs = now;
+            bottomStallStartedAtMs = 0;
           } else {
             noNewCardsScrolls = advanceResult.progressed === true ? 0 : noNewCardsScrolls + 1;
-            bottomStallScrolls = advanceResult.reachedBottom === true ? bottomStallScrolls + 1 : 0;
+            if (advanceResult.progressed === true) {
+              lastFeedActivityAtMs = now;
+            }
+            if (advanceResult.reachedBottom === true) {
+              bottomStallScrolls += 1;
+              if (bottomStallStartedAtMs <= 0) {
+                bottomStallStartedAtMs = now;
+              }
+            } else {
+              bottomStallScrolls = 0;
+              bottomStallStartedAtMs = 0;
+            }
           }
 
           sendProgress({ force: true });
 
+          const idleMs = Math.max(0, now - lastFeedActivityAtMs);
+          const bottomStallMs = bottomStallStartedAtMs > 0
+            ? Math.max(0, now - bottomStallStartedAtMs)
+            : 0;
+          const stalledOut = infiniteScroll
+            ? bottomStallMs >= INFINITE_BOTTOM_STALL_TIMEOUT_MS || idleMs >= INFINITE_RESULT_IDLE_TIMEOUT_MS
+            : bottomStallScrolls >= RESULT_BOTTOM_STALL_LIMIT || noNewCardsScrolls >= RESULT_STALL_SCROLL_LIMIT;
+
           if (
             advanceResult.atEnd === true ||
-            bottomStallScrolls >= RESULT_BOTTOM_STALL_LIMIT ||
-            noNewCardsScrolls >= RESULT_STALL_SCROLL_LIMIT
+            stalledOut
           ) {
             break;
           }
@@ -194,6 +219,9 @@
         }
 
         noNewCardsScrolls = 0;
+        bottomStallScrolls = 0;
+        bottomStallStartedAtMs = 0;
+        lastFeedActivityAtMs = Date.now();
 
         for (const card of unseenCards) {
           if (state.stopRequested) break;
@@ -1841,10 +1869,13 @@
     const primaryTarget = resolvePrimaryScrollTarget(currentFeed, lastCard, targets);
     const beforeScrollState = captureScrollState(primaryTarget);
     const aggressive = Number(stallCount || 0) >= AGGRESSIVE_RESULT_SCROLL_THRESHOLD;
+    const infiniteMode = state.runInfiniteScroll === true;
 
     await scrollResults(currentFeed, { aggressive, primaryTarget });
 
-    const waitBudgetMs = aggressive ? 1800 : 1000;
+    const waitBudgetMs = aggressive
+      ? (infiniteMode ? 4800 : 1800)
+      : (infiniteMode ? 2600 : 1000);
     const deadline = Date.now() + waitBudgetMs;
 
     while (Date.now() < deadline) {
